@@ -46,6 +46,29 @@ cargo test --locked
 
 `scripts/check` runs formatting, Clippy, the tests and the docs, as CI does.
 
+## Known issues
+
+- The bundled SQLite (3.53.2) is affected by RUSTSEC-2026-0459. It is fixed
+  in `rusqlite` 0.41, which Wok will adopt together with shelter-kit and
+  Bothy, since a build links only one SQLite
+  ([#1](https://github.com/forgesworn/wok/issues/1)).
+- Two concurrency tests failed once on a Linux CI runner, one with
+  `SQLITE_BUSY` during a competing WAL truncate
+  ([#2](https://github.com/forgesworn/wok/issues/2)).
+
+## Support development
+
+Wok is part of [ForgeSworn](https://github.com/forgesworn), maintained by
+TheCryptoDonkey. Donations support development, testing and documentation.
+
+- [GitHub Sponsors](https://github.com/sponsors/TheCryptoDonkey)
+- [Ko-fi](https://ko-fi.com/brays)
+- [ForgeSworn on Geyser](https://geyser.fund/project/forgesworn)
+- Lightning: `profusemeat89@walletofsatoshi.com`
+
+See [support and donation details](SUPPORT.md), including Nostr zaps.
+Donations are optional and do not buy relay access or a service guarantee.
+
 ## Licence
 
-MIT. See `LICENSE`.
+MIT, copyright 2026 TheCryptoDonkey. See `LICENSE`.

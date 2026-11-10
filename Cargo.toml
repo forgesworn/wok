@@ -7,7 +7,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
-authors = ["ForgeSworn contributors"]
+authors = ["TheCryptoDonkey"]
 repository = "https://github.com/forgesworn/wok"
 
 [workspace.dependencies]
