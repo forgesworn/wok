@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Local gate, mirroring .github/workflows/ci.yml.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+echo "== fmt =="
+cargo fmt --all -- --check
+
+echo "== clippy =="
+cargo clippy --workspace --all-targets -- -D warnings
+
+echo "== test =="
+cargo test --workspace --locked
+
+echo "== doc =="
+cargo doc --workspace --no-deps
