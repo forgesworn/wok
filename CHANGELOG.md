@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 - unreleased
+## 0.1.0 - 2026-11-10
 
 - First release: the event store, its group-commit writer and live fan-out,
   moved from Bothy's node repository at `9d75c2c` as the `wok-store` crate.
