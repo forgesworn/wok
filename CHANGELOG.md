@@ -10,3 +10,6 @@
 - `single_d_value`, `event_frame`, `LiveFanout` (with its methods) and the
   hidden `PreparedPut::verified` are public, for Bothy's relay engine until it
   moves into Wok.
+- Known: the bundled SQLite 3.53.2 is affected by RUSTSEC-2026-0459 (#1),
+  ignored in `cargo audit` until the joint move to `rusqlite` 0.41; two
+  concurrency tests failed once on Linux CI (#2).
