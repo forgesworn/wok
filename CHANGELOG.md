@@ -13,6 +13,8 @@
   handler from when it opens, and the store arms and disarms its query and
   expiry deadlines through it. A reader's deadline is disarmed when its query
   returns, where it used to stay set until the next query.
+- Update locked tokio to 1.54.1 and faster-hex to 0.10.1 for
+  RUSTSEC-2026-0386 and RUSTSEC-2026-0306.
 - No schema change: schema 4 remains, and existing stores open as before.
 
 ## 0.1.0 - 2026-11-10
