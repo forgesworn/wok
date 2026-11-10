@@ -6969,6 +6969,13 @@ PRAGMA user_version=2;")).unwrap();
                     if run_checkpoint(&conn, "TRUNCATE").is_ok_and(|(busy, _, _)| busy == 0) {
                         truncates += 1;
                     }
+                    // A pause between attempts. Back to back, the truncates
+                    // hold the write lock almost continuously, and on a slow
+                    // runner the writer's polling busy handler can miss every
+                    // gap for its whole timeout: a plain SQLITE_BUSY, which is
+                    // what any SQLite writer reports against a lock held that
+                    // long, not the SQLITE_BUSY_SNAPSHOT this test guards.
+                    std::thread::sleep(Duration::from_micros(500));
                 }
                 truncates
             })

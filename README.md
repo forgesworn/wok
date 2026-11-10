@@ -52,9 +52,6 @@ cargo test --locked
   in `rusqlite` 0.41, which Wok will adopt together with shelter-kit and
   Bothy, since a build links only one SQLite
   ([#1](https://github.com/forgesworn/wok/issues/1)).
-- Two concurrency tests failed once on a Linux CI runner, one with
-  `SQLITE_BUSY` during a competing WAL truncate
-  ([#2](https://github.com/forgesworn/wok/issues/2)).
 
 ## Support development
 
