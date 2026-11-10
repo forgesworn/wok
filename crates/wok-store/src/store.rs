@@ -28,6 +28,10 @@ pub const MAX_QUERY_EVENTS: usize = 128;
 /// One committed expiry pass. Callers release shared work capacity between passes.
 pub const MAX_EXPIRE_EVENTS: usize = 128;
 const EXPIRY_BUDGET: Duration = Duration::from_secs(5);
+/// How long one history query, count or batched event may run.
+const QUERY_BUDGET: Duration = Duration::from_secs(2);
+/// SQLite calls a connection's [`Budget`] check every this many VM steps.
+const BUDGET_STEPS: std::ffi::c_int = 10_000;
 /// How long any connection waits for a lock before SQLite reports busy. The
 /// writer returns to it after the ceiling checkpoint's longer wait.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -341,7 +345,7 @@ impl std::ops::DerefMut for WriterGuard<'_> {
 
 /// Installed in place of SQLite's automatic checkpoint, which would run inside
 /// the commit. It only records how large the log is.
-fn wal_observe(_: &rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite::Result<()> {
+fn wal_observe(_: &mut rusqlite::hooks::Wal, pages: std::ffi::c_int) -> rusqlite::Result<()> {
     WAL_PROBE.with(|p| {
         if let Ok(slot) = p.try_borrow()
             && let Some(shared) = slot.as_ref()
@@ -588,7 +592,7 @@ enum WarmOutcome {
 /// steps; it sleeps `pause` there, so the thread leaves most of a core to
 /// everything else.
 fn warm_indexes(
-    conn: &Connection,
+    conn: &mut Connection,
     stop: &Arc<AtomicBool>,
     max_bytes: u64,
     pause: Duration,
@@ -1070,9 +1074,11 @@ pub struct SqliteEventStore {
     // connection to close checkpoints and removes the WAL, and a read-only
     // one cannot. Empty when the database cannot use WAL; reads then share
     // the writer connection.
-    readers: Vec<Mutex<Connection>>,
+    readers: Vec<Mutex<Reader>>,
     next_reader: AtomicUsize,
     conn: Mutex<Connection>,
+    /// The writer's statement deadline.
+    budget: Budget,
     max_bytes: u64,
     min_free_bytes: u64,
     parent: PathBuf,
@@ -1429,6 +1435,8 @@ impl SqliteEventStore {
         )?;
         conn.busy_timeout(BUSY_TIMEOUT)?;
         conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
+        let budget = Budget::new();
+        budget.attach(&mut conn, BUDGET_STEPS)?;
         let mut version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
         if version == 0 {
             let tables: i64 = conn.query_row(
@@ -1666,7 +1674,7 @@ PRAGMA user_version=2;"))?;
                     // The pragma clears SQLite's automatic checkpoint (itself
                     // a WAL hook); ours replaces it and only counts pages.
                     conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                    conn.wal_hook(Some(wal_observe));
+                    conn.wal_hook(Some(wal_observe))?;
                     maintenance.background = true;
                 }
                 Err(error) => {
@@ -1687,6 +1695,7 @@ PRAGMA user_version=2;"))?;
             readers,
             next_reader: AtomicUsize::new(0),
             conn: Mutex::new(conn),
+            budget,
             max_bytes,
             min_free_bytes,
             parent: canonical_parent,
@@ -1726,7 +1735,8 @@ PRAGMA user_version=2;"))?;
 
     /// Run `f` on a read-only connection, taking a free one if any, so
     /// history queries neither wait for the writer nor serialise on each other
-    /// beyond the pool size. Without WAL it uses the writer connection.
+    /// beyond the pool size. Without WAL it uses the writer connection. Each
+    /// statement of `f` is interrupted once [`QUERY_BUDGET`] has passed.
     fn with_reader<T>(
         &self,
         f: impl FnOnce(&Connection) -> Result<T, EventStoreError>,
@@ -1734,20 +1744,20 @@ PRAGMA user_version=2;"))?;
         let count = self.readers.len();
         if count == 0 {
             let conn = self.lock()?;
-            return f(&conn);
+            return self.budget.within(QUERY_BUDGET, || f(&conn));
         }
         let first = self.next_reader.fetch_add(1, AtomicOrdering::Relaxed) % count;
         for offset in 0..count {
             match self.readers[(first + offset) % count].try_lock() {
-                Ok(conn) => return f(&conn),
+                Ok(reader) => return reader.budget.within(QUERY_BUDGET, || f(&reader.conn)),
                 Err(TryLockError::WouldBlock) => {}
                 Err(TryLockError::Poisoned(_)) => return Err(EventStoreError::Poisoned),
             }
         }
-        let conn = self.readers[first]
+        let reader = self.readers[first]
             .lock()
             .map_err(|_| EventStoreError::Poisoned)?;
-        f(&conn)
+        reader.budget.within(QUERY_BUDGET, || f(&reader.conn))
     }
 
     /// The one place the writer checkpoints. Normally the checkpoint thread
@@ -1822,10 +1832,10 @@ PRAGMA user_version=2;"))?;
 fn open_readers(
     count: usize,
     open: impl Fn() -> Result<Connection, EventStoreError>,
-) -> Vec<Mutex<Connection>> {
+) -> Vec<Mutex<Reader>> {
     let mut readers = Vec::with_capacity(count);
     for _ in 0..count {
-        match open() {
+        match open().and_then(|conn| Ok(Reader::new(conn)?)) {
             Ok(reader) => readers.push(Mutex::new(reader)),
             Err(error) => {
                 tracing::warn!(%error, "event-store reader did not open; reads share the writer connection");
@@ -2548,7 +2558,7 @@ fn spawn_warmer(
     shared: &Arc<WalShared>,
     stop: &Arc<AtomicBool>,
 ) -> Result<JoinHandle<()>, EventStoreError> {
-    let conn = open_reader(
+    let mut conn = open_reader(
         path,
         u32::try_from(WARM_CACHE_KIB).unwrap_or(1024),
         options.mmap_bytes,
@@ -2561,7 +2571,7 @@ fn spawn_warmer(
         .stack_size(256 * 1024)
         .spawn(move || {
             match warm_indexes(
-                &conn,
+                &mut conn,
                 &stop,
                 max_bytes,
                 Duration::from_millis(1),
@@ -2661,13 +2671,88 @@ fn logical_bytes(conn: &Connection) -> Result<u64, EventStoreError> {
     Ok(usage(conn)?)
 }
 
-fn query_budget(conn: &Connection) -> Result<(), EventStoreError> {
-    let began = std::time::Instant::now();
-    conn.progress_handler(
-        10_000,
-        Some(move || began.elapsed() > Duration::from_secs(2)),
-    )?;
-    Ok(())
+/// A connection's statement deadline. SQLite calls the connection's one
+/// progress handler every [`BUDGET_STEPS`] VM steps, and the handler
+/// interrupts the running statement once an armed deadline has passed.
+/// rusqlite replaces a handler only through `&mut Connection`, which an open
+/// transaction or savepoint does not give, so the handler is attached when
+/// the connection opens and the deadline is armed and disarmed through this.
+///
+/// The connection's own thread arms the deadline and runs the statements the
+/// handler checks, so relaxed ordering is enough.
+#[derive(Clone)]
+struct Budget(Arc<BudgetClock>);
+
+struct BudgetClock {
+    epoch: Instant,
+    /// Nanoseconds after `epoch`, or `u64::MAX` when disarmed.
+    deadline: AtomicU64,
+}
+
+impl BudgetClock {
+    fn now(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_nanos()).unwrap_or(u64::MAX - 1)
+    }
+
+    fn expired(&self) -> bool {
+        let deadline = self.deadline.load(AtomicOrdering::Relaxed);
+        deadline != u64::MAX && self.now() >= deadline
+    }
+}
+
+impl Budget {
+    fn new() -> Self {
+        Self(Arc::new(BudgetClock {
+            epoch: Instant::now(),
+            deadline: AtomicU64::new(u64::MAX),
+        }))
+    }
+
+    /// Install the deadline check as `conn`'s progress handler, called every
+    /// `steps` VM steps.
+    fn attach(&self, conn: &mut Connection, steps: std::ffi::c_int) -> rusqlite::Result<()> {
+        let clock = Arc::clone(&self.0);
+        conn.progress_handler(steps, Some(move || clock.expired()))
+    }
+
+    /// Interrupt any statement still running once `after` has passed.
+    fn arm(&self, after: Duration) {
+        let after = u64::try_from(after.as_nanos()).unwrap_or(u64::MAX);
+        let at = self.0.now().saturating_add(after).min(u64::MAX - 1);
+        self.0.deadline.store(at, AtomicOrdering::Relaxed);
+    }
+
+    fn disarm(&self) {
+        self.0.deadline.store(u64::MAX, AtomicOrdering::Relaxed);
+    }
+
+    /// Run `f` armed for `after`, and disarm when it returns.
+    fn within<T>(&self, after: Duration, f: impl FnOnce() -> T) -> T {
+        self.arm(after);
+        let out = f();
+        self.disarm();
+        out
+    }
+
+    /// Interrupt the running statement at the handler's next call.
+    #[cfg(test)]
+    fn interrupt(&self) {
+        self.0.deadline.store(0, AtomicOrdering::Relaxed);
+    }
+}
+
+/// A read-only connection of the pool, with its statement deadline.
+struct Reader {
+    conn: Connection,
+    budget: Budget,
+}
+
+impl Reader {
+    fn new(mut conn: Connection) -> rusqlite::Result<Self> {
+        let budget = Budget::new();
+        budget.attach(&mut conn, BUDGET_STEPS)?;
+        Ok(Self { conn, budget })
+    }
 }
 
 /// One event ready for [`EventStore::put_prepared_batch`]: every check that
@@ -2817,7 +2902,7 @@ impl PreparedPut {
 /// One batch may keep starting events for at most this long. Events behind
 /// that point are not refused: they come back as [`EventStoreError::Deferred`]
 /// and are offered again in the next batch, which always starts its first
-/// event. Each statement is also bounded by `query_budget`. A pass run again
+/// event. Each statement is also cut off after two seconds. A pass run again
 /// after an interrupted event counts from the same start, not afresh.
 pub const BATCH_BUDGET: Duration = Duration::from_secs(5);
 
@@ -3074,7 +3159,7 @@ impl SqliteEventStore {
         let at = event.created_at.as_secs() as i64;
         let coord = coordinate(event);
         #[cfg(test)]
-        self.slow_hook(tx, &event.id.to_hex(), Slow::AtFirstRead);
+        self.slow_hook(&event.id.to_hex(), Slow::AtFirstRead);
         let used_before = usage(tx)?;
         if probe(
             tx,
@@ -3181,7 +3266,7 @@ impl SqliteEventStore {
             }
         }
         #[cfg(test)]
-        self.slow_hook(tx, &event.id.to_hex(), Slow::AtFirstWrite);
+        self.slow_hook(&event.id.to_hex(), Slow::AtFirstWrite);
         exec(
             tx,
             "INSERT INTO events(visibility,id,author,kind,created_at,coordinate,expires_at,json) VALUES(?,?,?,?,?,?,?,?)",
@@ -3234,10 +3319,9 @@ impl SqliteEventStore {
 
     /// Make the event interrupt at this point if a test said it should.
     #[cfg(test)]
-    fn slow_hook(&self, conn: &Connection, id: &str, at: Slow) {
+    fn slow_hook(&self, id: &str, at: Slow) {
         if self.slow_of(id) == Some(at) {
-            conn.progress_handler(1, Some(|| true))
-                .expect("install the test interrupt");
+            self.budget.interrupt();
         }
     }
 
@@ -3265,6 +3349,12 @@ impl SqliteEventStore {
         for &i in idxs {
             results[i] = None;
         }
+        // A test interrupt lands on the next VM step, not up to
+        // `BUDGET_STEPS` later.
+        #[cfg(test)]
+        if !self.slow.lock().unwrap().is_empty() {
+            self.budget.attach(conn, 1)?;
+        }
         // Immediate: the write lock is taken at BEGIN, under the busy handler.
         // A deferred transaction reads first, and an idle TRUNCATE on the
         // checkpoint connection (which resets the log) between that read and
@@ -3288,7 +3378,7 @@ impl SqliteEventStore {
             }
             started = true;
             // Each event gets its own deadline; the commit gets none.
-            query_budget(&tx)?;
+            self.budget.arm(QUERY_BUDGET);
             #[cfg(test)]
             if let Some(Slow::Takes(ms)) = self.slow_of(&batch[i].event.id.to_hex()) {
                 std::thread::sleep(Duration::from_millis(ms));
@@ -3311,7 +3401,7 @@ impl SqliteEventStore {
                 Err(error) if is_event_fault(&error) => {
                     // The expired timer would interrupt the very statements
                     // that undo this event, so drop it first.
-                    savepoint.progress_handler(0, None::<fn() -> bool>)?;
+                    self.budget.disarm();
                     if savepoint.is_autocommit() {
                         // An interrupted write rolled the transaction back,
                         // this event's savepoint and every earlier event's
@@ -3348,7 +3438,7 @@ impl SqliteEventStore {
         }
         // Do not interrupt the commit with a timer that began at the first
         // statement.
-        tx.progress_handler(0, None::<fn() -> bool>)?;
+        self.budget.disarm();
         #[cfg(test)]
         {
             let code = self.commit_fault.load(AtomicOrdering::SeqCst);
@@ -3388,7 +3478,7 @@ impl SqliteEventStore {
             let end = self.run_batch(&mut conn, batch, &idxs, results, began);
             // Never leave an expired timer on the connection for whatever
             // runs next, not even its BEGIN.
-            let _ = conn.progress_handler(0, None::<fn() -> bool>);
+            self.budget.disarm();
             match end {
                 Ok(BatchEnd::Committed { reclaimed }) => {
                     if reclaimed {
@@ -3447,8 +3537,7 @@ impl EventStore for SqliteEventStore {
         let mut conn = self.lock()?;
         // Expiry has its own deadline, rather than inheriting the history
         // query's timer. Each bounded transaction makes durable progress.
-        let began = std::time::Instant::now();
-        conn.progress_handler(10_000, Some(move || began.elapsed() > EXPIRY_BUDGET))?;
+        self.budget.arm(EXPIRY_BUDGET);
         // Immediate, as in `run_batch`: see there.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let removed = tx.execute(
@@ -3457,7 +3546,7 @@ impl EventStore for SqliteEventStore {
         );
         // Do not interrupt commit with a timer that began before the DELETE.
         // On an interrupted statement the transaction drops and rolls back.
-        tx.progress_handler(0, None::<fn() -> bool>)?;
+        self.budget.disarm();
         let removed = removed?;
         tx.commit()?;
         if removed > 0 {
@@ -3469,8 +3558,7 @@ impl EventStore for SqliteEventStore {
 
     fn logical_bytes(&self) -> Result<u64, EventStoreError> {
         let conn = self.lock()?;
-        query_budget(&conn)?;
-        logical_bytes(&conn)
+        self.budget.within(QUERY_BUDGET, || logical_bytes(&conn))
     }
 
     fn put_prepared_batch(
@@ -3571,7 +3659,6 @@ impl EventStore for SqliteEventStore {
             return Ok(0);
         };
         self.with_reader(|conn| {
-            query_budget(conn)?;
             let mut statement = conn.prepare(&sql)?;
             let count: i64 = statement.query_row(params_from_iter(values), |r| r.get(0))?;
             u64::try_from(count).map_err(|_| EventStoreError::Corrupt)
@@ -3730,7 +3817,6 @@ impl SqliteEventStore {
         row: impl Fn(String) -> Result<T, EventStoreError>,
     ) -> Result<Vec<T>, EventStoreError> {
         self.with_reader(|conn| {
-            query_budget(conn)?;
             let mut statement = conn.prepare_cached(sql)?;
             let rows = statement.query_map(params_from_iter(values), |r| r.get::<_, String>(0))?;
             rows.map(|r| row(r?)).collect()
@@ -4110,6 +4196,36 @@ mod tests {
     }
     fn store(tmp: &TempDir) -> SqliteEventStore {
         SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap()
+    }
+
+    #[test]
+    fn a_budget_armed_inside_a_transaction_interrupts_its_statement() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        let budget = Budget::new();
+        budget.attach(&mut conn, 100).unwrap();
+        let count = "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i<1000000) SELECT count(*) FROM n";
+        let tx = conn.transaction().unwrap();
+        // Disarmed, the statement runs to the end.
+        assert_eq!(
+            tx.query_row(count, [], |r| r.get::<_, i64>(0)).unwrap(),
+            1_000_000
+        );
+        // Armed with no time left, through no `&mut Connection`.
+        budget.arm(Duration::ZERO);
+        match tx.query_row(count, [], |r| r.get::<_, i64>(0)) {
+            Err(rusqlite::Error::SqliteFailure(e, _)) => {
+                assert_eq!(e.code, rusqlite::ErrorCode::OperationInterrupted)
+            }
+            other => panic!("expected an interrupt, got {other:?}"),
+        }
+        budget.disarm();
+        assert_eq!(
+            tx.query_row(count, [], |r| r.get::<_, i64>(0)).unwrap(),
+            1_000_000
+        );
+        // `within` leaves the deadline disarmed for whatever runs next.
+        budget.within(Duration::ZERO, || ());
+        assert!(!budget.0.expired());
     }
     struct SequenceFreeSpace(Mutex<Vec<u64>>);
     impl FreeSpace for SequenceFreeSpace {
@@ -7205,8 +7321,8 @@ PRAGMA user_version=2;")).unwrap();
         assert_eq!(db.readers.len(), READ_CONNECTIONS);
         for reader in &db.readers {
             let reader = reader.lock().unwrap();
-            assert_eq!(pragma(&reader, "cache_size"), -321);
-            assert_eq!(pragma(&reader, "mmap_size"), 16 * 1024 * 1024);
+            assert_eq!(pragma(&reader.conn, "cache_size"), -321);
+            assert_eq!(pragma(&reader.conn, "mmap_size"), 16 * 1024 * 1024);
         }
         let default = SqliteEventStore::open(&tmp.path().join("other.sqlite"), 1_000_000).unwrap();
         let options = StoreOptions::default();
@@ -7253,7 +7369,7 @@ PRAGMA user_version=2;")).unwrap();
             let readers = db
                 .readers
                 .iter()
-                .map(|r| pragma(&r.lock().unwrap(), "mmap_size"))
+                .map(|r| pragma(&r.lock().unwrap().conn, "mmap_size"))
                 .collect();
             (writer, readers)
         };
@@ -7343,13 +7459,13 @@ PRAGMA user_version=2;")).unwrap();
         // Open: a read-only connection needs the live store's WAL index.
         let _store = store(&tmp);
         many_events(&path, 60_000);
-        let reader = open_reader(&path, 256, 64 * 1024 * 1024).unwrap();
+        let mut reader = open_reader(&path, 256, 64 * 1024 * 1024).unwrap();
         // Bounded: ten entries an index, five indexes (the tag indexes hold
         // as many rows as events here).
         let stop = Arc::new(AtomicBool::new(false));
         assert_eq!(
             warm_indexes(
-                &reader,
+                &mut reader,
                 &stop,
                 WARM_BYTES_PER_ENTRY * 50,
                 Duration::ZERO,
@@ -7362,7 +7478,7 @@ PRAGMA user_version=2;")).unwrap();
         let stopped = Arc::new(AtomicBool::new(true));
         assert_eq!(
             warm_indexes(
-                &reader,
+                &mut reader,
                 &stopped,
                 u64::MAX / 2,
                 Duration::ZERO,
@@ -7376,7 +7492,7 @@ PRAGMA user_version=2;")).unwrap();
         let unstopped = Arc::new(AtomicBool::new(false));
         let began = Instant::now();
         let slow = warm_indexes(
-            &reader,
+            &mut reader,
             &unstopped,
             WARM_BYTES_PER_ENTRY * 5 * 1_000_000,
             Duration::from_millis(5),
@@ -7402,7 +7518,7 @@ PRAGMA user_version=2;")).unwrap();
             })
         };
         let outcome = warm_indexes(
-            &reader,
+            &mut reader,
             &later,
             WARM_BYTES_PER_ENTRY * 5 * 1_000_000,
             Duration::from_millis(20),

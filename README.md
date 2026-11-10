@@ -46,13 +46,6 @@ cargo test --locked
 
 `scripts/check` runs formatting, Clippy, the tests and the docs, as CI does.
 
-## Known issues
-
-- The bundled SQLite (3.53.2) is affected by RUSTSEC-2026-0459. It is fixed
-  in `rusqlite` 0.41, which Wok will adopt together with shelter-kit and
-  Bothy, since a build links only one SQLite
-  ([#1](https://github.com/forgesworn/wok/issues/1)).
-
 ## Support development
 
 Wok is part of [ForgeSworn](https://github.com/forgesworn), maintained by

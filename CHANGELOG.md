@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.2.0 - 2026-11-10
+
+- Move to `rusqlite` 0.41.1 and its bundled SQLite 3.54 for RUSTSEC-2026-0459
+  (#1). The advisory is no longer ignored in `cargo audit`.
+- `EventStoreError::Sqlite` carries `rusqlite::Error`, so this release is
+  breaking: a consumer that also links `rusqlite` must move to 0.41 in the
+  same change, since a build links only one bundled SQLite.
+- The minimum supported Rust version is now 1.89, as `rusqlite` 0.41 requires.
+- `rusqlite` 0.41 replaces a progress handler only through `&mut Connection`,
+  which an open transaction does not give. Each connection now carries one
+  handler from when it opens, and the store arms and disarms its query and
+  expiry deadlines through it. A reader's deadline is disarmed when its query
+  returns, where it used to stay set until the next query.
+- No schema change: schema 4 remains, and existing stores open as before.
+
 ## 0.1.0 - 2026-11-10
 
 - First release: the event store, its group-commit writer and live fan-out,
