@@ -593,6 +593,11 @@ fn run(shared: Arc<Shared>, store: Arc<dyn EventStore>, announce: Announce) {
             committed.push((put, live));
         }
         let answered = replies.len();
+        // Counted before anyone is answered, so a caller holding its answer
+        // always finds its batch in `stats()`.
+        shared.batches.fetch_add(1, Ordering::Relaxed);
+        shared.events.fetch_add(answered as u64, Ordering::Relaxed);
+        shared.largest.fetch_max(answered as u64, Ordering::Relaxed);
         for (reply, result) in replies {
             reply.send(result);
         }
@@ -608,9 +613,6 @@ fn run(shared: Arc<Shared>, store: Arc<dyn EventStore>, announce: Announce) {
                 announce(visibility, event, json);
             }
         }
-        shared.batches.fetch_add(1, Ordering::Relaxed);
-        shared.events.fetch_add(answered as u64, Ordering::Relaxed);
-        shared.largest.fetch_max(answered as u64, Ordering::Relaxed);
         {
             let mut queue = shared.lock();
             // Back at the front, in their old order, ahead of anything that
