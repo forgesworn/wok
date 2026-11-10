@@ -3,9 +3,9 @@ resolver = "3"
 members = ["crates/wok-store"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 authors = ["TheCryptoDonkey"]
 repository = "https://github.com/forgesworn/wok"
@@ -14,7 +14,7 @@ repository = "https://github.com/forgesworn/wok"
 fs2 = "0.4.3"
 nostr = { version = "0.45.3", default-features = false, features = ["std"] }
 # `hooks`: the store installs its own WAL hook and progress handlers.
-rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
+rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tempfile = "3"
