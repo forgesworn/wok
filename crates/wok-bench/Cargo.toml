@@ -1,6 +1,6 @@
 [package]
 name = "wok-bench"
-description = "Store-level baseline benchmark for wok-store: ingest, query and live fan-out"
+description = "Store-level baseline benchmark for wok-store: ingest, query, live fan-out and the session engine"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -17,5 +17,8 @@ nostr = { workspace = true, features = ["os-rng"] }
 rusqlite = { workspace = true }
 serde_json = { workspace = true }
 tempfile = { workspace = true }
-# The fan-out scenario drives `LiveReceiver::recv` on a real runtime.
-tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
+# The fan-out and engine scenarios drive `LiveReceiver::recv` and the
+# session engine's writes on a real runtime; `sync` is the start barrier.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time", "sync"] }
+# A session is opened for a relay URL.
+url = { workspace = true }

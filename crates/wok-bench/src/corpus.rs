@@ -91,6 +91,19 @@ fn tag(parts: &[&str]) -> Result<Tag, String> {
     Tag::parse(parts.iter().copied()).map_err(|e| format!("build a tag: {e}"))
 }
 
+/// The corpus authors' keys, in author order: the same keys `build` signs
+/// with, so a scenario can authenticate as an author.
+pub fn author_keys(cfg: &Config) -> Result<Vec<Keys>, String> {
+    (0..cfg.authors)
+        .map(|a| Keys::parse(&secret_hex(cfg.seed, a)).map_err(|e| format!("a corpus key: {e}")))
+        .collect()
+}
+
+/// The key `notes` signs with.
+pub fn notes_key(seed: u64) -> Result<Keys, String> {
+    Keys::parse(&secret_hex(seed ^ 0x6661_6E6F_7574, 0)).map_err(|e| format!("a notes key: {e}"))
+}
+
 /// Build and sign the corpus. Signing is the slow part and is never timed.
 pub fn build(cfg: &Config) -> Result<Corpus, String> {
     let events = cfg.events;
@@ -107,9 +120,7 @@ pub fn build(cfg: &Config) -> Result<Corpus, String> {
             minimum_events(author_count)
         ));
     }
-    let keys: Vec<Keys> = (0..author_count)
-        .map(|a| Keys::parse(&secret_hex(cfg.seed, a)).map_err(|e| format!("a corpus key: {e}")))
-        .collect::<Result<_, _>>()?;
+    let keys = author_keys(cfg)?;
     let authors: Vec<PublicKey> = keys.iter().map(Keys::public_key).collect();
     let mut rng = SplitMix(cfg.seed ^ 0x636F_7270_7573);
     // Distinct, increasing timestamps that all precede NOW.
@@ -196,8 +207,7 @@ pub fn build(cfg: &Config) -> Result<Corpus, String> {
 /// `count` plain notes from one fixed key, for the fan-out scenario: it needs
 /// events to publish, not a corpus to query, so it has no size floor.
 pub fn notes(seed: u64, count: usize, content_bytes: usize) -> Result<Vec<Event>, String> {
-    let keys = Keys::parse(&secret_hex(seed ^ 0x6661_6E6F_7574, 0))
-        .map_err(|e| format!("a fan-out key: {e}"))?;
+    let keys = notes_key(seed)?;
     let mut rng = SplitMix(seed ^ 0x6661_6E6F_7574);
     let base = NOW - 10 * count as u64 - 1_000;
     (0..count)

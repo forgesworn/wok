@@ -1,9 +1,11 @@
 //! `wok-bench`: a store-level baseline benchmark for `wok-store`.
 //!
-//! Three scenarios, each a pure `wok-store` workload with no network:
+//! Four scenarios, each a pure `wok-store` workload with no network:
 //! `ingest` (puts through the group-commit writer and straight into the
 //! store), `query` (every query shape over a seeded corpus, in both
-//! partitions) and `fanout` (readers draining a `LiveFanout`). The corpus is
+//! partitions), `fanout` (readers draining a `LiveFanout`) and `engine` (the
+//! relay session engine, driven frame by frame, against the writer and the
+//! store). The corpus is
 //! seeded, signed from fixed keys and prepared before any clock starts. The
 //! result is one JSON document, and a refused put, a wrong answer or a
 //! lagging reader fails the run instead of being reported.
@@ -12,8 +14,10 @@
 //! They say nothing about other relay implementations, and are only
 //! comparable between runs with the same header and sizes.
 
+mod alloc;
 mod config;
 mod corpus;
+mod engine;
 mod fanout;
 mod ingest;
 mod query;
@@ -26,6 +30,9 @@ use wok_store::Visibility;
 
 use config::{Config, HELP};
 use corpus::Corpus;
+
+#[global_allocator]
+static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 fn main() -> ExitCode {
     let cfg = match config::parse(std::env::args().skip(1)) {
@@ -54,7 +61,7 @@ fn run(cfg: &Config) -> Result<Value, String> {
     let mut document = Map::new();
     document.insert("header".into(), support::header(cfg));
 
-    let corpus = if cfg.ingest || cfg.query {
+    let corpus = if cfg.ingest || cfg.query || cfg.engine {
         eprintln!("corpus: signing {} events", cfg.events);
         let corpus = corpus::build(cfg)?;
         check_ceiling(cfg, &corpus)?;
@@ -69,6 +76,9 @@ fn run(cfg: &Config) -> Result<Value, String> {
         }
         if cfg.query {
             document.insert("query".into(), query::run(cfg, corpus)?);
+        }
+        if cfg.engine {
+            document.insert("engine".into(), engine::run(cfg, corpus)?);
         }
     }
     if cfg.fanout {
@@ -138,6 +148,11 @@ mod tests {
             fanout_readers: 3,
             fanout_events: 20,
             fanout_workers: 2,
+            engine_connections: vec![1, 3],
+            engine_windows: vec![1, 4],
+            engine_workers: 2,
+            engine_subscribers: 6,
+            engine_publish: 5,
             ..Config::default()
         };
         let document = run(&cfg).unwrap_or_else(|e| panic!("the smoke run failed: {e}"));
@@ -191,6 +206,14 @@ mod tests {
         assert_eq!(fanout["deliveries"], 60);
         assert!(fanout["delivered_json_bytes"].as_u64().unwrap() > 0);
         assert!(fanout["all_readers_complete_ms"].is_number());
+
+        let engine = &document["engine"];
+        for part in ["writes", "queries", "subscribers"] {
+            assert!(engine.get(part).is_some(), "the engine lacks {part}");
+        }
+        assert!(engine["note"].is_string());
+        assert_eq!(engine["subscribers"]["subscribers"], 6);
+        assert_eq!(engine["subscribers"]["delivery"]["events"], 5);
 
         // Nothing identifies the machine or the person who ran it.
         let text = document.to_string();

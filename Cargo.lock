@@ -1643,6 +1643,7 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "url",
  "wok-store",
 ]
 
