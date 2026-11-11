@@ -1,0 +1,21 @@
+[package]
+name = "wok-bench"
+description = "Store-level baseline benchmark for wok-store: ingest, query and live fan-out"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+wok-store = { path = "../wok-store" }
+# Signing the corpus needs `Keys::sign_event`, which draws auxiliary
+# randomness from the operating system.
+nostr = { workspace = true, features = ["os-rng"] }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+# The fan-out scenario drives `LiveReceiver::recv` on a real runtime.
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "time"] }
