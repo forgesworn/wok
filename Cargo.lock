@@ -1207,7 +1207,7 @@ dependencies = [
 
 [[package]]
 name = "wok-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "nostr",
  "rusqlite",
@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "wok-store"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "hex",

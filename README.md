@@ -4,8 +4,8 @@ Wok is a Nostr relay core in Rust. It is being moved out of the Bothy node,
 where it was built as Bothy's event shelter, so that other applications can
 run the same relay.
 
-The `wok-store` crate holds the storage half and, unreleased on `main`, the
-session engine that serves clients from it.
+The `wok-store` crate holds the storage half and, since 0.3.0, the session
+engine that serves clients from it.
 
 - **Event store.** Nostr events in SQLite, split into a public and a sheltered
   partition. The caller chooses the partition; the store never infers it from
