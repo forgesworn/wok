@@ -1,9 +1,11 @@
 # wok
 
-Wok is a Nostr relay core in Rust, moved out of the Bothy node. It is a
-library: it never opens a port or runs a daemon, and it holds no policy. The
-application around it says who may connect, who its keepers and guests are,
-and which events carry authority, and it binds the listeners.
+Wok is a Nostr relay core in Rust, moved out of the Bothy node. Its library
+crates (`wok-store`, `wok-ws`) never open a port or run a daemon, and they
+hold no policy: the application around them says who may connect, who its
+keepers and guests are, and which events carry authority, and it binds the
+listeners. `wokd` is the one program: a members-only relay its operator runs
+for one group. Keep it members-only, with no open mode.
 
 ## Build & Test
 
@@ -33,6 +35,10 @@ crates/
   wok-ws/
     src/lib.rs     - Door: the WebSocket doors, their budgets, Admission
   wok-bench/       - store-level baseline benchmark (not published)
+  wokd/
+    src/lib.rs     - Config, Members, PerAddress, run/serve, remove
+    src/main.rs    - the wokd command line
+    README.md      - what an operator runs and owes
 ```
 
 ## Conventions

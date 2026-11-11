@@ -1,0 +1,35 @@
+[package]
+name = "wokd"
+description = "A members-only Nostr relay on Wok: one group's keys, NIP-42 for every read and write"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+# The data directory's lock: a removal never edits the store under a running relay.
+fs2 = { workspace = true }
+nostr = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+# The configuration file. Daemon-only: nothing a library links needs it.
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+url = { workspace = true }
+wok-store = { path = "../wok-store" }
+wok-ws = { path = "../wok-ws" }
+
+[dev-dependencies]
+futures-util = { workspace = true, features = ["sink"] }
+# A stock client: does an ordinary Nostr library get through NIP-42 here?
+nostr = { workspace = true, features = ["os-rng"] }
+nostr-sdk = { version = "0.45", default-features = false, features = ["ring", "rustls-tls-webpki-roots"] }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }

@@ -38,13 +38,17 @@ The `wok-ws` crate, since 0.4.0, carries those frames over WebSockets.
   returns for the connection's life. A request it cannot place is refused.
   NIP-42 is still required on every connection it admits.
 
-Wok is a library. It opens no port and holds no policy of its own: the
-application says who its keepers are (`KeeperAccess`), which guests may read
-and write which kinds in which rooms (`GuestAuthority`), which events carry
-authority to install rather than content to store (`AuthorityEvents`) and who
-may connect to the sheltered door (`Admission`), and it binds the listeners
-itself. Every operation asks again, so a withdrawn key or scope stops working
-at once.
+`wok-store` and `wok-ws` are libraries. They open no port and hold no
+policy of their own: the application says who its keepers are
+(`KeeperAccess`), which guests may read and write which kinds in which rooms
+(`GuestAuthority`), which events carry authority to install rather than
+content to store (`AuthorityEvents`) and who may connect to the sheltered
+door (`Admission`), and it binds the listeners itself. Every operation asks
+again, so a withdrawn key or scope stops working at once.
+
+The `wokd` crate is a program built on them: a members-only relay that its
+operator runs for one group, with a removal command for that operator. Whoever runs an
+instance operates it; see [`crates/wokd/README.md`](crates/wokd/README.md).
 
 ## Storage compatibility
 
