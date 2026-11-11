@@ -15,7 +15,7 @@ use wok_store::{
     StoreOptions, Visibility,
 };
 
-use crate::config::Config;
+use crate::config::{Config, Variant};
 use crate::corpus::{Corpus, NOW};
 
 /// The splitmix64 generator the corpus is drawn from.
@@ -293,7 +293,7 @@ pub fn writer_limits_json(limits: &WriterLimits) -> Value {
 pub fn header(cfg: &Config) -> Value {
     let dirty = git(&["status", "--porcelain"]).map(|status| !status.is_empty());
     let threads: Vec<usize> = cfg.ingest_threads.clone();
-    json!({
+    let mut header = json!({
         "git_commit": git(&["rev-parse", "--short", "HEAD"]).unwrap_or_else(|| "unknown".into()),
         "git_dirty": dirty,
         "os": std::env::consts::OS,
@@ -336,7 +336,24 @@ pub fn header(cfg: &Config) -> Value {
             "engine_subscribers": cfg.engine_subscribers,
             "engine_publish": cfg.engine_publish,
         },
-    })
+    });
+    // Added apart from the literal above, which the `json!` macro's recursion
+    // limit cannot hold any more.
+    header["scenarios"]["socket"] = json!(cfg.socket);
+    let params = &mut header["params"];
+    params["socket_connections"] = json!(cfg.socket_connections);
+    params["socket_window"] = json!(cfg.socket_window);
+    params["socket_events"] = json!(cfg.socket_events);
+    params["socket_serial_events"] = json!(cfg.socket_serial_events);
+    params["socket_variants"] = json!(
+        cfg.socket_variants
+            .iter()
+            .map(Variant::label)
+            .collect::<Vec<_>>()
+    );
+    params["socket_client_nodelay"] = json!(cfg.socket_client_nodelay);
+    params["socket_rounds"] = json!(cfg.socket_rounds);
+    header
 }
 
 #[cfg(test)]

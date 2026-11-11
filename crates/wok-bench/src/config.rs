@@ -24,6 +24,10 @@ SCENARIO
               through sessions and through the writer alone, queries through a
               session and straight on the store, and the memory and delivery
               cost of subscribers (no network; counts allocations)
+    socket    acknowledged-write throughput through the relay's WebSocket doors
+              on 127.0.0.1, against fresh stores, beside the engine driven
+              directly on the same events (writes only; client and server share
+              one process and one host)
     all       every scenario (default)
 
 Results are one JSON document on stdout, or in the file named by --out.
@@ -73,6 +77,26 @@ queries, and --fanout-queue-bytes and --fanout-total-bytes size its live queues)
                             (default 1000)
     --engine-publish N      events published to those subscribers (default 200)
 
+SOCKET (--content-bytes and --seed apply; no corpus is built)
+    --socket-connections L  comma-separated connection counts (default 1,4,16,64)
+    --socket-window N       EVENT frames each connection keeps in flight, at most
+                            64, the door's own cap (default 32)
+    --socket-events N       events per cell, split evenly across the connections
+                            (default 20000)
+    --socket-serial-events N  events for the one strictly serial cell, one
+                            connection with a window of 1; 0 skips it
+                            (default 2000)
+    --socket-variants L     comma-separated server settings, each
+                            WORKERS:BLOCKING:SHARED/PUBLIC:NODELAY, for example
+                            2:8:2/1:off. WORKERS and BLOCKING size the server's
+                            runtime, SHARED and PUBLIC are the door's work
+                            permits, NODELAY is the server's TCP_NODELAY (on or
+                            off). Default 2:8:2/1:off
+    --socket-client-nodelay on|off  the client's TCP_NODELAY (default on)
+    --socket-rounds N       run the whole grid N times in one process, the
+                            variant order reversed on even rounds; each round is
+                            reported separately (default 1)
+
 STORE
     --profile P           server or phone StoreOptions (default server)
     --max-bytes N         the store's logical byte ceiling (default: sized
@@ -113,12 +137,111 @@ impl QueryMode {
     }
 }
 
+/// The most EVENT frames the door keeps in flight on one connection
+/// (`MAX_INFLIGHT_WRITES` in `wok-ws`, which is private): a larger window
+/// would only queue behind it, so it is refused.
+pub const DOOR_INFLIGHT_WRITES: usize = 64;
+
+/// One server setting of the socket scenario: the server runtime's workers
+/// and blocking threads, the door's work permits, and the server listener's
+/// TCP_NODELAY.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Variant {
+    pub workers: usize,
+    pub blocking: usize,
+    pub shared: usize,
+    pub public: usize,
+    pub nodelay: bool,
+}
+
+impl Variant {
+    /// The syntax it is parsed from, and the name it is reported under.
+    pub fn label(&self) -> String {
+        format!(
+            "{}:{}:{}/{}:{}",
+            self.workers,
+            self.blocking,
+            self.shared,
+            self.public,
+            if self.nodelay { "on" } else { "off" }
+        )
+    }
+}
+
+impl FromStr for Variant {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, String> {
+        let bad = |why: &str| {
+            format!(
+                "--socket-variants: `{text}` is not WORKERS:BLOCKING:SHARED/PUBLIC:NODELAY ({why})"
+            )
+        };
+        let parts: Vec<&str> = text.split(':').collect();
+        let [workers, blocking, permits, nodelay] = parts.as_slice() else {
+            return Err(bad("expected four parts"));
+        };
+        let (shared, public) = permits
+            .split_once('/')
+            .ok_or_else(|| bad("the work permits are SHARED/PUBLIC"))?;
+        let count = |what: &str, value: &str| -> Result<usize, String> {
+            let value: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| bad(&format!("{what} `{value}` is not a number")))?;
+            // A zero is refused here: a door with no work permits would turn
+            // every write into a 10 second BUSY instead of a clean error.
+            if value == 0 {
+                Err(bad(&format!("{what} must be at least 1")))
+            } else {
+                Ok(value)
+            }
+        };
+        let variant = Self {
+            workers: count("WORKERS", workers)?,
+            blocking: count("BLOCKING", blocking)?,
+            shared: count("SHARED", shared)?,
+            public: count("PUBLIC", public)?,
+            nodelay: switch("--socket-variants", nodelay.trim())?,
+        };
+        if variant.public > variant.shared {
+            return Err(bad("PUBLIC is a share of SHARED, so at most SHARED"));
+        }
+        Ok(variant)
+    }
+}
+
+/// `on` or `off`.
+fn switch(name: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "on" => Ok(true),
+        "off" => Ok(false),
+        _ => Err(format!("{name}: `{value}` is `on` or `off`")),
+    }
+}
+
+fn variants(value: &str) -> Result<Vec<Variant>, String> {
+    let mut out: Vec<Variant> = Vec::new();
+    for part in value.split(',') {
+        let variant: Variant = part.trim().parse()?;
+        if out.contains(&variant) {
+            return Err(format!(
+                "--socket-variants: `{}` is listed twice",
+                variant.label()
+            ));
+        }
+        out.push(variant);
+    }
+    Ok(out)
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub ingest: bool,
     pub query: bool,
     pub fanout: bool,
     pub engine: bool,
+    pub socket: bool,
     pub seed: u64,
     pub events: usize,
     pub authors: usize,
@@ -141,6 +264,13 @@ pub struct Config {
     pub engine_events: usize,
     pub engine_subscribers: usize,
     pub engine_publish: usize,
+    pub socket_connections: Vec<usize>,
+    pub socket_window: usize,
+    pub socket_events: usize,
+    pub socket_serial_events: usize,
+    pub socket_variants: Vec<Variant>,
+    pub socket_client_nodelay: bool,
+    pub socket_rounds: usize,
     pub profile: Profile,
     pub max_bytes: Option<u64>,
     pub dir: Option<PathBuf>,
@@ -154,6 +284,7 @@ impl Default for Config {
             query: true,
             fanout: true,
             engine: true,
+            socket: true,
             seed: 1,
             events: 2000,
             authors: 16,
@@ -176,6 +307,19 @@ impl Default for Config {
             engine_events: 0,
             engine_subscribers: 1000,
             engine_publish: 200,
+            socket_connections: vec![1, 4, 16, 64],
+            socket_window: 32,
+            socket_events: 20_000,
+            socket_serial_events: 2000,
+            socket_variants: vec![Variant {
+                workers: 2,
+                blocking: 8,
+                shared: 2,
+                public: 1,
+                nodelay: false,
+            }],
+            socket_client_nodelay: true,
+            socket_rounds: 1,
             profile: Profile::Server,
             max_bytes: None,
             dir: None,
@@ -298,6 +442,23 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
                 cfg.engine_subscribers = at_least_one(name, number(name, &value)?)?
             }
             "engine-publish" => cfg.engine_publish = at_least_one(name, number(name, &value)?)?,
+            "socket-connections" => cfg.socket_connections = counts(name, &value)?,
+            "socket-window" => {
+                let window = at_least_one(name, number(name, &value)?)?;
+                if window > DOOR_INFLIGHT_WRITES {
+                    return Err(format!(
+                        "--socket-window is at most {DOOR_INFLIGHT_WRITES}, the door's own cap on writes in flight per connection"
+                    ));
+                }
+                cfg.socket_window = window;
+            }
+            "socket-events" => cfg.socket_events = at_least_one(name, number(name, &value)?)?,
+            "socket-serial-events" => cfg.socket_serial_events = number(name, &value)?,
+            "socket-variants" => cfg.socket_variants = variants(&value)?,
+            "socket-client-nodelay" => {
+                cfg.socket_client_nodelay = switch(&format!("--{name}"), &value)?
+            }
+            "socket-rounds" => cfg.socket_rounds = at_least_one(name, number(name, &value)?)?,
             "profile" => {
                 cfg.profile = match value.as_str() {
                     "server" => Profile::Server,
@@ -311,15 +472,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             _ => return Err(format!("unknown option `--{name}`")),
         }
     }
-    let (ingest, query, fanout, engine) = match scenario.as_deref() {
-        None | Some("all") => (true, true, true, true),
-        Some("ingest") => (true, false, false, false),
-        Some("query") => (false, true, false, false),
-        Some("fanout") => (false, false, true, false),
-        Some("engine") => (false, false, false, true),
+    let (ingest, query, fanout, engine, socket) = match scenario.as_deref() {
+        None | Some("all") => (true, true, true, true, true),
+        Some("ingest") => (true, false, false, false, false),
+        Some("query") => (false, true, false, false, false),
+        Some("fanout") => (false, false, true, false, false),
+        Some("engine") => (false, false, false, true, false),
+        Some("socket") => (false, false, false, false, true),
         Some(other) => {
             return Err(format!(
-                "unknown scenario `{other}` (ingest, query, fanout, engine or all)"
+                "unknown scenario `{other}` (ingest, query, fanout, engine, socket or all)"
             ));
         }
     };
@@ -327,6 +489,16 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
     cfg.query = query;
     cfg.fanout = fanout;
     cfg.engine = engine;
+    cfg.socket = socket;
+    if cfg.socket {
+        let widest = cfg.socket_connections.iter().copied().max().unwrap_or(1);
+        if cfg.socket_events < widest {
+            return Err(format!(
+                "--socket-events {} is below the widest --socket-connections {widest}: every connection needs an event",
+                cfg.socket_events
+            ));
+        }
+    }
     Ok(Some(cfg))
 }
 
@@ -341,8 +513,21 @@ mod tests {
     #[test]
     fn no_arguments_run_everything_at_the_defaults() {
         let cfg = parsed(&[]).unwrap().unwrap();
-        assert!(cfg.ingest && cfg.query && cfg.fanout && cfg.engine);
+        assert!(cfg.ingest && cfg.query && cfg.fanout && cfg.engine && cfg.socket);
         assert_eq!(cfg.events, 2000);
+        assert_eq!(cfg.socket_connections, vec![1, 4, 16, 64]);
+        assert_eq!(
+            (
+                cfg.socket_window,
+                cfg.socket_events,
+                cfg.socket_serial_events
+            ),
+            (32, 20_000, 2000)
+        );
+        assert_eq!(cfg.socket_variants.len(), 1);
+        assert_eq!(cfg.socket_variants[0].label(), "2:8:2/1:off");
+        assert!(cfg.socket_client_nodelay);
+        assert_eq!(cfg.socket_rounds, 1);
         assert_eq!(cfg.ingest_threads, vec![1, 4]);
         assert_eq!(cfg.engine_connections, vec![1, 4, 16, 64]);
         assert_eq!(cfg.engine_windows, vec![1, 32]);
@@ -391,6 +576,79 @@ mod tests {
         assert_eq!((cfg.engine_subscribers, cfg.engine_publish), (20, 7));
         assert!(parsed(&["--engine-windows", "0"]).is_err());
         assert!(parsed(&["--engine-connections", "1,,2"]).is_err());
+    }
+
+    #[test]
+    fn the_socket_scenario_and_its_options_parse() {
+        let cfg = parsed(&[
+            "socket",
+            "--socket-connections",
+            "2,8",
+            "--socket-window=4",
+            "--socket-events",
+            "1_000",
+            "--socket-serial-events=0",
+            "--socket-variants",
+            "2:8:2/1:off, 4:16:8/8:on",
+            "--socket-client-nodelay",
+            "off",
+            "--socket-rounds=3",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(cfg.socket && !cfg.engine && !cfg.ingest && !cfg.query && !cfg.fanout);
+        assert_eq!(cfg.socket_connections, vec![2, 8]);
+        assert_eq!(
+            (
+                cfg.socket_window,
+                cfg.socket_events,
+                cfg.socket_serial_events
+            ),
+            (4, 1000, 0)
+        );
+        let labels: Vec<String> = cfg.socket_variants.iter().map(Variant::label).collect();
+        assert_eq!(labels, ["2:8:2/1:off", "4:16:8/8:on"]);
+        assert!(cfg.socket_variants[1].nodelay);
+        assert!(!cfg.socket_client_nodelay);
+        assert_eq!(cfg.socket_rounds, 3);
+    }
+
+    #[test]
+    fn bad_socket_input_is_refused_with_a_reason() {
+        for (args, reason) in [
+            (&["--socket-window", "65"][..], "at most 64"),
+            (&["--socket-window", "0"], "at least 1"),
+            (&["--socket-rounds", "0"], "at least 1"),
+            (&["--socket-connections", "1,0"], "at least 1"),
+            (&["--socket-client-nodelay", "yes"], "on` or `off"),
+            (&["--socket-variants", "2:8:2/1"], "four parts"),
+            (&["--socket-variants", "2:8:2:off"], "SHARED/PUBLIC"),
+            (&["--socket-variants", "0:8:2/1:off"], "at least 1"),
+            (&["--socket-variants", "2:8:2/0:off"], "at least 1"),
+            (&["--socket-variants", "2:8:1/2:off"], "at most SHARED"),
+            (&["--socket-variants", "2:x:2/1:off"], "not a number"),
+            (&["--socket-variants", "2:8:2/1:maybe"], "on` or `off"),
+            (
+                &["--socket-variants", "2:8:2/1:off,2:8:2/1:off"],
+                "listed twice",
+            ),
+            (
+                &[
+                    "socket",
+                    "--socket-connections",
+                    "64",
+                    "--socket-events",
+                    "10",
+                ],
+                "below the widest",
+            ),
+        ] {
+            let message = parsed(args).unwrap_err();
+            assert!(
+                message.contains(reason),
+                "{args:?}: `{message}` lacks `{reason}`"
+            );
+        }
     }
 
     #[test]
