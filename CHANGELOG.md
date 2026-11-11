@@ -19,6 +19,14 @@
   expired".
 - New dependencies, in `wok-ws` only: `axum` 0.8 with `ws`, and
   `futures-util` 0.3. `wok-store` gains none.
+- `wok-bench` gains an `engine` scenario: the relay session engine driven
+  frame by frame with no network, beside the bare writer and the raw store in
+  the same run. It gives acknowledged writes by session count and in-flight
+  window, REQ and COUNT through a session against the same filters on the
+  store, and what a subscribed session holds in Rust allocations. Every event
+  is signed and the engine checks each signature. A default run now includes
+  it, and the whole process runs under a counting allocator, which each
+  result's header records.
 
 ## 0.3.0 - 2026-11-11
 

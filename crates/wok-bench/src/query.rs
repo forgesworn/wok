@@ -7,11 +7,13 @@
 //! answer compared with that expectation, ids and order; during timing each
 //! answer's length is checked against it outside the timed region.
 
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use nostr::event::Event;
 use nostr::filter::{Filter, MatchEventOptions};
 use serde_json::{Value, json};
+use tempfile::TempDir;
 use wok_store::{EventStore, MAX_EXACT_COUNT, MAX_QUERY_EVENTS, SqliteEventStore, Visibility};
 
 use crate::config::{Config, QueryMode};
@@ -24,23 +26,36 @@ use crate::support::{
 /// Events per population call.
 const POPULATE_BATCH: usize = 128;
 
-struct Variant {
-    filter: Filter,
+pub(crate) struct Variant {
+    pub filter: Filter,
+    /// The filter as the JSON a client would send in a REQ.
+    pub raw: Value,
     /// The ids the store must return, in order (a query shape).
-    ids: Vec<String>,
+    pub ids: Vec<String>,
     /// The number the store must count (a count shape).
-    count: u64,
+    pub count: u64,
 }
 
-struct Shape {
-    name: &'static str,
-    counts: bool,
-    variants: Vec<Variant>,
+pub(crate) struct Shape {
+    pub name: &'static str,
+    pub counts: bool,
+    pub variants: Vec<Variant>,
 }
 
-pub fn run(cfg: &Config, corpus: &Corpus) -> Result<Value, String> {
-    eprintln!("query: populating {} events", corpus.items.len());
-    let (_dir, store) = fresh_store(cfg, corpus.items.len())?;
+/// A store holding the whole corpus, and what filling it took.
+pub(crate) struct Populated {
+    /// The store comes first so that it drops before its directory goes.
+    pub store: Arc<SqliteEventStore>,
+    pub _dir: TempDir,
+    pub prepared_in: Duration,
+    pub populated_in: Duration,
+    pub reoffers: usize,
+}
+
+/// Fill a fresh store with the corpus, in `POPULATE_BATCH` chunks, and check
+/// that it holds exactly the corpus.
+pub(crate) fn populated_store(cfg: &Config, corpus: &Corpus) -> Result<Populated, String> {
+    let (dir, store) = fresh_store(cfg, corpus.items.len())?;
     let (puts, prepared_in) = prepare(corpus)?;
     let started = Instant::now();
     let mut reoffers = 0;
@@ -49,7 +64,24 @@ pub fn run(cfg: &Config, corpus: &Corpus) -> Result<Value, String> {
     }
     let populated_in = started.elapsed();
     verify_population(&store, corpus)?;
-    drop(puts);
+    Ok(Populated {
+        store,
+        _dir: dir,
+        prepared_in,
+        populated_in,
+        reoffers,
+    })
+}
+
+pub fn run(cfg: &Config, corpus: &Corpus) -> Result<Value, String> {
+    eprintln!("query: populating {} events", corpus.items.len());
+    let populated = populated_store(cfg, corpus)?;
+    let store = &populated.store;
+    let (prepared_in, populated_in, reoffers) = (
+        populated.prepared_in,
+        populated.populated_in,
+        populated.reoffers,
+    );
     // Let the checkpoint thread drain and truncate the WAL, so the first
     // shape is not timed against it.
     std::thread::sleep(cfg.settle());
@@ -63,7 +95,7 @@ pub fn run(cfg: &Config, corpus: &Corpus) -> Result<Value, String> {
             eprintln!("query: {} {}", partition_name(visibility), shape.name);
             results.insert(
                 shape.name.to_string(),
-                time_shape(cfg, &store, visibility, shape)?,
+                time_shape(cfg, store, visibility, shape)?,
             );
         }
         partitions.insert(
@@ -263,7 +295,11 @@ fn pick<'a>(
 }
 
 /// The variants of every shape for one partition.
-fn shapes(cfg: &Config, events: &[&Event], visibility: Visibility) -> Result<Vec<Shape>, String> {
+pub(crate) fn shapes(
+    cfg: &Config,
+    events: &[&Event],
+    visibility: Visibility,
+) -> Result<Vec<Shape>, String> {
     let mut rng =
         SplitMix(cfg.seed ^ 0x7368_6170_6573 ^ ((visibility == Visibility::Public) as u64));
     let n = cfg.variants;
@@ -372,6 +408,7 @@ fn shapes(cfg: &Config, events: &[&Event], visibility: Visibility) -> Result<Vec
     ] {
         let mut variants = Vec::with_capacity(filters.len());
         for value in filters {
+            let raw = value.clone();
             let filter = filter_of(value)?;
             let (ids, count) = if counting {
                 (Vec::new(), expected_count(events, &filter))
@@ -384,7 +421,12 @@ fn shapes(cfg: &Config, events: &[&Event], visibility: Visibility) -> Result<Vec
                     partition_name(visibility)
                 ));
             }
-            variants.push(Variant { filter, ids, count });
+            variants.push(Variant {
+                filter,
+                raw,
+                ids,
+                count,
+            });
         }
         out.push(Shape {
             name,

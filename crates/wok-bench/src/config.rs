@@ -20,13 +20,17 @@ SCENARIO
               the store on one thread
     query     populate a store, then time each query shape in both partitions
     fanout    attach readers to a live fan-out and publish events to them
+    engine    the relay session engine against the store: acknowledged writes
+              through sessions and through the writer alone, queries through a
+              session and straight on the store, and the memory and delivery
+              cost of subscribers (no network; counts allocations)
     all       every scenario (default)
 
 Results are one JSON document on stdout, or in the file named by --out.
 Progress goes to stderr. Every figure is checked: a refused or duplicate put,
 a short query answer or a lagging reader fails the run.
 
-CORPUS (ingest and query)
+CORPUS (ingest, query and engine)
     --seed N              seed for keys and content (default 1)
     --events N            events in the corpus (default 2000)
     --authors N           distinct authors (default 16)
@@ -53,6 +57,21 @@ FANOUT
                           reader; 0 publishes as fast as it can (default 0)
     --fanout-queue-bytes N  per-reader queue limit (default the live default)
     --fanout-total-bytes N  limit on distinct bytes held (default the live default)
+
+ENGINE (the corpus sizes above apply; --queries and --variants shape its
+queries, and --fanout-queue-bytes and --fanout-total-bytes size its live queues)
+    --engine-connections L  comma-separated session counts for the writes
+                            (default 1,4,16,64)
+    --engine-windows L      comma-separated in-flight windows: 1 commits one
+                            write at a time, more reserve in arrival order and
+                            await that many together (default 1,32)
+    --engine-workers N      runtime threads driving the sessions (default 4)
+    --engine-events N       most events each write cell sends, taken from the
+                            front of the door's admitted subset; 0 sends the
+                            whole subset (default 0)
+    --engine-subscribers N  sessions holding an open REQ and a live receiver
+                            (default 1000)
+    --engine-publish N      events published to those subscribers (default 200)
 
 STORE
     --profile P           server or phone StoreOptions (default server)
@@ -99,6 +118,7 @@ pub struct Config {
     pub ingest: bool,
     pub query: bool,
     pub fanout: bool,
+    pub engine: bool,
     pub seed: u64,
     pub events: usize,
     pub authors: usize,
@@ -115,6 +135,12 @@ pub struct Config {
     pub fanout_window: usize,
     pub fanout_queue_bytes: usize,
     pub fanout_total_bytes: usize,
+    pub engine_connections: Vec<usize>,
+    pub engine_windows: Vec<usize>,
+    pub engine_workers: usize,
+    pub engine_events: usize,
+    pub engine_subscribers: usize,
+    pub engine_publish: usize,
     pub profile: Profile,
     pub max_bytes: Option<u64>,
     pub dir: Option<PathBuf>,
@@ -127,6 +153,7 @@ impl Default for Config {
             ingest: true,
             query: true,
             fanout: true,
+            engine: true,
             seed: 1,
             events: 2000,
             authors: 16,
@@ -143,6 +170,12 @@ impl Default for Config {
             fanout_window: 0,
             fanout_queue_bytes: LIVE_QUEUE_BYTES,
             fanout_total_bytes: LIVE_TOTAL_BYTES,
+            engine_connections: vec![1, 4, 16, 64],
+            engine_windows: vec![1, 32],
+            engine_workers: 4,
+            engine_events: 0,
+            engine_subscribers: 1000,
+            engine_publish: 200,
             profile: Profile::Server,
             max_bytes: None,
             dir: None,
@@ -189,6 +222,13 @@ fn at_least_one(name: &str, value: usize) -> Result<usize, String> {
     }
 }
 
+fn counts(name: &str, value: &str) -> Result<Vec<usize>, String> {
+    value
+        .split(',')
+        .map(|part| at_least_one(name, number(name, part.trim())?))
+        .collect()
+}
+
 /// Parse the arguments after the program name. `Ok(None)` asks for the help text.
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, String> {
     let mut cfg = Config::default();
@@ -220,13 +260,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             "events" => cfg.events = at_least_one(name, number(name, &value)?)?,
             "authors" => cfg.authors = at_least_one(name, number(name, &value)?)?,
             "content-bytes" => cfg.content_bytes = number(name, &value)?,
-            "ingest-threads" => {
-                let threads = value
-                    .split(',')
-                    .map(|part| at_least_one(name, number(name, part.trim())?))
-                    .collect::<Result<Vec<usize>, String>>()?;
-                cfg.ingest_threads = threads;
-            }
+            "ingest-threads" => cfg.ingest_threads = counts(name, &value)?,
             "direct-batch" => {
                 let batch = at_least_one(name, number(name, &value)?)?;
                 if batch > BATCH_EVENTS {
@@ -256,6 +290,14 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             "fanout-total-bytes" => {
                 cfg.fanout_total_bytes = at_least_one(name, number(name, &value)?)?
             }
+            "engine-connections" => cfg.engine_connections = counts(name, &value)?,
+            "engine-windows" => cfg.engine_windows = counts(name, &value)?,
+            "engine-workers" => cfg.engine_workers = at_least_one(name, number(name, &value)?)?,
+            "engine-events" => cfg.engine_events = number(name, &value)?,
+            "engine-subscribers" => {
+                cfg.engine_subscribers = at_least_one(name, number(name, &value)?)?
+            }
+            "engine-publish" => cfg.engine_publish = at_least_one(name, number(name, &value)?)?,
             "profile" => {
                 cfg.profile = match value.as_str() {
                     "server" => Profile::Server,
@@ -269,20 +311,22 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             _ => return Err(format!("unknown option `--{name}`")),
         }
     }
-    let (ingest, query, fanout) = match scenario.as_deref() {
-        None | Some("all") => (true, true, true),
-        Some("ingest") => (true, false, false),
-        Some("query") => (false, true, false),
-        Some("fanout") => (false, false, true),
+    let (ingest, query, fanout, engine) = match scenario.as_deref() {
+        None | Some("all") => (true, true, true, true),
+        Some("ingest") => (true, false, false, false),
+        Some("query") => (false, true, false, false),
+        Some("fanout") => (false, false, true, false),
+        Some("engine") => (false, false, false, true),
         Some(other) => {
             return Err(format!(
-                "unknown scenario `{other}` (ingest, query, fanout or all)"
+                "unknown scenario `{other}` (ingest, query, fanout, engine or all)"
             ));
         }
     };
     cfg.ingest = ingest;
     cfg.query = query;
     cfg.fanout = fanout;
+    cfg.engine = engine;
     Ok(Some(cfg))
 }
 
@@ -297,9 +341,12 @@ mod tests {
     #[test]
     fn no_arguments_run_everything_at_the_defaults() {
         let cfg = parsed(&[]).unwrap().unwrap();
-        assert!(cfg.ingest && cfg.query && cfg.fanout);
+        assert!(cfg.ingest && cfg.query && cfg.fanout && cfg.engine);
         assert_eq!(cfg.events, 2000);
         assert_eq!(cfg.ingest_threads, vec![1, 4]);
+        assert_eq!(cfg.engine_connections, vec![1, 4, 16, 64]);
+        assert_eq!(cfg.engine_windows, vec![1, 32]);
+        assert_eq!((cfg.engine_subscribers, cfg.engine_publish), (1000, 200));
     }
 
     #[test]
@@ -314,9 +361,36 @@ mod tests {
         ])
         .unwrap()
         .unwrap();
-        assert!(!cfg.ingest && cfg.query && !cfg.fanout);
+        assert!(!cfg.ingest && cfg.query && !cfg.fanout && !cfg.engine);
         assert_eq!((cfg.events, cfg.queries), (1000, 7));
         assert_eq!(cfg.ingest_threads, vec![2, 8]);
+    }
+
+    #[test]
+    fn the_engine_scenario_and_its_options_parse() {
+        let cfg = parsed(&[
+            "engine",
+            "--engine-connections",
+            "2,8",
+            "--engine-windows=1,4",
+            "--engine-workers",
+            "3",
+            "--engine-events",
+            "500",
+            "--engine-subscribers=20",
+            "--engine-publish",
+            "7",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(cfg.engine && !cfg.ingest && !cfg.query && !cfg.fanout);
+        assert_eq!(cfg.engine_connections, vec![2, 8]);
+        assert_eq!(cfg.engine_windows, vec![1, 4]);
+        assert_eq!(cfg.engine_workers, 3);
+        assert_eq!(cfg.engine_events, 500);
+        assert_eq!((cfg.engine_subscribers, cfg.engine_publish), (20, 7));
+        assert!(parsed(&["--engine-windows", "0"]).is_err());
+        assert!(parsed(&["--engine-connections", "1,,2"]).is_err());
     }
 
     #[test]

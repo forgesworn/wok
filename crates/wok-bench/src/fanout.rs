@@ -29,7 +29,7 @@ use crate::support::{ms, per_second, prepare_json};
 /// The live module charges this much on top of an event's JSON for each
 /// queued copy. It is private there, so the pre-check below mirrors it; the
 /// run fails on a lagging reader whatever this says.
-const CHARGE_OVERHEAD: usize = 512;
+pub(crate) const CHARGE_OVERHEAD: usize = 512;
 /// How long to wait for any reader, or for the slowest reader to move on.
 const STALL: Duration = Duration::from_secs(120);
 

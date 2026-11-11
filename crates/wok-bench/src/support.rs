@@ -309,7 +309,9 @@ pub fn header(cfg: &Config) -> Value {
             "ingest": cfg.ingest,
             "query": cfg.query,
             "fanout": cfg.fanout,
+            "engine": cfg.engine,
         },
+        "allocations_counted": "every allocation of the process goes through a counting allocator (two relaxed atomic operations each), which every scenario pays",
         "params": {
             "seed": cfg.seed,
             "events": cfg.events,
@@ -327,6 +329,12 @@ pub fn header(cfg: &Config) -> Value {
             "fanout_window": cfg.fanout_window,
             "fanout_queue_bytes": cfg.fanout_queue_bytes,
             "fanout_total_bytes": cfg.fanout_total_bytes,
+            "engine_connections": cfg.engine_connections,
+            "engine_windows": cfg.engine_windows,
+            "engine_workers": cfg.engine_workers,
+            "engine_events": cfg.engine_events,
+            "engine_subscribers": cfg.engine_subscribers,
+            "engine_publish": cfg.engine_publish,
         },
     })
 }
