@@ -4,7 +4,8 @@ Wok is a Nostr relay core in Rust. It is being moved out of the Bothy node,
 where it was built as Bothy's event shelter, so that other applications can
 run the same relay.
 
-Version 0.1.0 is the first step: the storage half, as the `wok-store` crate.
+The `wok-store` crate holds the storage half and, unreleased on `main`, the
+session engine that serves clients from it.
 
 - **Event store.** Nostr events in SQLite, split into a public and a sheltered
   partition. The caller chooses the partition; the store never infers it from
@@ -17,10 +18,20 @@ Version 0.1.0 is the first step: the storage half, as the `wok-store` crate.
 - **Live fan-out.** Committed events are delivered to attached connections,
   each with its own queue bounded by bytes. A reader that falls behind is
   dropped as lagged instead of holding memory for everyone.
+- **Session engine** (`wok_store::relay`). One session per connection turns
+  client frames into replies: NIP-01 `EVENT`, `REQ` and `CLOSE`, NIP-42
+  `AUTH`, NIP-45 `COUNT` and NIP-77 reconciliation, each bounded per frame,
+  filter, reply and minute. A public door serves anyone and takes only
+  keeper-authored events of a short list of public kinds; a sheltered door
+  serves authenticated keepers and guests.
 
-Wok is a library. It opens no port, authenticates nobody and holds no grant
-model. The NIP-01/NIP-42 session engine and the WebSocket server are still
-inside Bothy and move here in later releases.
+Wok is a library. It opens no port and holds no policy of its own: the
+application says who its keepers are (`KeeperAccess`), which guests may read
+and write which kinds in which rooms (`GuestAuthority`), and which events carry
+authority to install rather than content to store (`AuthorityEvents`), and it
+carries the frames over its own transport. Every operation asks again, so a
+withdrawn key or scope stops working at once. The WebSocket server is still
+inside Bothy and moves here in a later release.
 
 ## Storage compatibility
 

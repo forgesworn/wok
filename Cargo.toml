@@ -12,7 +12,10 @@ repository = "https://github.com/forgesworn/wok"
 
 [workspace.dependencies]
 fs2 = "0.4.3"
-nostr = { version = "0.45.3", default-features = false, features = ["std"] }
+hex = "0.4"
+negentropy = "0.5.2"
+# `os-rng`: the relay draws each NIP-42 challenge from a fresh key.
+nostr = { version = "0.45.3", default-features = false, features = ["std", "os-rng"] }
 # `hooks`: the store installs its own WAL hook and progress handlers.
 rusqlite = { version = "0.41.1", features = ["bundled", "hooks"] }
 serde = { version = "1", features = ["derive"] }
@@ -21,3 +24,4 @@ tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.48", default-features = false }
 tracing = "0.1"
+url = "2.5"
