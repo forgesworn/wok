@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1 - 2026-11-11
 
 - `wok-bench` gains a diagnostic `door-path` scenario, run only when named
   and not part of a default `all` run. It sets the sheltered door beside the
