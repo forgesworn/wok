@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Add the relay session engine as `wok_store::relay`, moved from Bothy's node
+  repository: NIP-01 sessions with NIP-42 authentication, NIP-45 counts and
+  NIP-77 reconciliation over the store, on a public door and a sheltered one.
+  Replies are word for word what Bothy sent, including two refusals that still
+  say "circle grant".
+- The engine holds no policy. `KeeperAccess` says who the keepers are,
+  `GuestAuthority` gives guests room- and kind-scoped access to the sheltered
+  partition, `AuthorityEvents` names the events a door installs instead of
+  storing, and `AnnounceHook` sees each event announced live.
+- New dependencies: `negentropy` 0.5, `url` 2.5, `hex` 0.4, and `nostr`'s
+  `os-rng` feature, from which each NIP-42 challenge is drawn.
+- No schema change.
+
 ## 0.2.0 - 2026-11-10
 
 - Move to `rusqlite` 0.41.1 and its bundled SQLite 3.54 for RUSTSEC-2026-0459
