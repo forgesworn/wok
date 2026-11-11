@@ -1,8 +1,9 @@
 # wok
 
 Wok is a Nostr relay core in Rust, moved out of the Bothy node. It is a
-library: it never opens a port, runs a daemon, authenticates clients or
-decides grants. Those belong to the application around it.
+library: it never opens a port or runs a daemon, and it holds no policy. The
+application around it says who may connect, who its keepers and guests are,
+and which events carry authority, and it binds the listeners.
 
 ## Build & Test
 
@@ -27,6 +28,11 @@ crates/
     src/store.rs   - EventStore, SqliteEventStore, schema and migration
     src/writer.rs  - EventWriter: one writer thread, group commit
     src/live.rs    - LiveFanout: byte-bounded live delivery
+    src/relay.rs   - EventRelay, RelaySession: the NIP-01/42/45/77 session
+                     engine and the policy traits it asks
+  wok-ws/
+    src/lib.rs     - Door: the WebSocket doors, their budgets, Admission
+  wok-bench/       - store-level baseline benchmark (not published)
 ```
 
 ## Conventions
@@ -34,11 +40,15 @@ crates/
 - British English in prose and comments.
 - The store never infers a partition from an event's tags; the caller
   supplies it.
-- `single_d_value`, `event_frame`, `LiveFanout` and `PreparedPut::verified`
-  are public only because Bothy's relay engine still uses them from outside
-  this crate. They become crate-private again when the engine moves here.
-  `PreparedPut::verified` skips the signature check: never call it with an
-  event whose signature has not just been verified.
+- `PreparedPut::verified` skips the signature check, so it is crate-private:
+  only the relay engine's own prepared frames, verified moments earlier, may
+  use it. Keep it that way. `LiveFanout` is public because `wok-bench` drives
+  it directly.
+- `wok-ws` builds its sheltered router only with an `Admission`. Do not add a
+  permissive default: a request the admission cannot place is refused.
+- `wok-ws` carries no dependency only a daemon would need (configuration
+  parsing, a command line), because applications link it into their own
+  builds, mobile ones included.
 
 ## Common Pitfalls
 

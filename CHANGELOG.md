@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Add `wok-ws`, the relay's WebSocket doors, moved from Bothy's node
+  repository. A `Door` holds one relay's connection and work budgets and
+  hands out unbound axum routers: a public one, which also serves the NIP-11
+  relay information document, and a sheltered one. It opens no port.
+- The sheltered router is built only with an `Admission`, which decides from
+  the request's extensions whether a connection may open and holds what it
+  returns (a per-peer permit, say) for the connection's life. There is no
+  default, and a request it cannot place is refused. NIP-42 is still required
+  on every connection it admits.
+- The deadlines (`Timings`), the budgets (32 connections, 24 of them public;
+  `WORK_PERMITS` of 2, 1 of them public, adjustable with
+  `with_connection_limits` and `with_work_limits`), the buffer sizes, the
+  close codes and reasons, the HTTP statuses and the NIP-11 document are as
+  Bothy had them, including a close reason that still says "circle authority
+  expired".
+- New dependencies, in `wok-ws` only: `axum` 0.8 with `ws`, and
+  `futures-util` 0.3. `wok-store` gains none.
+
 ## 0.3.0 - 2026-11-11
 
 - Add the relay session engine as `wok_store::relay`, moved from Bothy's node
