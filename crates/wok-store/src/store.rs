@@ -237,6 +237,18 @@ impl StoreOptions {
             ..Self::server()
         }
     }
+
+    /// A tool that opens the store while nothing else serves it (an
+    /// operator's removal, say): the server's caches, with no background
+    /// checkpoint thread and no warm-up scan, so no other connection is
+    /// holding the write-ahead log when the tool truncates it.
+    pub fn offline() -> Self {
+        Self {
+            background_checkpoint: false,
+            warm: false,
+            ..Self::server()
+        }
+    }
 }
 
 impl Default for StoreOptions {
@@ -487,6 +499,35 @@ impl WalShared {
 }
 
 /// `PRAGMA wal_checkpoint(mode)`: `(busy, frames in the log, frames checkpointed)`.
+/// One event out, in an operator's removal: barred by author and id, its
+/// head (if it is one) and the row, whose tags go with it.
+fn remove_one(
+    tx: &Connection,
+    scope: i64,
+    author: &[u8],
+    id: &[u8],
+) -> Result<(), rusqlite::Error> {
+    tx.execute(
+        "INSERT OR IGNORE INTO deleted_ids VALUES(?,?,?)",
+        params![scope, author, id],
+    )?;
+    tx.execute(
+        "DELETE FROM heads WHERE visibility=? AND author=? AND id=?",
+        params![scope, author, id],
+    )?;
+    tx.execute(
+        "DELETE FROM events WHERE visibility=? AND id=?",
+        params![scope, id],
+    )?;
+    Ok(())
+}
+
+/// Truncate the write-ahead log after a removal; whether it was.
+fn truncate_after_removal(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let (busy, _, _) = run_checkpoint(conn, "TRUNCATE")?;
+    Ok(busy == 0)
+}
+
 fn run_checkpoint(conn: &Connection, mode: &str) -> Result<(i64, i64, i64), rusqlite::Error> {
     conn.query_row(&format!("PRAGMA wal_checkpoint({mode})"), [], |r| {
         Ok((r.get(0)?, r.get(1)?, r.get(2)?))
@@ -703,6 +744,19 @@ pub enum PutOutcome {
     Stored,
     Duplicate,
     Ephemeral,
+}
+
+/// What an operator's removal did ([`SqliteEventStore::remove`],
+/// [`SqliteEventStore::remove_author`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Removal {
+    /// The events removed, each now barred from being stored again.
+    pub removed: Vec<nostr::event::EventId>,
+    /// Whether the write-ahead log was truncated afterwards, so the removed
+    /// bytes are gone from it as well as from the database file. `false`
+    /// means another connection was holding it: the bytes leave when it is
+    /// next truncated, and the removal itself is already durable.
+    pub erased: bool,
 }
 
 #[derive(Debug, Error)]
@@ -3135,6 +3189,81 @@ impl SqliteEventStore {
             ));
         }
         Ok(count as u64)
+    }
+
+    /// An operator's removal: take the events with these ids out of
+    /// `visibility`, whoever signed them, and bar each from being stored
+    /// again. It is for acting on a report, with nothing else serving this
+    /// store: another process's readers, live delivery and byte accounting
+    /// would not see it. Deletion events are removed like any other, and a
+    /// replaceable head that points at a removed event goes too, so its
+    /// coordinate text is not left behind. An id that is not stored is not
+    /// in [`Removal::removed`] and is not barred, because the bar is kept by
+    /// author. One transaction; the write-ahead log is truncated afterwards.
+    pub fn remove(
+        &self,
+        visibility: Visibility,
+        ids: &[nostr::event::EventId],
+    ) -> Result<Removal, EventStoreError> {
+        let scope = visibility.key();
+        let mut removed = Vec::new();
+        let mut conn = self.lock()?;
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for id in ids {
+            let author: Option<Vec<u8>> = probe(
+                &tx,
+                "SELECT author FROM events WHERE visibility=? AND id=?",
+                params![scope, id.as_bytes()],
+                |row| row.get(0),
+            )?;
+            if let Some(author) = author {
+                remove_one(&tx, scope, &author, id.as_bytes())?;
+                removed.push(*id);
+            }
+        }
+        tx.commit()?;
+        let erased = !removed.is_empty() && truncate_after_removal(&conn)?;
+        Ok(Removal { removed, erased })
+    }
+
+    /// An operator's removal of every event `author` signed in
+    /// `visibility`, as [`Self::remove`], in transactions of at most
+    /// [`MAX_EXPIRE_EVENTS`] events so a large backlog makes durable
+    /// progress. Events stored later under that key are not barred: the bar
+    /// is per id.
+    pub fn remove_author(
+        &self,
+        visibility: Visibility,
+        author: &nostr::key::PublicKey,
+    ) -> Result<Removal, EventStoreError> {
+        let scope = visibility.key();
+        let author = author.as_bytes();
+        let mut removed = Vec::new();
+        let mut conn = self.lock()?;
+        loop {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let batch: Vec<Vec<u8>> = {
+                let mut statement =
+                    tx.prepare("SELECT id FROM events WHERE visibility=? AND author=? LIMIT ?")?;
+                statement
+                    .query_map(params![scope, author, MAX_EXPIRE_EVENTS as i64], |row| {
+                        row.get(0)
+                    })?
+                    .collect::<Result<_, _>>()?
+            };
+            if batch.is_empty() {
+                break;
+            }
+            for id in &batch {
+                remove_one(&tx, scope, author, id)?;
+                removed.push(
+                    nostr::event::EventId::from_slice(id).map_err(|_| EventStoreError::Corrupt)?,
+                );
+            }
+            tx.commit()?;
+        }
+        let erased = !removed.is_empty() && truncate_after_removal(&conn)?;
+        Ok(Removal { removed, erased })
     }
 
     /// The per-event body of a write, inside a transaction the caller owns:
@@ -9161,5 +9290,152 @@ PRAGMA user_version=2;")).unwrap();
                 .join("\n");
             assert!(plan.contains(index), "{plan}");
         }
+    }
+
+    fn offline_store(tmp: &TempDir) -> SqliteEventStore {
+        SqliteEventStore::open_with_options(
+            &tmp.path().join("events.sqlite"),
+            10_000_000,
+            0,
+            StoreOptions::offline(),
+        )
+        .unwrap()
+    }
+
+    /// Whether `marker` appears anywhere in the store's files on disk.
+    fn on_disk(tmp: &TempDir, marker: &str) -> bool {
+        ["events.sqlite", "events.sqlite-wal"].iter().any(|name| {
+            std::fs::read(tmp.path().join(name))
+                .map(|bytes| bytes.windows(marker.len()).any(|w| w == marker.as_bytes()))
+                .unwrap_or(false)
+        })
+    }
+
+    #[test]
+    fn operator_removal_takes_an_event_its_tags_and_its_head_off_the_disk_and_bars_it() {
+        let tmp = TempDir::new().unwrap();
+        let member = Keys::generate();
+        let stranger = Keys::generate();
+        // Signed by a key that is nobody's member: the case an operator needs.
+        let reported = event(
+            &stranger,
+            30023,
+            NOW - 30,
+            "REPORTED-CONTENT-7f3a",
+            &[
+                tag("d", "REPORTED-COORD-91c2"),
+                tag("t", "REPORTED-TAG-5e8b"),
+            ],
+        );
+        let kept = event(&member, 1, NOW - 20, "kept", &[tag("t", "kept")]);
+        let elsewhere = event(&member, 1, NOW - 10, "public", &[]);
+        let unknown = event(&member, 1, NOW - 5, "never stored", &[]).id;
+        let db = offline_store(&tmp);
+        db.put(Visibility::Sheltered, &reported, NOW).unwrap();
+        db.put(Visibility::Sheltered, &kept, NOW).unwrap();
+        db.put(Visibility::Public, &elsewhere, NOW).unwrap();
+        db.put(Visibility::Public, &reported, NOW).unwrap();
+        let before = db.logical_bytes().unwrap();
+
+        let removal = db
+            .remove(Visibility::Sheltered, &[reported.id, unknown])
+            .unwrap();
+        assert_eq!(
+            removal.removed,
+            vec![reported.id],
+            "an unknown id is not removed"
+        );
+        assert!(removal.erased, "nothing else held the log");
+        assert!(db.logical_bytes().unwrap() < before);
+        assert!(
+            ids(
+                &db,
+                Visibility::Sheltered,
+                Filter::new().id(reported.id),
+                NOW
+            )
+            .is_empty()
+        );
+        assert!(
+            ids(
+                &db,
+                Visibility::Sheltered,
+                Filter::new().hashtag("REPORTED-TAG-5e8b"),
+                NOW
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            ids(&db, Visibility::Sheltered, Filter::new(), NOW),
+            vec![kept.id.to_hex()]
+        );
+        // The other partition is not touched, so the copy there is not
+        // removed or barred.
+        assert_eq!(
+            ids(&db, Visibility::Public, Filter::new().id(reported.id), NOW),
+            vec![reported.id.to_hex()]
+        );
+        assert!(matches!(
+            db.put(Visibility::Sheltered, &reported, NOW),
+            Err(EventStoreError::Retired)
+        ));
+        assert!(matches!(
+            db.put(Visibility::Sheltered, &kept, NOW),
+            Ok(PutOutcome::Duplicate)
+        ));
+        let public = db.remove(Visibility::Public, &[reported.id]).unwrap();
+        assert_eq!(public.removed, vec![reported.id]);
+        drop(db);
+        for marker in [
+            "REPORTED-CONTENT-7f3a",
+            "REPORTED-COORD-91c2",
+            "REPORTED-TAG-5e8b",
+        ] {
+            assert!(
+                !on_disk(&tmp, marker),
+                "{marker} is still in the store's files"
+            );
+        }
+        assert!(on_disk(&tmp, "kept") || on_disk(&tmp, "public"));
+    }
+
+    #[test]
+    fn operator_removal_by_author_takes_every_event_of_that_key_in_bounded_passes() {
+        let tmp = TempDir::new().unwrap();
+        let flooder = Keys::generate();
+        let member = Keys::generate();
+        let db = offline_store(&tmp);
+        let flood: Vec<Event> = (0..(MAX_EXPIRE_EVENTS as u64 * 2 + 7))
+            .map(|i| event(&flooder, 1, NOW - 1000 + i, &format!("flood {i}"), &[]))
+            .collect();
+        for e in &flood {
+            db.put(Visibility::Sheltered, e, NOW).unwrap();
+        }
+        let deletion = event(&flooder, 5, NOW - 1, "", &[tag("e", flood[0].id.to_hex())]);
+        let kept = event(&member, 1, NOW - 1, "kept", &[]);
+        db.put(Visibility::Sheltered, &kept, NOW).unwrap();
+        let removal = db
+            .remove_author(Visibility::Sheltered, &flooder.public_key())
+            .unwrap();
+        assert_eq!(removal.removed.len(), flood.len());
+        assert!(removal.erased);
+        assert_eq!(
+            ids(&db, Visibility::Sheltered, Filter::new(), NOW),
+            vec![kept.id.to_hex()]
+        );
+        assert!(matches!(
+            db.put(Visibility::Sheltered, &flood[3], NOW),
+            Err(EventStoreError::Retired)
+        ));
+        // A deletion event is removed like any other.
+        db.put(Visibility::Sheltered, &deletion, NOW).unwrap();
+        let removal = db.remove(Visibility::Sheltered, &[deletion.id]).unwrap();
+        assert_eq!(removal.removed, vec![deletion.id]);
+        // Nothing left of that key: a second pass removes nothing.
+        let again = db
+            .remove_author(Visibility::Sheltered, &flooder.public_key())
+            .unwrap();
+        assert!(again.removed.is_empty());
+        assert!(!again.erased, "nothing removed, nothing truncated");
     }
 }
