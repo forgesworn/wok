@@ -42,8 +42,8 @@ newer build and an import with the older one.
 
 ## Performance
 
-The store has been benchmarked against strfry 1.1.2, but only inside Bothy
-and with Bothy's relay on top. Those results have not yet been reproduced from
+The store has been benchmarked, including against another relay
+implementation, but only inside Bothy and with Bothy's relay on top. Those results have not yet been reproduced from
 this repository, and no performance claim is made for Wok itself until they
 are.
 
