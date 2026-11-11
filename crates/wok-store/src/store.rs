@@ -303,6 +303,10 @@ struct WalShared {
     passive_runs: AtomicU64,
     truncate_runs: AtomicU64,
     blocking_runs: AtomicU64,
+    /// Time the writer has spent in its blocking checkpoints, in nanoseconds,
+    /// and the longest single one. Diagnostics only.
+    blocking_ns: AtomicU64,
+    blocking_longest_ns: AtomicU64,
     warm_rows: AtomicU64,
     warm_cancelled: AtomicBool,
     warm_finished: AtomicBool,
@@ -390,6 +394,8 @@ impl WalShared {
             passive_runs: AtomicU64::new(0),
             truncate_runs: AtomicU64::new(0),
             blocking_runs: AtomicU64::new(0),
+            blocking_ns: AtomicU64::new(0),
+            blocking_longest_ns: AtomicU64::new(0),
             warm_rows: AtomicU64::new(0),
             warm_cancelled: AtomicBool::new(false),
             warm_finished: AtomicBool::new(false),
@@ -699,6 +705,31 @@ fn warm_indexes(
     })();
     conn.progress_handler(0, None::<fn() -> bool>)?;
     outcome
+}
+
+/// Counts of a store's checkpoints since it was opened, for diagnostics and
+/// benchmarks ([`SqliteEventStore::checkpoint_stats`]). A store opened
+/// without the background checkpoint leaves SQLite's automatic checkpoint in
+/// charge and counts nothing here.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointStats {
+    /// PASSIVE checkpoints the checkpoint thread has run without an error,
+    /// whether or not each copied the whole log.
+    pub passive: u64,
+    /// TRUNCATE checkpoints the checkpoint thread has finished on a quiet
+    /// store.
+    pub truncating: u64,
+    /// Blocking checkpoints the writer has attempted because a commit left
+    /// the WAL at its ceiling. One refused at once, because the checkpoint
+    /// thread held the checkpoint lock, is counted too; `blocking_time` tells
+    /// them apart.
+    pub blocking: u64,
+    /// Time the writer has spent in those, during which it took no batch.
+    pub blocking_time: Duration,
+    /// The longest single one.
+    pub longest_blocking: Duration,
+    /// The most WAL pages any commit has left.
+    pub peak_wal_pages: u32,
 }
 
 /// The store's background threads. Dropping it stops them and waits: the
@@ -1838,14 +1869,22 @@ PRAGMA user_version=2;"))?;
         let _ = conn.busy_timeout(CEILING_WAIT);
         let result = run_checkpoint(conn, "FULL");
         let _ = conn.busy_timeout(BUSY_TIMEOUT);
+        let took = began.elapsed();
+        let took_ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
         shared.blocking_runs.fetch_add(1, AtomicOrdering::Relaxed);
+        shared
+            .blocking_ns
+            .fetch_add(took_ns, AtomicOrdering::Relaxed);
+        shared
+            .blocking_longest_ns
+            .fetch_max(took_ns, AtomicOrdering::Relaxed);
         // A checkpoint that finished needs no pause before the next. Neither
         // does one that was refused at once (the checkpoint thread held the
         // checkpoint lock): the next commit tries again. Only one that waited
         // for readers and still could not finish is not repeated for a
         // second, so a reader that never lets go costs the writer at most
         // CEILING_WAIT in every CEILING_WAIT + CEILING_RETRY.
-        let waited = began.elapsed() >= CEILING_WAIT / 2;
+        let waited = took >= CEILING_WAIT / 2;
         let finished = matches!(result, Ok((0, _, _)));
         *shared
             .last_blocking
@@ -3160,6 +3199,22 @@ impl SqliteEventStore {
     /// Commits so far, one per batch that stored or removed anything.
     pub fn commits(&self) -> u64 {
         self.commits.load(AtomicOrdering::Relaxed)
+    }
+
+    /// What the store's checkpointing has done since it was opened. Reading
+    /// it changes nothing.
+    pub fn checkpoint_stats(&self) -> CheckpointStats {
+        let shared = &self.maintenance.shared;
+        CheckpointStats {
+            passive: shared.passive_runs.load(AtomicOrdering::Relaxed),
+            truncating: shared.truncate_runs.load(AtomicOrdering::Relaxed),
+            blocking: shared.blocking_runs.load(AtomicOrdering::Relaxed),
+            blocking_time: Duration::from_nanos(shared.blocking_ns.load(AtomicOrdering::Relaxed)),
+            longest_blocking: Duration::from_nanos(
+                shared.blocking_longest_ns.load(AtomicOrdering::Relaxed),
+            ),
+            peak_wal_pages: shared.peak_pages.load(AtomicOrdering::Relaxed),
+        }
     }
 
     /// A room-profile owner serialises all of its stores and assigns each
@@ -7154,6 +7209,60 @@ PRAGMA user_version=2;")).unwrap();
             .query_row("PRAGMA wal_autocheckpoint", [], |r| r.get::<_, i64>(0))
             .unwrap();
         assert_eq!(writer_autocheckpoint, 0);
+    }
+
+    #[test]
+    fn checkpoint_stats_report_the_blocking_checkpoints_and_their_time() {
+        // No checkpoint is reachable: only the peak moves.
+        let tmp = TempDir::new().unwrap();
+        let quiet = io_store(
+            &tmp,
+            StoreOptions {
+                checkpoint_pages: u32::MAX / 2,
+                wal_ceiling_pages: u32::MAX,
+                idle_truncate_after: Duration::from_secs(3600),
+                ..StoreOptions::default()
+            },
+        );
+        let key = Keys::generate();
+        write_notes(&quiet, &key, 0, 8, 4);
+        let stats = quiet.checkpoint_stats();
+        assert!(stats.peak_wal_pages > 0);
+        assert_eq!(
+            stats,
+            CheckpointStats {
+                peak_wal_pages: stats.peak_wal_pages,
+                ..CheckpointStats::default()
+            }
+        );
+
+        // A ceiling the first commit passes (it is never below the threshold,
+        // so both are low): the writer goes to its blocking checkpoint, which
+        // is counted and timed whether or not the thread's passive one got
+        // there first.
+        let tmp = TempDir::new().unwrap();
+        let db = io_store(
+            &tmp,
+            StoreOptions {
+                checkpoint_pages: 12,
+                wal_ceiling_pages: 12,
+                idle_truncate_after: Duration::from_secs(3600),
+                ..StoreOptions::default()
+            },
+        );
+        write_notes(&db, &key, 0, 40, 4);
+        let stats = db.checkpoint_stats();
+        assert!(stats.blocking >= 1, "the writer ran a blocking checkpoint");
+        assert!(stats.longest_blocking > Duration::ZERO);
+        assert!(stats.blocking_time >= stats.longest_blocking);
+        assert!(stats.peak_wal_pages >= 12);
+        assert_eq!(stats.truncating, 0);
+        // Reading changed nothing: the writer is idle, so its counts stand.
+        let again = db.checkpoint_stats();
+        assert_eq!(
+            (again.blocking, again.blocking_time, again.longest_blocking),
+            (stats.blocking, stats.blocking_time, stats.longest_blocking)
+        );
     }
 
     /// Review M2: the probe is carried by the writer lock itself, so a commit

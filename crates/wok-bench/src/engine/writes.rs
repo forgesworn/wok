@@ -601,6 +601,23 @@ pub(crate) fn mean(events: u64, batches: u64) -> f64 {
     (events as f64 / batches as f64 * 100.0).round() / 100.0
 }
 
+/// The store's own checkpoint counts for one cell, read before the store is
+/// dropped (dropping it runs one last truncating checkpoint). `blocking`
+/// counts the writer's checkpoints at the WAL ceiling, including one refused
+/// at once; the times say how long the writer was held in them.
+pub(crate) fn checkpoints_json(store: &SqliteEventStore) -> Value {
+    let stats = store.checkpoint_stats();
+    let ms = |d: std::time::Duration| (d.as_secs_f64() * 1e6).round() / 1e3;
+    json!({
+        "passive": stats.passive,
+        "truncating": stats.truncating,
+        "blocking": stats.blocking,
+        "blocking_ms": ms(stats.blocking_time),
+        "longest_blocking_ms": ms(stats.longest_blocking),
+        "peak_wal_pages": stats.peak_wal_pages,
+    })
+}
+
 pub(crate) fn writer_json(stats: WriterStats, commits: u64) -> Value {
     json!({
         "batches": stats.batches,
@@ -800,6 +817,7 @@ pub(crate) fn engine_cell_with(
     relay.flush();
     let stats = relay.writer_stats();
     let commits = store.commits();
+    let checkpoints = checkpoints_json(&store);
     verify_cell(
         &store,
         cell.visibility,
@@ -840,6 +858,7 @@ pub(crate) fn engine_cell_with(
         out["hops"] = json!(hops.name());
     }
     out["writer"] = writer_json(stats, commits);
+    out["checkpoints"] = checkpoints;
     out["form"] = json!(if cell.window == 1 {
         "PendingWrite::commit, one write at a time per session"
     } else {
@@ -881,6 +900,7 @@ fn baseline_cell(cell: &Cell, corpus_events: &[&Event]) -> Result<Value, String>
     writer.flush();
     let stats = writer.stats();
     let commits = store.commits();
+    let checkpoints = checkpoints_json(&store);
     verify_cell(
         &store,
         cell.visibility,
@@ -895,6 +915,7 @@ fn baseline_cell(cell: &Cell, corpus_events: &[&Event]) -> Result<Value, String>
         "queue_and_commit": mean_us(merged.queue_ns, events),
     });
     out["writer"] = writer_json(stats, commits);
+    out["checkpoints"] = checkpoints;
     out["form"] = json!(if cell.window == 1 {
         "EventWriter::reserve_until then Reserved::wait_until, one write at a time per submitter"
     } else {
