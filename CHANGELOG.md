@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- `wok-ws`: a shutdown is taken between frames, so a write a connection has
+  read when the shutdown lands is queued and answered before the close. Until
+  now the frame being worked on was dropped: not stored and never answered.
+  A turn still running a second after the shutdown (waiting on a work permit,
+  say, or a slow peer) is interrupted as before, so a shutdown stays bounded.
 - `wok-bench` gains a `socket` scenario: acknowledged writes through
   `wok-ws`'s two doors over real WebSocket connections, beside the same
   events driven straight at the session engine in the same run. Each cell

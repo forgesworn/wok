@@ -911,6 +911,13 @@ const STALLED: Closing = Closing {
     writable: false,
 };
 
+/// How long a shutdown lets a connection finish the frame it is part way
+/// through, so a write it has read is queued and answered before the close.
+/// A turn still waiting after this (on a work permit, say, or a slow peer)
+/// is interrupted, and a write it had read but not queued is not stored and
+/// gets no answer.
+const SHUTDOWN_TURN_GRACE: Duration = Duration::from_secs(1);
+
 /// Bound on sending the Close frame to a peer that is not settled with.
 const CLOSE_UNSETTLED: Duration = Duration::from_millis(100);
 /// Bound on the whole closing handshake.
@@ -1022,12 +1029,18 @@ async fn serve(
     _admitted: Option<Admitted>,
 ) {
     let mut stopped = state.door.stop.subscribe();
+    let between_turns = stopped.clone();
     // Outside `serve_connected`, so a shutdown that drops it still answers
     // what is in flight.
     let mut in_flight = InFlight::new();
+    // `serve_connected` takes a shutdown between turns; this interrupts a
+    // turn that is still running once the grace has passed.
     let closing = tokio::select! {
-        closing = serve_connected(&mut socket, &state, &mut in_flight) => closing,
-        _ = stopped.wait_for(|stopped| *stopped) => SHUTDOWN,
+        closing = serve_connected(&mut socket, &state, &mut in_flight, between_turns) => closing,
+        _ = async {
+            let _ = stopped.wait_for(|stopped| *stopped).await;
+            tokio::time::sleep(SHUTDOWN_TURN_GRACE).await;
+        } => SHUTDOWN,
     };
     close_connection(&mut socket, closing, &mut in_flight).await;
 }
@@ -1036,6 +1049,7 @@ async fn serve_connected(
     socket: &mut WebSocket,
     state: &SocketState,
     in_flight: &mut InFlight,
+    mut stopped: tokio::sync::watch::Receiver<bool>,
 ) -> Closing {
     // Attached only while a REQ is open: a connection with no subscription
     // has no use for live events, and must not lag or be woken by them.
@@ -1198,6 +1212,10 @@ async fn serve_connected(
                 authority_lost |= matches!(outcome, Some((_, (_, true))));
                 outcome
             },
+            // Between turns: the frame read last has been queued or answered.
+            _ = async {
+                let _ = stopped.wait_for(|stopped| *stopped).await;
+            } => return SHUTDOWN,
             _ = tokio::time::sleep_until(auth_deadline), if state.visibility == Visibility::Sheltered && !authenticated => return DEADLINE,
             // A public socket has no AUTH deadline, so it must at least answer
             // pings: one that goes quiet stops holding a public permit.
@@ -3283,6 +3301,93 @@ mod tests {
             assert!(at("ok") < at("event"), "{id}: its OK comes first");
         }
         routes.shutdown();
+        task.abort();
+    }
+
+    /// The frames up to the close: the OK for `id`, if one came, and the
+    /// close code.
+    async fn answer_and_close(socket: &mut Socket, id: &str) -> (Option<Value>, Option<u16>) {
+        let mut answer = None;
+        let close = loop {
+            match timeout(Duration::from_secs(10), socket.next())
+                .await
+                .unwrap()
+            {
+                Some(Ok(ClientMessage::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame[0] == "OK" && frame[1] == id {
+                        answer = Some(frame);
+                    }
+                }
+                Some(Ok(ClientMessage::Close(frame))) => {
+                    break frame.map(|frame| u16::from(frame.code));
+                }
+                Some(Ok(_)) => {}
+                other => panic!("the socket ended without a close frame: {other:?}"),
+            }
+        };
+        (answer, close)
+    }
+
+    /// A shutdown that lands while a connection is part way through a frame
+    /// lets that turn finish, so a write the door has read is stored and
+    /// answered before the close.
+    #[tokio::test]
+    async fn a_write_read_when_the_shutdown_lands_is_answered_before_the_close() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (url, task) = listen(&routes, Visibility::Sheltered).await;
+        let mut socket = connect(&url, Some(&key)).await;
+        // Park the next turn: the EVENT is read and checked, then waits for
+        // a work permit.
+        let held = Arc::clone(&routes.work)
+            .acquire_many_owned(WORK_PERMITS as u32)
+            .await
+            .unwrap();
+        let note = event(&key, 1, now(), "read before the shutdown", vec![]);
+        send_frame(&mut socket, json!(["EVENT", note])).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        routes.shutdown();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(held);
+        let (answer, close) = answer_and_close(&mut socket, &note.id.to_hex()).await;
+        assert_eq!(
+            answer.map(|frame| frame[2].clone()),
+            Some(json!(true)),
+            "the write the door had read is stored and answered"
+        );
+        assert_eq!(close, Some(1001));
+        task.abort();
+    }
+
+    /// A turn still waiting when the shutdown grace runs out does not hold
+    /// the shutdown up: the connection closes regardless.
+    #[tokio::test]
+    async fn a_turn_stuck_past_the_grace_does_not_hold_the_shutdown_up() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (url, task) = listen(&routes, Visibility::Sheltered).await;
+        let mut socket = connect(&url, Some(&key)).await;
+        let _held = Arc::clone(&routes.work)
+            .acquire_many_owned(WORK_PERMITS as u32)
+            .await
+            .unwrap();
+        let note = event(&key, 1, now(), "never gets a permit", vec![]);
+        send_frame(&mut socket, json!(["EVENT", note])).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let began = tokio::time::Instant::now();
+        routes.shutdown();
+        let (answer, close) = answer_and_close(&mut socket, &note.id.to_hex()).await;
+        assert_eq!(close, Some(1001));
+        assert!(
+            began.elapsed() < Duration::from_secs(3),
+            "closed {:?} after the shutdown",
+            began.elapsed()
+        );
+        // Never stored: there was no permit to store it with.
+        assert_ne!(answer.map(|frame| frame[2].clone()), Some(json!(true)));
         task.abort();
     }
 }
