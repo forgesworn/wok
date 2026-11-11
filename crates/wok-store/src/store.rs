@@ -935,7 +935,7 @@ impl StoredEvent {
 /// The value of an event's single `d` tag: `Some` only when exactly one tag
 /// is named `d` and that tag has exactly two elements. The one definition of
 /// a room, for built events and for stored JSON alike.
-pub fn single_d_value<'t, T: AsRef<str> + 't>(
+pub(crate) fn single_d_value<'t, T: AsRef<str> + 't>(
     tags: impl IntoIterator<Item = &'t [T]>,
 ) -> Option<&'t str> {
     let mut found = None;
@@ -2789,11 +2789,9 @@ impl PreparedPut {
     }
 
     /// As [`Self::new`] for an event whose signature the caller has already
-    /// verified. It skips the signature check, so only a relay's own prepared
-    /// frames, verified moments earlier, may use it. Public only until the
-    /// relay engine moves into Wok; it then becomes crate-private again.
-    #[doc(hidden)]
-    pub fn verified(
+    /// verified. It skips the signature check, so only the relay engine's own
+    /// prepared frames, verified moments earlier, may use it.
+    pub(crate) fn verified(
         visibility: Visibility,
         event: Event,
         now: u64,
