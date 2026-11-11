@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.2 - 2026-11-11
 
 - `wok-store`: `SqliteEventStore::checkpoint_stats` reports what the store's
   checkpointing has done since it was opened: the passive, truncating and
