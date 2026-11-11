@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0 - 2026-11-11
 
 - Add `wok-ws`, the relay's WebSocket doors, moved from Bothy's node
   repository. A `Door` holds one relay's connection and work budgets and
@@ -27,6 +27,7 @@
   is signed and the engine checks each signature. A default run now includes
   it, and the whole process runs under a counting allocator, which each
   result's header records.
+- `wok-store` is unchanged since 0.3.0, and so is schema 4.
 
 ## 0.3.0 - 2026-11-11
 
