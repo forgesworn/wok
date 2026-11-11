@@ -11,6 +11,11 @@
   `GuestAuthority` gives guests room- and kind-scoped access to the sheltered
   partition, `AuthorityEvents` names the events a door installs instead of
   storing, and `AnnounceHook` sees each event announced live.
+- `single_d_value`, `event_frame` and the hidden `PreparedPut::verified`,
+  public in 0.1.0 and 0.2.0 only for Bothy's copy of the engine, are
+  crate-private again, so a caller outside the crate can no longer skip the
+  signature check. Bothy no longer uses them. `LiveFanout` stays public, since
+  `wok-bench` drives it directly.
 - New dependencies: `negentropy` 0.5, `url` 2.5, `hex` 0.4, and `nostr`'s
   `os-rng` feature, from which each NIP-42 challenge is drawn.
 - A filter that names several ids is answered from the id index, one seek for
