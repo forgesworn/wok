@@ -29,6 +29,7 @@
 mod ack_only;
 mod client;
 pub(crate) mod door_path;
+pub(crate) mod guest_path;
 mod server;
 
 use std::collections::HashSet;

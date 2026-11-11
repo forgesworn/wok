@@ -241,7 +241,11 @@ pub(crate) async fn write_lane(
             }
             Ok(Some(Err(e))) => return Err(format!("{label}: the connection failed: {e}")),
             Ok(Some(Ok(Message::Text(text)))) => text,
-            Ok(Some(Ok(Message::Ping(_) | Message::Pong(_)))) => continue,
+            Ok(Some(Ok(Message::Ping(_)))) => {
+                lane.pings += 1;
+                continue;
+            }
+            Ok(Some(Ok(Message::Pong(_)))) => continue,
             Ok(Some(Ok(Message::Close(frame)))) => {
                 return Err(format!(
                     "{label}: the server closed the connection with {} writes in flight: {frame:?}",

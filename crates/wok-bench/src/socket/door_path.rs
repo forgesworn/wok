@@ -183,7 +183,7 @@ fn run_arm(shared: &Shared, arm: Arm, spec: &Spec) -> Result<Value, String> {
 
 /// The median: the middle value, or the mean of the two middle values of an
 /// even count.
-fn median(values: &[f64]) -> f64 {
+pub(crate) fn median(values: &[f64]) -> f64 {
     let mut sorted = values.to_vec();
     sorted.sort_by(f64::total_cmp);
     let n = sorted.len();
@@ -199,15 +199,15 @@ fn median(values: &[f64]) -> f64 {
 
 /// One pair's comparison, X against Y.
 #[derive(Debug, PartialEq)]
-struct Pair {
-    verdict: &'static str,
+pub(crate) struct Pair {
+    pub(crate) verdict: &'static str,
     /// Rounds in which X < Y, and in which X > Y; ties count as neither.
-    below: usize,
-    above: usize,
-    median_x: f64,
-    median_y: f64,
-    median_batch_x: Option<f64>,
-    median_batch_y: Option<f64>,
+    pub(crate) below: usize,
+    pub(crate) above: usize,
+    pub(crate) median_x: f64,
+    pub(crate) median_y: f64,
+    pub(crate) median_batch_x: Option<f64>,
+    pub(crate) median_batch_y: Option<f64>,
 }
 
 /// The rule, fixed before any figures were seen. The rounds are paired by
@@ -215,7 +215,12 @@ struct Pair {
 /// of them (7 of 8, the count it was designed for), "above" if X > Y in at
 /// least `n - 1`, and otherwise "not separated"; if both reach `n - 1`, which
 /// only two rounds or fewer allow, it is "not separated".
-fn compare(x: &[f64], y: &[f64], batch_x: Option<&[f64]>, batch_y: Option<&[f64]>) -> Pair {
+pub(crate) fn compare(
+    x: &[f64],
+    y: &[f64],
+    batch_x: Option<&[f64]>,
+    batch_y: Option<&[f64]>,
+) -> Pair {
     let n = x.len().min(y.len());
     let threshold = n.saturating_sub(1);
     let below = x.iter().zip(y).filter(|(x, y)| x < y).count();
@@ -250,15 +255,20 @@ fn consistent_with_hops(two_hops_vs_door: &Pair) -> bool {
 }
 
 fn pair_json(x: Arm, y: Arm, pair: &Pair) -> Value {
+    named_pair_json(x.name(), y.name(), pair)
+}
+
+/// A pair's record, X and Y named by the caller. The two names must differ.
+pub(crate) fn named_pair_json(x: &str, y: &str, pair: &Pair) -> Value {
     let mut writes = Map::new();
-    writes.insert(x.name().into(), json!(pair.median_x));
-    writes.insert(y.name().into(), json!(pair.median_y));
+    writes.insert(x.into(), json!(pair.median_x));
+    writes.insert(y.into(), json!(pair.median_y));
     let mut batches = Map::new();
-    batches.insert(x.name().into(), json!(pair.median_batch_x));
-    batches.insert(y.name().into(), json!(pair.median_batch_y));
+    batches.insert(x.into(), json!(pair.median_batch_x));
+    batches.insert(y.into(), json!(pair.median_batch_y));
     json!({
-        "x": x.name(),
-        "y": y.name(),
+        "x": x,
+        "y": y,
         "verdict": pair.verdict,
         "below": pair.below,
         "above": pair.above,

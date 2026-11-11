@@ -11,12 +11,12 @@ use tokio::net::TcpListener;
 use tokio::runtime::{Builder, Runtime};
 use tokio::task::JoinHandle;
 use url::Url;
-use wok_store::relay::EventRelay;
+use wok_store::relay::{EventRelay, GuestAuthority};
 use wok_store::{EventStore, SqliteEventStore, Visibility};
 use wok_ws::{Admission, Admitted, Door};
 
 use crate::config::{Config, Variant};
-use crate::engine::{Clock, Keepers, relay_on};
+use crate::engine::{Clock, Keepers, relay_with_guests};
 use crate::support::fresh_store;
 
 /// How long the server task has to end once the door is shut down.
@@ -66,12 +66,27 @@ impl Server {
         store_events: usize,
         connections: usize,
     ) -> Result<Self, String> {
-        let (dir, store) = fresh_store(cfg, store_events)?;
-        let relay = relay_on(
+        let store = fresh_store(cfg, store_events)?;
+        Self::start_on(keepers, visibility, variant, store, connections, None)
+    }
+
+    /// [`Self::start`] on a store the caller opened, `(dir, store)` with the
+    /// store's files in `dir`, and with `guests` installed as the relay's
+    /// guest authority when given.
+    pub(crate) fn start_on(
+        keepers: &Arc<Keepers>,
+        visibility: Visibility,
+        variant: &Variant,
+        (dir, store): (TempDir, Arc<SqliteEventStore>),
+        connections: usize,
+        guests: Option<Arc<dyn GuestAuthority>>,
+    ) -> Result<Self, String> {
+        let relay = relay_with_guests(
             Arc::clone(&store) as Arc<dyn EventStore>,
             keepers,
             None,
             Clock::Wall,
+            guests,
         );
         let connections = connections.max(1);
         let door = Door::new(Arc::clone(&relay))

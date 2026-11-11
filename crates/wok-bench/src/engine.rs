@@ -38,7 +38,7 @@ use tokio::runtime::{Builder, Runtime};
 use tokio::sync::watch;
 use url::Url;
 use wok_store::EventStore;
-use wok_store::relay::{EventRelay, KeeperAccess, RelaySession, ok};
+use wok_store::relay::{EventRelay, GuestAuthority, KeeperAccess, RelaySession, ok};
 use wok_store::writer::WriterLimits;
 
 use crate::config::Config;
@@ -133,8 +133,22 @@ pub(crate) fn relay_on(
     live_limits: Option<(usize, usize)>,
     clock: Clock,
 ) -> Arc<EventRelay> {
+    relay_with_guests(store, keepers, live_limits, clock, None)
+}
+
+/// [`relay_on`], with a guest authority installed when one is given.
+pub(crate) fn relay_with_guests(
+    store: Arc<dyn EventStore>,
+    keepers: &Arc<Keepers>,
+    live_limits: Option<(usize, usize)>,
+    clock: Clock,
+    guests: Option<Arc<dyn GuestAuthority>>,
+) -> Arc<EventRelay> {
     let access: Arc<dyn KeeperAccess> = Arc::clone(keepers) as Arc<dyn KeeperAccess>;
     let mut relay = EventRelay::new(store, access).with_frame_limit(FRAME_LIMIT);
+    if let Some(guests) = guests {
+        relay = relay.with_guest_authority(guests);
+    }
     if let Clock::Fixed(fixed) = clock {
         relay = relay.with_clock(move || fixed);
     }

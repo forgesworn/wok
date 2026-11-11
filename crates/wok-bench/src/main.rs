@@ -26,6 +26,13 @@
 //! binds `127.0.0.1` on an ephemeral port, as `socket` does, and applies one
 //! comparison rule, fixed in advance, to the paired rounds.
 //!
+//! A seventh, `guest-path`, is diagnostic too and also runs only when it is
+//! named. Through the sheltered door it sets keeper writes beside guest
+//! writes, whose scopes come from bench-only guest authorities (one in memory,
+//! one a model on its own SQLite file), on an empty and on a seeded store, and
+//! counts every call the relay makes to the authority. It binds `127.0.0.1` on
+//! an ephemeral port as well.
+//!
 //! The figures are for holding later changes to "no slower" on one machine.
 //! They say nothing about other relay implementations, and are only
 //! comparable between runs with the same header and sizes.
@@ -106,6 +113,9 @@ fn run(cfg: &Config) -> Result<Value, String> {
     }
     if cfg.door_path {
         document.insert("door_path".into(), socket::door_path::run(cfg)?);
+    }
+    if cfg.guest_path {
+        document.insert("guest_path".into(), socket::guest_path::run(cfg)?);
     }
     Ok(Value::Object(document))
 }
@@ -250,6 +260,9 @@ mod tests {
         // The diagnostic door-path scenario is not part of a default run.
         assert_eq!(header["scenarios"]["door_path"], false);
         assert!(document.get("door_path").is_none());
+        // Nor is the guest-path one.
+        assert_eq!(header["scenarios"]["guest_path"], false);
+        assert!(document.get("guest_path").is_none());
 
         // Nothing identifies the machine or the person who ran it.
         let text = document.to_string();

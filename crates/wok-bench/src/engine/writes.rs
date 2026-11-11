@@ -149,6 +149,8 @@ pub(crate) struct Lane {
     pub(crate) queue_ns: u64,
     /// Time inside `reserve` (or `reserve_until`) alone.
     pub(crate) reserve_ns: u64,
+    /// WebSocket Ping frames a socket lane saw while it wrote; 0 elsewhere.
+    pub(crate) pings: u64,
     pub(crate) finished: Option<Instant>,
 }
 
@@ -541,6 +543,7 @@ pub(crate) struct Merged {
     pub(crate) begin_ns: u64,
     pub(crate) queue_ns: u64,
     pub(crate) reserve_ns: u64,
+    pub(crate) pings: u64,
     pub(crate) lanes_with_events: usize,
     pub(crate) wall: Duration,
 }
@@ -560,6 +563,7 @@ pub(crate) fn drive(
         begin_ns: 0,
         queue_ns: 0,
         reserve_ns: 0,
+        pings: 0,
         lanes_with_events: 0,
         wall: Duration::ZERO,
     };
@@ -578,6 +582,7 @@ pub(crate) fn drive(
         merged.begin_ns += lane.begin_ns;
         merged.queue_ns += lane.queue_ns;
         merged.reserve_ns += lane.reserve_ns;
+        merged.pings += lane.pings;
         if let Some(finished) = lane.finished {
             merged.wall = merged.wall.max(finished.saturating_duration_since(started));
         }
