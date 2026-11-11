@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `wok-bench` gains a diagnostic `door-path` scenario, run only when named
+  and not part of a default `all` run. It sets the sheltered door beside the
+  engine driven directly, with and without the door's blocking-pool hops,
+  and beside a bench-only stand-in that only acknowledges frames, to see
+  whether those hops account for the door's cost. The libraries are
+  unchanged; the bench binary binds `127.0.0.1` on an ephemeral port for it.
+- `wok-bench` gains a diagnostic `guest-path` scenario, run only when named
+  and not part of a default `all` run. It sets keeper writes through the
+  sheltered door beside guest writes, whose publishes ask a guest authority
+  for scopes, on an empty and a seeded store, and counts and times every
+  authority call. The libraries are unchanged; the bench binary binds
+  `127.0.0.1` on an ephemeral port for it, and its guest authorities (one in
+  memory, one a model over a small SQLite file) live in `wok-bench` only and
+  are not for applications.
+
 ## 0.5.0 - 2026-11-11
 
 - Add `wokd`, a members-only Nostr relay built on `wok-store` and `wok-ws`.

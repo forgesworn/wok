@@ -37,8 +37,9 @@ use nostr::filter::Filter;
 use nostr::key::Keys;
 use serde_json::{Value, json};
 use tokio::runtime::Runtime;
-use tokio::sync::Barrier;
-use tokio::task::{JoinHandle, unconstrained};
+use tokio::sync::{Barrier, Semaphore};
+use tokio::task::{JoinHandle, spawn_blocking, unconstrained};
+use tokio::time::timeout;
 use wok_store::relay::{Handled, PUBLIC_KINDS, PreparedFrame, ok};
 use wok_store::writer::{EventWriter, WriterLimits, WriterStats};
 use wok_store::{
@@ -148,6 +149,8 @@ pub(crate) struct Lane {
     pub(crate) queue_ns: u64,
     /// Time inside `reserve` (or `reserve_until`) alone.
     pub(crate) reserve_ns: u64,
+    /// WebSocket Ping frames a socket lane saw while it wrote; 0 elsewhere.
+    pub(crate) pings: u64,
     pub(crate) finished: Option<Instant>,
 }
 
@@ -336,6 +339,131 @@ async fn engine_lane(
     Ok(lane)
 }
 
+/// The door's blocking-pool hops, added to the engine lane by the
+/// `door-path` scenario's stand-ins. The engine scenario and the socket
+/// scenario's direct arm never take them: they run [`engine_lane`] unchanged.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hops {
+    /// `PreparedFrame::parse` on `spawn_blocking`, awaited; `begin_prepared`
+    /// inline on the lane's task.
+    Parse,
+    /// As [`Self::Parse`], then the door's `apply`: an owned permit from the
+    /// shared work semaphore, awaited under the door's own I/O deadline, and
+    /// `begin_prepared` on a second `spawn_blocking` whose closure holds the
+    /// permit and takes and returns the session.
+    ParseAndBegin,
+}
+
+impl Hops {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Parse => "parse",
+            Self::ParseAndBegin => "parse_and_begin",
+        }
+    }
+}
+
+/// The door's deadline on taking a work permit (`IO_TIMEOUT` in `wok-ws`,
+/// which is private).
+pub(crate) const DOOR_PERMIT_WAIT: Duration = Duration::from_secs(10);
+
+/// [`engine_lane`] with the door's blocking-pool hops. Everything else (the
+/// order parse, `admit_frame`, `begin_prepared`, the two commit forms, the
+/// timings and the checks) is as in [`engine_lane`]. `work` is the shared
+/// work semaphore, used by [`Hops::ParseAndBegin`] only.
+#[allow(clippy::too_many_arguments)]
+async fn hop_lane(
+    label: String,
+    mut session: wok_store::relay::RelaySession,
+    frames: Vec<String>,
+    window: usize,
+    clock: Clock,
+    start: Arc<Barrier>,
+    hops: Hops,
+    work: Arc<Semaphore>,
+) -> Result<Lane, String> {
+    let mut lane = Lane {
+        latencies: Vec::with_capacity(frames.len()),
+        ..Lane::default()
+    };
+    let mut flight: Flight<String, Vec<String>> = Flight::new(window);
+    start.wait().await;
+    for (index, text) in frames.into_iter().enumerate() {
+        let started = Instant::now();
+        let prepared = spawn_blocking(move || PreparedFrame::parse(text))
+            .await
+            .map_err(|e| format!("{label}: frame {index}: the parse task failed: {e}"))?;
+        let parsed = Instant::now();
+        if !session.admit_frame(clock.now()) {
+            return Err(format!(
+                "{label}: frame {index}: the frame allowance refused it"
+            ));
+        }
+        let handled = match hops {
+            Hops::Parse => session.begin_prepared(prepared, clock.now()),
+            Hops::ParseAndBegin => {
+                let permit = timeout(DOOR_PERMIT_WAIT, Arc::clone(&work).acquire_owned())
+                    .await
+                    .map_err(|_| format!("{label}: frame {index}: no work permit in time"))?
+                    .map_err(|e| format!("{label}: frame {index}: the work semaphore: {e}"))?;
+                let (returned, handled) = spawn_blocking(move || {
+                    let _permit = permit;
+                    let handled = session.begin_prepared(prepared, clock.now());
+                    (session, handled)
+                })
+                .await
+                .map_err(|e| format!("{label}: frame {index}: the begin task failed: {e}"))?;
+                session = returned;
+                handled
+            }
+        };
+        let begun = Instant::now();
+        lane.parse_ns += (parsed - started).as_nanos() as u64;
+        lane.begin_ns += (begun - parsed).as_nanos() as u64;
+        let write = match handled {
+            Handled::Write(write) => write,
+            Handled::Replies(replies) => {
+                return Err(format!(
+                    "{label}: frame {index}: expected a write to queue, got {}",
+                    describe(&replies)
+                ));
+            }
+        };
+        let id = write.id().to_owned();
+        if window == 1 {
+            let replies = write.commit().await;
+            let acked = Instant::now();
+            lane.acknowledged(started, begun, acked);
+            expect_stored(&label, &id, &replies)?;
+        } else {
+            let reserving = Instant::now();
+            let ticket = write.reserve().await.map_err(|replies| {
+                format!(
+                    "{label}: frame {index}: no place in the writer's queue: {}",
+                    describe(&replies)
+                )
+            })?;
+            lane.reserve_ns += reserving.elapsed().as_nanos() as u64;
+            flight.push(started, begun, id, Box::pin(ticket.wait()));
+            for done in flight.ready().await {
+                finish_engine(&label, &mut lane, done)?;
+            }
+            while flight.len() >= window {
+                for done in flight.some().await {
+                    finish_engine(&label, &mut lane, done)?;
+                }
+            }
+        }
+    }
+    while flight.len() > 0 {
+        for done in flight.some().await {
+            finish_engine(&label, &mut lane, done)?;
+        }
+    }
+    lane.finished = Some(Instant::now());
+    Ok(lane)
+}
+
 fn finish_engine(
     label: &str,
     lane: &mut Lane,
@@ -415,6 +543,7 @@ pub(crate) struct Merged {
     pub(crate) begin_ns: u64,
     pub(crate) queue_ns: u64,
     pub(crate) reserve_ns: u64,
+    pub(crate) pings: u64,
     pub(crate) lanes_with_events: usize,
     pub(crate) wall: Duration,
 }
@@ -434,6 +563,7 @@ pub(crate) fn drive(
         begin_ns: 0,
         queue_ns: 0,
         reserve_ns: 0,
+        pings: 0,
         lanes_with_events: 0,
         wall: Duration::ZERO,
     };
@@ -452,6 +582,7 @@ pub(crate) fn drive(
         merged.begin_ns += lane.begin_ns;
         merged.queue_ns += lane.queue_ns;
         merged.reserve_ns += lane.reserve_ns;
+        merged.pings += lane.pings;
         if let Some(finished) = lane.finished {
             merged.wall = merged.wall.max(finished.saturating_duration_since(started));
         }
@@ -605,6 +736,19 @@ pub(crate) fn engine_cell(
     keepers: &Arc<Keepers>,
     keys: &[Keys],
 ) -> Result<Value, String> {
+    engine_cell_with(cell, frames, keepers, keys, None)
+}
+
+/// [`engine_cell`], its sessions on [`hop_lane`] when `hops` is given, with
+/// the hops and the cell's own work semaphore (the caller makes a fresh one
+/// per cell, as each door holds its own).
+pub(crate) fn engine_cell_with(
+    cell: &Cell,
+    frames: &[String],
+    keepers: &Arc<Keepers>,
+    keys: &[Keys],
+    hops: Option<(Hops, Arc<Semaphore>)>,
+) -> Result<Value, String> {
     let (_dir, store) = fresh_store(cell.cfg, cell.total_events)?;
     let relay = relay_on(
         Arc::clone(&store) as Arc<dyn EventStore>,
@@ -630,14 +774,27 @@ pub(crate) fn engine_cell(
             .step_by(cell.connections)
             .cloned()
             .collect();
-        tasks.push(cell.runtime.spawn(engine_lane(
-            label,
-            session,
-            lane_frames,
-            cell.window,
-            cell.clock,
-            Arc::clone(&start),
-        )));
+        let lane_start = Arc::clone(&start);
+        tasks.push(match &hops {
+            None => cell.runtime.spawn(engine_lane(
+                label,
+                session,
+                lane_frames,
+                cell.window,
+                cell.clock,
+                lane_start,
+            )),
+            Some((hops, work)) => cell.runtime.spawn(hop_lane(
+                label,
+                session,
+                lane_frames,
+                cell.window,
+                cell.clock,
+                lane_start,
+                *hops,
+                Arc::clone(work),
+            )),
+        });
     }
     let mut merged = drive(cell.runtime, tasks, &start)?;
     relay.flush();
@@ -652,12 +809,36 @@ pub(crate) fn engine_cell(
     )?;
     let events = frames.len();
     let mut out = cell_json(&mut merged, events, cell.window);
-    out["stage_mean_us"] = json!({
-        "parse_and_signature_check": mean_us(merged.parse_ns, events),
-        "begin_prepared": mean_us(merged.begin_ns, events),
-        "queue_and_commit": mean_us(merged.queue_ns, events),
-        "reserve_await": if cell.window > 1 { json!(mean_us(merged.reserve_ns, events)) } else { Value::Null },
-    });
+    let reserve_await = if cell.window > 1 {
+        json!(mean_us(merged.reserve_ns, events))
+    } else {
+        Value::Null
+    };
+    let hops = hops.map(|(hops, _)| hops);
+    out["stage_mean_us"] = match hops {
+        None => json!({
+            "parse_and_signature_check": mean_us(merged.parse_ns, events),
+            "begin_prepared": mean_us(merged.begin_ns, events),
+            "queue_and_commit": mean_us(merged.queue_ns, events),
+            "reserve_await": reserve_await,
+        }),
+        // The hops are inside the stages they wrap, and named so.
+        Some(Hops::Parse) => json!({
+            "parse_hop_and_signature_check": mean_us(merged.parse_ns, events),
+            "admit_and_begin_prepared": mean_us(merged.begin_ns, events),
+            "queue_and_commit": mean_us(merged.queue_ns, events),
+            "reserve_await": reserve_await,
+        }),
+        Some(Hops::ParseAndBegin) => json!({
+            "parse_hop_and_signature_check": mean_us(merged.parse_ns, events),
+            "admit_permit_and_begin_prepared_hop": mean_us(merged.begin_ns, events),
+            "queue_and_commit": mean_us(merged.queue_ns, events),
+            "reserve_await": reserve_await,
+        }),
+    };
+    if let Some(hops) = hops {
+        out["hops"] = json!(hops.name());
+    }
     out["writer"] = writer_json(stats, commits);
     out["form"] = json!(if cell.window == 1 {
         "PendingWrite::commit, one write at a time per session"

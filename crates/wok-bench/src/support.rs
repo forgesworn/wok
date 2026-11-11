@@ -353,6 +353,14 @@ pub fn header(cfg: &Config) -> Value {
     );
     params["socket_client_nodelay"] = json!(cfg.socket_client_nodelay);
     params["socket_rounds"] = json!(cfg.socket_rounds);
+    params["door_path_events"] = json!(cfg.door_path_events);
+    params["door_path_serial_events"] = json!(cfg.door_path_serial_events);
+    params["door_path_rounds"] = json!(cfg.door_path_rounds);
+    params["guest_path_events"] = json!(cfg.guest_path_events);
+    params["guest_path_seed_events"] = json!(cfg.guest_path_seed_events);
+    params["guest_path_rounds"] = json!(cfg.guest_path_rounds);
+    header["scenarios"]["door_path"] = json!(cfg.door_path);
+    header["scenarios"]["guest_path"] = json!(cfg.guest_path);
     header
 }
 
