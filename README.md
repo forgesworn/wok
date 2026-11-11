@@ -46,9 +46,10 @@ content to store (`AuthorityEvents`) and who may connect to the sheltered
 door (`Admission`), and it binds the listeners itself. Every operation asks
 again, so a withdrawn key or scope stops working at once.
 
-The `wokd` crate is a program built on them: a members-only relay that its
-operator runs for one group, with a removal command for that operator. Whoever runs an
-instance operates it; see [`crates/wokd/README.md`](crates/wokd/README.md).
+The `wokd` crate, since 0.5.0, is a program built on them: a members-only
+relay that its operator runs for one group, with a removal command for that
+operator. Whoever runs an instance operates it; see
+[`crates/wokd/README.md`](crates/wokd/README.md).
 
 ## Storage compatibility
 
