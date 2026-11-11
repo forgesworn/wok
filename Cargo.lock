@@ -1206,6 +1206,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "wok-bench"
+version = "0.2.0"
+dependencies = [
+ "nostr",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "wok-store",
+]
+
+[[package]]
 name = "wok-store"
 version = "0.2.0"
 dependencies = [
