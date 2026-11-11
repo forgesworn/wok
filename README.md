@@ -25,8 +25,7 @@ engine that serves clients from it.
   keeper-authored events of a short list of public kinds; a sheltered door
   serves authenticated keepers and guests.
 
-The `wok-ws` crate, unreleased on `main`, carries those frames over
-WebSockets.
+The `wok-ws` crate, since 0.4.0, carries those frames over WebSockets.
 
 - **Doors.** A `Door` holds one relay's connection and work budgets and hands
   out unbound axum routers: a public one, which also serves the NIP-11 relay
