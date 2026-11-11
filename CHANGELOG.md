@@ -13,6 +13,10 @@
   storing, and `AnnounceHook` sees each event announced live.
 - New dependencies: `negentropy` 0.5, `url` 2.5, `hex` 0.4, and `nostr`'s
   `os-rng` feature, from which each NIP-42 challenge is drawn.
+- A filter that names several ids is answered from the id index, one seek for
+  each id. SQLite used to walk the partition in time order for it, so the
+  query took longer as the partition grew; a filter with one id was not
+  affected. Answers and their order are unchanged.
 - No schema change.
 
 ## 0.2.0 - 2026-11-10

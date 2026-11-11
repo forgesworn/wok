@@ -3972,9 +3972,19 @@ fn build_query(
                 binds.0,
             )));
         }
+        // A filter that names ids is answered from the id index: one seek
+        // for each id, then a sort of at most that many rows. Left to
+        // choose, SQLite takes `events_time` for its order and, with fewer
+        // ids than the limit, reads the whole partition to learn that no
+        // more match. One id it seeks anyway; several it does not.
+        let by_id = if filter.ids.is_some() {
+            " INDEXED BY events_id"
+        } else {
+            ""
+        };
         return Ok(Some((
             format!(
-                "SELECT e.json FROM events e WHERE e.visibility={vis}{conds} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit}"
+                "SELECT e.json FROM events e{by_id} WHERE e.visibility={vis}{conds} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit}"
             ),
             binds.0,
         )));
@@ -8878,6 +8888,114 @@ PRAGMA user_version=2;")).unwrap();
         }
     }
 
+    /// A filter naming several ids, against an answer worked out by hand:
+    /// with ids present the tag-driven and event-driven shapes build the
+    /// same statement, so the usual oracle would compare it with itself.
+    #[test]
+    fn several_ids_answer_newest_first_from_their_own_partition() {
+        use serde_json::json;
+        let tmp = TempDir::new().unwrap();
+        let db = store(&tmp);
+        let key = Keys::generate();
+        let old = event(&key, 1, NOW - 10, "old", &[]);
+        let tie_a = event(&key, 1, NOW - 5, "tie a", &[]);
+        let tie_b = event(&key, 1, NOW - 5, "tie b", &[]);
+        let new = event(&key, 7, NOW - 1, "new", &[]);
+        let expiring = event(&key, 1, NOW - 2, "soon", &[tag("expiration", NOW + 10)]);
+        let hidden = event(&key, 1, NOW - 3, "sheltered", &[]);
+        let absent = event(&key, 1, NOW - 4, "never stored", &[]);
+        for e in [&old, &tie_a, &tie_b, &new, &expiring] {
+            db.put(Visibility::Public, e, NOW).unwrap();
+        }
+        db.put(Visibility::Sheltered, &hidden, NOW).unwrap();
+        // Other events on every side of them in time, which are not asked for.
+        for n in 0..30u64 {
+            let other = event(&key, 1, NOW - 20 + n, &format!("other {n}"), &[]);
+            db.put(Visibility::Public, &other, NOW).unwrap();
+        }
+        let named: Vec<String> = [&old, &tie_a, &tie_b, &new, &expiring, &hidden, &absent]
+            .iter()
+            .map(|e| e.id.to_hex())
+            .collect();
+        let filter = |extra: serde_json::Value| {
+            let mut value = json!({ "ids": named });
+            for (k, v) in extra.as_object().unwrap() {
+                value[k] = v.clone();
+            }
+            serde_json::from_value::<Filter>(value).unwrap()
+        };
+        // Equal times order by id, lowest first.
+        let mut ties = [tie_a.id.to_hex(), tie_b.id.to_hex()];
+        ties.sort();
+        let [tie_first, tie_second] = ties;
+        let (old, new, expiring, hidden) = (
+            old.id.to_hex(),
+            new.id.to_hex(),
+            expiring.id.to_hex(),
+            hidden.id.to_hex(),
+        );
+        let (old, new, expiring, hidden, tie_first, tie_second) = (
+            old.as_str(),
+            new.as_str(),
+            expiring.as_str(),
+            hidden.as_str(),
+            tie_first.as_str(),
+            tie_second.as_str(),
+        );
+        let later = NOW + 20;
+
+        // While the expiring event lives it is answered in its place.
+        assert_eq!(
+            ids(&db, Visibility::Public, filter(json!({})), NOW),
+            [new, expiring, tie_first, tie_second, old]
+        );
+        // Afterwards it is gone; the sheltered and the absent id never show.
+        assert_eq!(
+            ids(&db, Visibility::Public, filter(json!({})), later),
+            [new, tie_first, tie_second, old]
+        );
+        // A limit below the number of ids keeps the newest.
+        assert_eq!(
+            ids(&db, Visibility::Public, filter(json!({"limit": 2})), later),
+            [new, tie_first]
+        );
+        // The other conditions still narrow the answer.
+        assert_eq!(
+            ids(
+                &db,
+                Visibility::Public,
+                filter(json!({"kinds": [1]})),
+                later
+            ),
+            [tie_first, tie_second, old]
+        );
+        assert_eq!(
+            ids(
+                &db,
+                Visibility::Public,
+                filter(json!({"since": NOW - 5, "until": NOW - 2})),
+                later
+            ),
+            [tie_first, tie_second]
+        );
+        // The other partition holds only its own event.
+        assert_eq!(
+            ids(&db, Visibility::Sheltered, filter(json!({})), later),
+            [hidden]
+        );
+        // The counts agree.
+        assert_eq!(
+            db.count(Visibility::Public, &[filter(json!({}))], later)
+                .unwrap(),
+            4
+        );
+        assert_eq!(
+            db.count(Visibility::Sheltered, &[filter(json!({}))], later)
+                .unwrap(),
+            1
+        );
+    }
+
     #[test]
     fn the_bench_queries_and_the_coordinate_statements_keep_their_indexes() {
         let tmp = TempDir::new().unwrap();
@@ -8915,6 +9033,25 @@ PRAGMA user_version=2;")).unwrap();
             plan.contains("USING INDEX events_id (visibility=? AND id=?)"),
             "{plan}"
         );
+        // Several ids, alone and with every other condition: one seek for
+        // each id, whatever else the filter carries. The sort that follows
+        // is of at most that many rows, so it is not checked for here.
+        let eight: Vec<String> = (0..8).map(|n| format!("{n:064x}")).collect();
+        for filter in [
+            serde_json::json!({"ids": eight}),
+            serde_json::json!({"ids": eight, "limit": 2}),
+            serde_json::json!({"ids": eight, "kinds": [1], "since": NOW - 80}),
+            serde_json::json!({"ids": eight, "authors": [hex], "kinds": [1]}),
+            serde_json::json!({"ids": eight, "#d": ["room-1"]}),
+        ] {
+            let plan = plan_of(filter.clone());
+            assert!(
+                plan.contains("USING INDEX events_id (visibility=? AND id=?)"),
+                "{filter}: {plan}"
+            );
+            assert!(!plan.contains("events_time"), "{filter}: {plan}");
+            assert!(!plan.contains("events_author_kind"), "{filter}: {plan}");
+        }
         let plan = plan_of(serde_json::json!({"authors": [hex], "kinds": [1], "limit": 50}));
         assert!(
             plan.contains("USING INDEX events_author_kind (visibility=? AND author=? AND kind=?)"),
@@ -9006,6 +9143,15 @@ PRAGMA user_version=2;")).unwrap();
             (
                 serde_json::json!({"authors": [hex], "#d": ["room-1"]}),
                 "events_author_kind",
+            ),
+            // A count of several ids seeks each one too.
+            (
+                serde_json::json!({"ids": eight}),
+                "USING INDEX events_id (visibility=? AND id=?)",
+            ),
+            (
+                serde_json::json!({"ids": eight, "kinds": [1]}),
+                "USING INDEX events_id (visibility=? AND id=?)",
             ),
         ] {
             let filter: Filter = serde_json::from_value(filter).unwrap();
