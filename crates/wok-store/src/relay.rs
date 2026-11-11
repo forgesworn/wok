@@ -233,10 +233,11 @@ impl AuthorityChanges {
         self.keepers.is_some()
     }
 
-    /// The generation each watched source has reached. A source bumps its
-    /// generation after its write commits, so a stamp read before a query
-    /// can only be older than that query's view, never newer.
-    fn stamp(&self) -> [u64; 3] {
+    /// The generation each watched source has reached (guest scopes, keepers,
+    /// issuers; 0 for one that cannot signal). A source bumps its generation
+    /// after its write commits, so a stamp read before a query can only be
+    /// older than that query's view, never newer.
+    pub fn stamp(&self) -> [u64; 3] {
         let read = |receiver: &Option<tokio::sync::watch::Receiver<u64>>| {
             receiver.as_ref().map_or(0, |receiver| *receiver.borrow())
         };
@@ -2458,7 +2459,10 @@ fn guest_valid_until(event: &Event, room: &str, scopes: &[GuestScope]) -> Option
         .min()
 }
 
-fn guest_event_readable(event: &Event, scopes: &[GuestScope]) -> bool {
+/// Whether a guest holding `scopes` may read `event`: in a room one of them
+/// names (the event's single `d` tag), of a kind that scope lets it read. The
+/// rule every REQ, NEG and live delivery applies to a guest.
+pub fn guest_event_readable(event: &Event, scopes: &[GuestScope]) -> bool {
     guest_readable(event.kind.as_u16(), event_room(event), scopes)
 }
 
