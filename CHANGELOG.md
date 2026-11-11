@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.0 - 2026-11-11
 
 - Add `wokd`, a members-only Nostr relay built on `wok-store` and `wok-ws`.
   `wokd --config <file>` serves one group, whose `npub` keys its operator
@@ -40,11 +40,11 @@
   with NIP-42 and every event is signed and verified. Server worker and
   blocking threads, the doors' work permits and `TCP_NODELAY` can be varied
   per run, and each door's refusals are checked before anything is measured.
-- The libraries are unchanged and still open no port. The unpublished bench
-  binary binds `127.0.0.1` on an ephemeral port for this scenario, refuses
-  any other address, and a default `all` run now does so. Its sheltered door
-  uses an admit-everything `Admission` that lives in `wok-bench` only and is
-  not for applications.
+- The scenario leaves the libraries unchanged. The unpublished bench binary
+  binds `127.0.0.1` on an ephemeral port for this scenario, refuses any other
+  address, and a default `all` run now does so. Its sheltered door uses an
+  admit-everything `Admission` that lives in `wok-bench` only and is not for
+  applications.
 
 ## 0.4.0 - 2026-11-11
 
