@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `wok-ws`: `Door::sheltered_router_with_information` is the sheltered door
+  serving a NIP-11 relay information document. It is the public door's
+  document, with the same NIP list and limits, except that `auth_required` is
+  `true`: the same static bytes for every caller, with no key, address,
+  contents or live state. A request for it is not a connection, so admission
+  does not see it; an upgrade still goes through admission and NIP-42,
+  whatever its `Accept` header says. `sheltered_router` and the public
+  document are unchanged.
+- `wokd` serves that document by default. `relay_information = false` turns it
+  off.
+
 ## 0.5.3 - 2026-11-11
 
 - `wok-store`: when a commit leaves the WAL at `wal_ceiling_pages` and

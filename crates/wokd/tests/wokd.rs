@@ -50,6 +50,23 @@ async fn start(dir: &Path, members: &[&Keys]) -> Running {
 
 /// [`start`] on `listener`, with `url` as the address clients name.
 async fn start_at(dir: &Path, members: &[&Keys], listener: TcpListener, url: String) -> Running {
+    start_at_with(dir, members, listener, url, "").await
+}
+
+/// [`start`], with `extra` appended to the configuration.
+async fn start_with(dir: &Path, members: &[&Keys], extra: &str) -> Running {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+    start_at_with(dir, members, listener, url, extra).await
+}
+
+async fn start_at_with(
+    dir: &Path,
+    members: &[&Keys],
+    listener: TcpListener,
+    url: String,
+    extra: &str,
+) -> Running {
     let members = members
         .iter()
         .map(|keys| format!("\"{}\"", keys.public_key().to_bech32().unwrap()))
@@ -57,7 +74,7 @@ async fn start_at(dir: &Path, members: &[&Keys], listener: TcpListener, url: Str
         .join(", ");
     let text = format!(
         "url = \"{url}\"\ndata_dir = '{}'\nmax_store_bytes = 67108864\n\
-         min_free_bytes = 0\nmembers = [{members}]\n",
+         min_free_bytes = 0\nmembers = [{members}]\n{extra}",
         dir.display()
     );
     let config = Config::from_toml(&text).expect("a valid configuration");
@@ -71,6 +88,33 @@ async fn start_at(dir: &Path, members: &[&Keys], listener: TcpListener, url: Str
         stop,
         task,
     }
+}
+
+/// A plain HTTP GET to the relay's address, as a browser's `fetch` sends
+/// it: the status code, the header block in lower case, and the body.
+async fn http_get(url: &str, accept: &str) -> (u16, String, String) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let address = url
+        .trim_start_matches("ws://")
+        .split('/')
+        .next()
+        .unwrap()
+        .to_owned();
+    let mut stream = tokio::net::TcpStream::connect(&address).await.unwrap();
+    let request = format!(
+        "GET {PATH} HTTP/1.1\r\nHost: {address}\r\nAccept: {accept}\r\n\
+         Origin: https://client.example\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(request.as_bytes()).await.unwrap();
+    let mut response = Vec::new();
+    timeout(Duration::from_secs(5), stream.read_to_end(&mut response))
+        .await
+        .expect("the relay answers")
+        .unwrap();
+    let text = String::from_utf8(response).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").expect("an HTTP response");
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, head.to_ascii_lowercase(), body.to_owned())
 }
 
 /// A WebSocket proxy in front of `upstream`, counting the AUTH frames its
@@ -643,4 +687,50 @@ fn a_removal_with_no_store_says_so_and_creates_nothing() {
     let missing = wokd::remove(&config, &Target::Author(alice.public_key()));
     assert!(matches!(missing, Err(RemoveError::NoStore)), "{missing:?}");
     assert!(!dir.exists());
+}
+
+#[tokio::test]
+async fn the_relay_information_document_says_login_is_required_and_names_nobody() {
+    let dir = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let running = start(dir.path(), &[&alice]).await;
+    let (status, head, body) = http_get(&running.url, "application/nostr+json").await;
+    assert_eq!(status, 200, "{head}");
+    assert!(
+        head.contains("content-type: application/nostr+json"),
+        "{head}"
+    );
+    assert!(head.contains("access-control-allow-origin: *"), "{head}");
+    let document: Value = serde_json::from_str(&body).unwrap();
+    let mut keys = document.as_object().unwrap().keys().collect::<Vec<_>>();
+    keys.sort();
+    assert_eq!(keys, ["limitation", "supported_nips"]);
+    assert_eq!(document["limitation"]["auth_required"], true);
+    assert_eq!(document["limitation"]["restricted_writes"], true);
+    assert!(!body.contains(&alice.public_key().to_hex()));
+    assert!(!body.contains(&alice.public_key().to_bech32().unwrap()));
+    assert!(!body.contains("127.0.0.1"));
+    // Without the NIP-11 media type there is no document.
+    let (status, head, body) = http_get(&running.url, "application/json").await;
+    assert!(!(200..300).contains(&status), "{head}");
+    assert!(!body.contains("supported_nips"));
+    // And a socket still has to log in as a member.
+    let mut socket = member(&running.url, &alice).await;
+    let event = note(&alice, "after the document");
+    assert_eq!(publish(&mut socket, &event).await[2], true);
+    drop(socket);
+    running.stop().await;
+}
+
+#[tokio::test]
+async fn with_relay_information_off_the_relay_serves_no_document() {
+    let dir = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let running = start_with(dir.path(), &[&alice], "relay_information = false\n").await;
+    assert!(!running.config.relay_information);
+    let (status, head, body) = http_get(&running.url, "application/nostr+json").await;
+    assert!(!(200..300).contains(&status), "{head}");
+    assert!(!head.contains("access-control-allow-origin"), "{head}");
+    assert!(!body.contains("supported_nips"));
+    running.stop().await;
 }

@@ -29,3 +29,9 @@ members = [
 # Seconds a connection may stay unauthenticated. Stock clients answer at
 # once; raise it only for a remote signer that asks its owner first.
 # auth_deadline_secs = 15
+
+# Whether to answer a NIP-11 request with the relay information document: the
+# same static document for everyone, giving the NIPs supported, the limits and
+# that every read and write needs NIP-42. It names no member, operator or
+# address.
+# relay_information = true

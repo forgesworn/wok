@@ -6,8 +6,9 @@
 //! binds the listener, chooses which router goes on which listener, and
 //! supplies the identity its sheltered door admits ([`Admission`]).
 //!
-//! The public router never mounts the sheltered partition, and only it serves
-//! the NIP-11 relay information document.
+//! The public router never mounts the sheltered partition. It serves the
+//! NIP-11 relay information document; a sheltered router serves one only
+//! when built with [`Door::sheltered_router_with_information`].
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -261,14 +262,29 @@ impl Door {
     /// The public door: anyone reads; writes are what the relay's policy
     /// admits. It also serves the NIP-11 relay information document.
     pub fn public_router(&self, canonical_url: Url) -> Router {
-        self.router(Visibility::Public, canonical_url, None)
+        self.router(Visibility::Public, canonical_url, None, true)
     }
 
     /// The sheltered door, for connections `admission` lets in. NIP-42 is
     /// still required on each: admission alone is not authorisation. It
     /// serves no relay information document.
     pub fn sheltered_router(&self, canonical_url: Url, admission: Arc<dyn Admission>) -> Router {
-        self.router(Visibility::Sheltered, canonical_url, Some(admission))
+        self.router(Visibility::Sheltered, canonical_url, Some(admission), false)
+    }
+
+    /// [`Self::sheltered_router`], also serving a NIP-11 relay information
+    /// document that says every read and write needs NIP-42. The document is
+    /// static, the same for every caller, and carries what the public one
+    /// does: supported NIPs and limits, with no key, address, contents or
+    /// live state. A request for it is not a connection, so `admission` does
+    /// not see it; an upgrade still goes through `admission` and NIP-42
+    /// whatever its `Accept` header says.
+    pub fn sheltered_router_with_information(
+        &self,
+        canonical_url: Url,
+        admission: Arc<dyn Admission>,
+    ) -> Router {
+        self.router(Visibility::Sheltered, canonical_url, Some(admission), true)
     }
 
     fn router(
@@ -276,13 +292,17 @@ impl Door {
         visibility: Visibility,
         canonical_url: Url,
         admission: Option<Arc<dyn Admission>>,
+        information: bool,
     ) -> Router {
-        // Only the public door exposes NIP-11. Do not apply a general CORS
-        // layer to the sheltered door.
-        let methods = if visibility == Visibility::Public {
-            get(public_get).options(public_preflight)
-        } else {
-            get(sheltered_get)
+        // The public door always serves NIP-11, a sheltered one only when
+        // asked to. The CORS headers go on the document's own responses; do
+        // not apply a general CORS layer to the sheltered door.
+        let methods = match (visibility, information) {
+            (Visibility::Public, _) => get(public_get).options(public_preflight),
+            (Visibility::Sheltered, true) => {
+                get(sheltered_get_with_information).options(public_preflight)
+            }
+            (Visibility::Sheltered, false) => get(sheltered_get),
         };
         Router::new().route(PATH, methods).with_state(SocketState {
             door: self.clone(),
@@ -365,34 +385,38 @@ async fn public_get(
         // connection budgets, even if the client also sends an Accept header.
         Ok(ws) => upgrade(state, None, ws),
         Err(rejection) if !accepts_relay_information(&headers) => rejection.into_response(),
-        Err(_) => {
-            // Static public capabilities only: never include an operator's
-            // key, private partitions, canonical address, contents or live
-            // state.
-            let mut response = axum::Json(serde_json::json!({
-                "supported_nips": wok_store::relay::SUPPORTED_NIPS,
-                "limitation": {
-                    "max_message_length": MAX_RELAY_FRAME_BYTES,
-                    "max_subscriptions": wok_store::relay::MAX_SUBSCRIPTIONS,
-                    "max_limit": wok_store::MAX_QUERY_EVENTS,
-                    "default_limit": wok_store::MAX_QUERY_EVENTS,
-                    "max_subid_length": wok_store::relay::MAX_SUBSCRIPTION_ID_CHARS,
-                    "max_event_tags": wok_store::MAX_EVENT_TAGS,
-                    "restricted_writes": true,
-                    "auth_required": false
-                }
-            }))
-            .into_response();
-            response.headers_mut().insert(
-                header::CONTENT_TYPE,
-                HeaderValue::from_static("application/nostr+json"),
-            );
-            response
-                .headers_mut()
-                .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-            public_information_cors(response)
-        }
+        Err(_) => relay_information(false),
     }
+}
+
+/// The NIP-11 document, the same bytes for every caller of a door. Static
+/// capabilities only: never include an operator's key, private partitions,
+/// canonical address, contents or live state. Both doors run the same
+/// session, so they share the NIP list and the limits; only whether a read
+/// needs NIP-42 differs.
+fn relay_information(auth_required: bool) -> Response {
+    let mut response = axum::Json(serde_json::json!({
+        "supported_nips": wok_store::relay::SUPPORTED_NIPS,
+        "limitation": {
+            "max_message_length": MAX_RELAY_FRAME_BYTES,
+            "max_subscriptions": wok_store::relay::MAX_SUBSCRIPTIONS,
+            "max_limit": wok_store::MAX_QUERY_EVENTS,
+            "default_limit": wok_store::MAX_QUERY_EVENTS,
+            "max_subid_length": wok_store::relay::MAX_SUBSCRIPTION_ID_CHARS,
+            "max_event_tags": wok_store::MAX_EVENT_TAGS,
+            "restricted_writes": true,
+            "auth_required": auth_required
+        }
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/nostr+json"),
+    );
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    public_information_cors(response)
 }
 
 async fn sheltered_get(
@@ -401,6 +425,22 @@ async fn sheltered_get(
     ws: WebSocketUpgrade,
 ) -> Response {
     upgrade(state, Some(&extensions), ws)
+}
+
+async fn sheltered_get_with_information(
+    State(state): State<SocketState>,
+    extensions: Extensions,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, WebSocketUpgradeRejection>,
+) -> Response {
+    match ws {
+        // A genuine upgrade goes through admission and NIP-42 as on the
+        // plain sheltered door, even if the client also sends an Accept
+        // header.
+        Ok(ws) => upgrade(state, Some(&extensions), ws),
+        Err(rejection) if !accepts_relay_information(&headers) => rejection.into_response(),
+        Err(_) => relay_information(true),
+    }
 }
 
 fn upgrade(state: SocketState, extensions: Option<&Extensions>, ws: WebSocketUpgrade) -> Response {
@@ -2077,6 +2117,198 @@ mod tests {
         assert_eq!(refused[0], "OK");
         assert_eq!(refused[1], note.id.to_hex());
         assert_eq!(refused[2], false);
+        routes.shutdown();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn sheltered_information_says_every_read_and_write_needs_auth() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let app = routes.sheltered_router_with_information(
+            "wss://keeper.example/events".parse().unwrap(),
+            Arc::new(PerPeer::default()),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(PATH)
+                    .header("accept", "application/json, application/nostr+json; q=0.9")
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "application/nostr+json");
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+        assert_eq!(response.headers()["access-control-allow-headers"], "Accept");
+        assert!(
+            !response
+                .headers()
+                .contains_key("access-control-allow-credentials")
+        );
+        let body = axum::body::to_bytes(response.into_body(), 4096)
+            .await
+            .unwrap();
+        let document: Value = serde_json::from_slice(&body).unwrap();
+        // Exactly the public document's keys and limits, with auth required.
+        assert_eq!(
+            document,
+            json!({
+                "supported_nips": [1, 9, 11, 40, 42, 45, 70, 77],
+                "limitation": {
+                    "max_message_length": 263_168,
+                    "max_subscriptions": 16,
+                    "max_limit": 128,
+                    "default_limit": 128,
+                    "max_subid_length": 64,
+                    "max_event_tags": 512,
+                    "restricted_writes": true,
+                    "auth_required": true
+                }
+            })
+        );
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(!text.contains(&key.public_key().to_hex()));
+        assert!(!text.contains("keeper.example"));
+        assert!(!text.contains("forgesworn"));
+        // Asking for the document opens no connection and takes no budget.
+        assert_eq!(routes.connections.available_permits(), 32);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("HEAD")
+                    .uri(PATH)
+                    .header("accept", "application/nostr+json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri(PATH)
+                    .header("origin", "https://client.example")
+                    .header("access-control-request-method", "GET")
+                    .header("access-control-request-headers", "accept")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers()["access-control-allow-origin"], "*");
+    }
+
+    #[tokio::test]
+    async fn sheltered_information_refuses_other_requests_as_the_plain_door_does() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let url: Url = "wss://keeper.example/events".parse().unwrap();
+        let with =
+            routes.sheltered_router_with_information(url.clone(), Arc::new(PerPeer::default()));
+        let plain = routes.sheltered_router(url, Arc::new(PerPeer::default()));
+        for accept in [
+            "",
+            "*/*",
+            "application/json",
+            "application/nostr+json; q=0",
+            "application/nostr+json; q=NaN",
+            "application/nostr+json; q=1.1",
+        ] {
+            let request = || {
+                Request::builder()
+                    .uri(PATH)
+                    .header("accept", accept)
+                    .header("origin", "https://client.example")
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let answered = with.clone().oneshot(request()).await.unwrap();
+            let before = plain.clone().oneshot(request()).await.unwrap();
+            assert!(
+                !answered.status().is_success(),
+                "unexpected metadata for {accept}"
+            );
+            assert_eq!(answered.status(), before.status(), "for {accept}");
+            assert!(
+                !answered
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_upgrade_asking_for_information_still_meets_admission_and_auth() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+        let admitted = routes
+            .sheltered_router_with_information(url.parse().unwrap(), Arc::new(PerPeer::default()))
+            .layer(Extension(TestPeer(1)));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, admitted).await.unwrap();
+        });
+        let mut request = url.clone().into_client_request().unwrap();
+        request.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/nostr+json"),
+        );
+        let (mut socket, response) = connect_async(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+        assert_eq!(receive(&mut socket).await[0], "AUTH");
+        drop(socket);
+        task.abort();
+
+        // No identity attached: admission refuses the upgrade, and the
+        // refusal is its status, not the document.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+        let refused = routes
+            .sheltered_router_with_information(url.parse().unwrap(), Arc::new(PerPeer::default()));
+        let task = tokio::spawn(async move {
+            axum::serve(listener, refused).await.unwrap();
+        });
+        let mut request = url.into_client_request().unwrap();
+        request.headers_mut().insert(
+            header::ACCEPT,
+            HeaderValue::from_static("application/nostr+json"),
+        );
+        match connect_async(request).await {
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                assert_eq!(response.status(), StatusCode::FORBIDDEN);
+                assert!(
+                    !response
+                        .headers()
+                        .contains_key("access-control-allow-origin")
+                );
+                let body = response.body().as_deref().unwrap_or_default();
+                assert!(!String::from_utf8_lossy(body).contains("supported_nips"));
+            }
+            Err(other) => panic!("not an HTTP refusal: {other}"),
+            Ok(_) => panic!("the upgrade was admitted"),
+        }
         routes.shutdown();
         task.abort();
     }
