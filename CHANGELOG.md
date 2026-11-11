@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.4 - 2026-11-11
 
 - `wok-ws`: `Door::sheltered_router_with_information` is the sheltered door
   serving a NIP-11 relay information document. It is the public door's
