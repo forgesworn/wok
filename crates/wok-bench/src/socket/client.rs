@@ -71,12 +71,19 @@ async fn next_text(label: &str, socket: &mut Socket, wait: Duration) -> Result<S
     }
 }
 
-/// Connect and read the AUTH challenge. `nodelay` is the client's TCP_NODELAY.
-async fn connect(label: &str, url: &str, nodelay: bool) -> Result<(Socket, String), String> {
+/// Connect, and nothing more: no frame is read. `nodelay` is the client's
+/// TCP_NODELAY.
+pub(crate) async fn connect_plain(label: &str, url: &str, nodelay: bool) -> Result<Socket, String> {
     let connected = timeout(SETUP_WAIT, connect_async_with_config(url, None, nodelay))
         .await
         .map_err(|_| format!("{label}: connecting took more than {SETUP_WAIT:?}"))?;
-    let (mut socket, _) = connected.map_err(|e| format!("{label}: connect to {url}: {e}"))?;
+    let (socket, _) = connected.map_err(|e| format!("{label}: connect to {url}: {e}"))?;
+    Ok(socket)
+}
+
+/// Connect and read the AUTH challenge. `nodelay` is the client's TCP_NODELAY.
+async fn connect(label: &str, url: &str, nodelay: bool) -> Result<(Socket, String), String> {
+    let mut socket = connect_plain(label, url, nodelay).await?;
     let first = next_text(label, &mut socket, SETUP_WAIT).await?;
     let value: Value = serde_json::from_str(&first)
         .map_err(|e| format!("{label}: the first frame is not JSON ({e}): {first}"))?;

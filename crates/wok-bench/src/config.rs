@@ -28,7 +28,11 @@ SCENARIO
               on 127.0.0.1, against fresh stores, beside the engine driven
               directly on the same events (writes only; client and server share
               one process and one host)
-    all       every scenario (default)
+    door-path diagnostic, run only when named: one connection through the
+              sheltered door beside stand-ins that add the door's blocking-pool
+              hops to the direct engine lane, and an acknowledge-only socket
+              stand-in; not part of `all`
+    all       every scenario above but door-path (default)
 
 Results are one JSON document on stdout, or in the file named by --out.
 Progress goes to stderr. Every figure is checked: a refused or duplicate put,
@@ -96,6 +100,14 @@ SOCKET (--content-bytes and --seed apply; no corpus is built)
     --socket-rounds N       run the whole grid N times in one process, the
                             variant order reversed on even rounds; each round is
                             reported separately (default 1)
+
+DOOR-PATH (--content-bytes and --seed apply; no corpus is built; the server
+setting is fixed at 2:8:2/1:off with the client's TCP_NODELAY on, and the
+--socket-* options do not apply)
+    --door-path-events N    events in the window-32 cell (default 20000)
+    --door-path-serial-events N  events in the window-1 cell (default 2000)
+    --door-path-rounds N    rounds, each running every arm of both cells once,
+                            the arm order rotated each round (default 8)
 
 STORE
     --profile P           server or phone StoreOptions (default server)
@@ -271,6 +283,10 @@ pub struct Config {
     pub socket_variants: Vec<Variant>,
     pub socket_client_nodelay: bool,
     pub socket_rounds: usize,
+    pub door_path: bool,
+    pub door_path_events: usize,
+    pub door_path_serial_events: usize,
+    pub door_path_rounds: usize,
     pub profile: Profile,
     pub max_bytes: Option<u64>,
     pub dir: Option<PathBuf>,
@@ -320,6 +336,10 @@ impl Default for Config {
             }],
             socket_client_nodelay: true,
             socket_rounds: 1,
+            door_path: false,
+            door_path_events: 20_000,
+            door_path_serial_events: 2000,
+            door_path_rounds: 8,
             profile: Profile::Server,
             max_bytes: None,
             dir: None,
@@ -459,6 +479,11 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
                 cfg.socket_client_nodelay = switch(&format!("--{name}"), &value)?
             }
             "socket-rounds" => cfg.socket_rounds = at_least_one(name, number(name, &value)?)?,
+            "door-path-events" => cfg.door_path_events = at_least_one(name, number(name, &value)?)?,
+            "door-path-serial-events" => {
+                cfg.door_path_serial_events = at_least_one(name, number(name, &value)?)?
+            }
+            "door-path-rounds" => cfg.door_path_rounds = at_least_one(name, number(name, &value)?)?,
             "profile" => {
                 cfg.profile = match value.as_str() {
                     "server" => Profile::Server,
@@ -472,16 +497,18 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             _ => return Err(format!("unknown option `--{name}`")),
         }
     }
-    let (ingest, query, fanout, engine, socket) = match scenario.as_deref() {
-        None | Some("all") => (true, true, true, true, true),
-        Some("ingest") => (true, false, false, false, false),
-        Some("query") => (false, true, false, false, false),
-        Some("fanout") => (false, false, true, false, false),
-        Some("engine") => (false, false, false, true, false),
-        Some("socket") => (false, false, false, false, true),
+    // `door-path` is diagnostic: it runs only when it is named, never in `all`.
+    let (ingest, query, fanout, engine, socket, door_path) = match scenario.as_deref() {
+        None | Some("all") => (true, true, true, true, true, false),
+        Some("ingest") => (true, false, false, false, false, false),
+        Some("query") => (false, true, false, false, false, false),
+        Some("fanout") => (false, false, true, false, false, false),
+        Some("engine") => (false, false, false, true, false, false),
+        Some("socket") => (false, false, false, false, true, false),
+        Some("door-path") => (false, false, false, false, false, true),
         Some(other) => {
             return Err(format!(
-                "unknown scenario `{other}` (ingest, query, fanout, engine, socket or all)"
+                "unknown scenario `{other}` (ingest, query, fanout, engine, socket, door-path or all)"
             ));
         }
     };
@@ -490,6 +517,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
     cfg.fanout = fanout;
     cfg.engine = engine;
     cfg.socket = socket;
+    cfg.door_path = door_path;
     if cfg.socket {
         let widest = cfg.socket_connections.iter().copied().max().unwrap_or(1);
         if cfg.socket_events < widest {
@@ -514,6 +542,7 @@ mod tests {
     fn no_arguments_run_everything_at_the_defaults() {
         let cfg = parsed(&[]).unwrap().unwrap();
         assert!(cfg.ingest && cfg.query && cfg.fanout && cfg.engine && cfg.socket);
+        assert!(!cfg.door_path, "door-path is never part of a default run");
         assert_eq!(cfg.events, 2000);
         assert_eq!(cfg.socket_connections, vec![1, 4, 16, 64]);
         assert_eq!(
@@ -611,6 +640,59 @@ mod tests {
         assert!(cfg.socket_variants[1].nodelay);
         assert!(!cfg.socket_client_nodelay);
         assert_eq!(cfg.socket_rounds, 3);
+    }
+
+    #[test]
+    fn the_door_path_scenario_runs_only_when_named_and_its_options_parse() {
+        let cfg = parsed(&["door-path"]).unwrap().unwrap();
+        assert!(cfg.door_path);
+        assert!(!cfg.ingest && !cfg.query && !cfg.fanout && !cfg.engine && !cfg.socket);
+        assert_eq!(
+            (
+                cfg.door_path_events,
+                cfg.door_path_serial_events,
+                cfg.door_path_rounds
+            ),
+            (20_000, 2000, 8)
+        );
+        let cfg = parsed(&[
+            "door-path",
+            "--door-path-events",
+            "40_000",
+            "--door-path-serial-events=4000",
+            "--door-path-rounds",
+            "3",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            (
+                cfg.door_path_events,
+                cfg.door_path_serial_events,
+                cfg.door_path_rounds
+            ),
+            (40_000, 4000, 3)
+        );
+        // Neither `all` nor any other scenario runs it.
+        for scenario in ["all", "socket", "engine", "ingest", "query", "fanout"] {
+            assert!(
+                !parsed(&[scenario]).unwrap().unwrap().door_path,
+                "{scenario}"
+            );
+        }
+        for (args, reason) in [
+            (&["--door-path-events", "0"][..], "at least 1"),
+            (&["--door-path-serial-events", "0"], "at least 1"),
+            (&["--door-path-rounds", "0"], "at least 1"),
+            (&["--door-path-rounds", "x"], "not a valid number"),
+            (&["door-path", "socket"], "unexpected"),
+        ] {
+            let message = parsed(args).unwrap_err();
+            assert!(
+                message.contains(reason),
+                "{args:?}: `{message}` lacks `{reason}`"
+            );
+        }
     }
 
     #[test]
