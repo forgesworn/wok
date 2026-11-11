@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- `wok-store`: `SqliteEventStore::checkpoint_stats` reports what the store's
+  checkpointing has done since it was opened: the passive, truncating and
+  blocking checkpoints it has run, the time the writer has spent in the
+  blocking ones and the longest of them, and the most WAL pages a commit has
+  left. Reading it changes nothing, and the store behaves as before.
+- `wok-bench` reports those counts as `checkpoints` wherever it reports
+  `writer`, and `door-path` marks an arm run `stalled` when its longest wait
+  for an OK passed 200 ms. No rule uses the marker.
+
 ## 0.5.1 - 2026-11-11
 
 - `wok-bench` gains a diagnostic `door-path` scenario, run only when named

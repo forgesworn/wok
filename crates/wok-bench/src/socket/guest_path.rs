@@ -50,7 +50,7 @@ use super::server::Server;
 use super::{CLIENT_WORKERS, allowances, client_runtime, content};
 use crate::config::{Config, DOOR_INFLIGHT_WRITES, Variant};
 use crate::corpus::KIND_NOTE;
-use crate::engine::writes::{cell_json, drive, writer_json};
+use crate::engine::writes::{cell_json, checkpoints_json, drive, writer_json};
 use crate::engine::{Keepers, tag, wall_seconds};
 use crate::support::{SplitMix, fresh_store};
 
@@ -1154,6 +1154,7 @@ fn run_one(
     server.relay.flush();
     let stats = server.relay.writer_stats();
     let commits = server.store.commits();
+    let checkpoints = checkpoints_json(&server.store);
     server.stop().map_err(|e| format!("{label}: {e}"))?;
     let lifetime = began.elapsed();
     let stored = verify_run(
@@ -1173,6 +1174,7 @@ fn run_one(
     out["store"] = json!(store.name());
     out["connections"] = json!(connections);
     out["writer"] = writer_json(stats, commits);
+    out["checkpoints"] = checkpoints;
     out["stored_total"] = json!(stored);
     out["pings_seen"] = json!(merged.pings);
     out["server_lifetime_s"] = json!((lifetime.as_secs_f64() * 1e3).round() / 1e3);

@@ -55,6 +55,10 @@ const THROUGHPUT_SHARE: f64 = 0.10;
 /// `consistent_with_hops`: the largest gap between their median mean batches,
 /// in events, inclusive.
 const BATCH_GAP: f64 = 1.0;
+/// An arm run is marked `stalled` when its longest wait for an OK passed
+/// this, in microseconds. A marker to read the store's checkpoint counts
+/// beside; no rule uses it.
+const STALL_US: f64 = 200_000.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Arm {
@@ -163,6 +167,7 @@ fn ack_only_arm(shared: &Shared, spec: &Spec) -> Result<Value, String> {
     out["variant"] = json!(BASELINE.label());
     out["connections"] = json!(1);
     out["writer"] = Value::Null;
+    out["checkpoints"] = Value::Null;
     out["verified"] = Value::Null;
     out["store"] = json!("none: the stand-in stores nothing, so there is nothing to verify");
     Ok(out)
@@ -174,11 +179,21 @@ fn run_arm(shared: &Shared, arm: Arm, spec: &Spec) -> Result<Value, String> {
         Arm::Direct => direct_arm(shared, spec, None)?,
         Arm::DirectOneHop => direct_arm(shared, spec, Some(Hops::Parse))?,
         Arm::DirectTwoHops => direct_arm(shared, spec, Some(Hops::ParseAndBegin))?,
-        Arm::SocketAckOnly => return ack_only_arm(shared, spec),
+        Arm::SocketAckOnly => ack_only_arm(shared, spec)?,
     };
-    // Each store arm returns only once its store has passed `verify_cell`.
-    out["verified"] = json!(true);
+    if arm.has_store() {
+        // Each store arm returns only once its store has passed `verify_cell`.
+        out["verified"] = json!(true);
+    }
+    out["stalled"] = json!(is_stalled(&out));
     Ok(out)
+}
+
+/// Whether an arm run's longest wait for an OK passed [`STALL_US`].
+fn is_stalled(run: &Value) -> bool {
+    run["ok_latency"]["max_us"]
+        .as_f64()
+        .is_some_and(|max| max > STALL_US)
 }
 
 /// The median: the middle value, or the mean of the two middle values of an
@@ -599,9 +614,13 @@ mod tests {
                         assert_eq!(run["verified"], true, "{}", arm.name());
                         assert_eq!(run["writer"]["events"], events, "{}", arm.name());
                         assert!(run["writer"]["commits"].as_u64().unwrap() > 0);
+                        assert!(run["checkpoints"]["peak_wal_pages"].as_u64().unwrap() > 0);
+                        assert!(run["checkpoints"]["blocking_ms"].is_number());
                     } else {
                         assert!(run["writer"].is_null());
+                        assert!(run["checkpoints"].is_null());
                     }
+                    assert!(run["stalled"].is_boolean(), "{}", arm.name());
                 }
                 assert_eq!(cell["arms"]["direct_one_hop"]["hops"], "parse");
                 assert_eq!(cell["arms"]["direct_two_hops"]["hops"], "parse_and_begin");

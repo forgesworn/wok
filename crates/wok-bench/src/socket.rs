@@ -47,7 +47,9 @@ use wok_store::{EventStore, Visibility};
 
 use crate::config::{Config, DOOR_INFLIGHT_WRITES, Variant};
 use crate::corpus::{KIND_NOTE, author_keys, notes_key};
-use crate::engine::writes::{Cell, cell_json, drive, engine_cell, verify_cell, writer_json};
+use crate::engine::writes::{
+    Cell, cell_json, checkpoints_json, drive, engine_cell, verify_cell, writer_json,
+};
 use crate::engine::{
     Clock, FRAME_LIMIT, Keepers, PRODUCTION_FRAME_LIMIT, runtime, tag, wall_seconds,
 };
@@ -219,6 +221,7 @@ fn socket_cell(
     server.relay.flush();
     let stats = server.relay.writer_stats();
     let commits = server.store.commits();
+    let checkpoints = checkpoints_json(&server.store);
     // The lanes have closed their connections; the door is shut down and the
     // server task must end before the store is read.
     server.stop().map_err(|e| format!("{label}: {e}"))?;
@@ -229,6 +232,7 @@ fn socket_cell(
     out["variant"] = json!(variant.label());
     out["connections"] = json!(spec.connections);
     out["writer"] = writer_json(stats, commits);
+    out["checkpoints"] = checkpoints;
     Ok(out)
 }
 
