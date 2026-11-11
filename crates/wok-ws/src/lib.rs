@@ -2064,7 +2064,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_event_router_has_no_cadence_control_route() {
+    async fn public_event_router_serves_nothing_but_its_door() {
         let tmp = TempDir::new().expect("temp dir");
         let key = Keys::generate();
         let response = routes(&tmp, &key)
@@ -2072,7 +2072,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .method("POST")
-                    .uri("/cadence/v1/status")
+                    .uri("/admin/v1/status")
                     .body(Body::empty())
                     .unwrap(),
             )
