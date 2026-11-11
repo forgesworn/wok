@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.3 - 2026-11-11
 
 - `wok-store`: when a commit leaves the WAL at `wal_ceiling_pages` and
   another checkpoint holds SQLite's checkpoint lock, the writer now waits for
