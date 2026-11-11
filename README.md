@@ -25,13 +25,27 @@ engine that serves clients from it.
   keeper-authored events of a short list of public kinds; a sheltered door
   serves authenticated keepers and guests.
 
+The `wok-ws` crate, unreleased on `main`, carries those frames over
+WebSockets.
+
+- **Doors.** A `Door` holds one relay's connection and work budgets and hands
+  out unbound axum routers: a public one, which also serves the NIP-11 relay
+  information document, and a sheltered one. Each connection's writes are
+  pipelined to the writer and answered in order, live events follow their
+  own `OK`, and a closing connection answers every frame it has read.
+- **Admission.** The sheltered router is built only with an `Admission`,
+  which decides from the request's extensions (an authenticated peer, a
+  connecting address) whether a connection may open, and holds what it
+  returns for the connection's life. A request it cannot place is refused.
+  NIP-42 is still required on every connection it admits.
+
 Wok is a library. It opens no port and holds no policy of its own: the
 application says who its keepers are (`KeeperAccess`), which guests may read
-and write which kinds in which rooms (`GuestAuthority`), and which events carry
-authority to install rather than content to store (`AuthorityEvents`), and it
-carries the frames over its own transport. Every operation asks again, so a
-withdrawn key or scope stops working at once. The WebSocket server is still
-inside Bothy and moves here in a later release.
+and write which kinds in which rooms (`GuestAuthority`), which events carry
+authority to install rather than content to store (`AuthorityEvents`) and who
+may connect to the sheltered door (`Admission`), and it binds the listeners
+itself. Every operation asks again, so a withdrawn key or scope stops working
+at once.
 
 ## Storage compatibility
 

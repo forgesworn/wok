@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wok-bench", "crates/wok-store"]
+members = ["crates/wok-bench", "crates/wok-store", "crates/wok-ws"]
 
 [workspace.package]
 version = "0.3.0"
@@ -11,7 +11,10 @@ authors = ["TheCryptoDonkey"]
 repository = "https://github.com/forgesworn/wok"
 
 [workspace.dependencies]
+# The same axum as Bothy, whose routers merge with this crate's.
+axum = { version = "0.8.9", features = ["ws"] }
 fs2 = "0.4.3"
+futures-util = "0.3"
 hex = "0.4"
 negentropy = "0.5.2"
 # `os-rng`: the relay draws each NIP-42 challenge from a fresh key.
@@ -23,5 +26,8 @@ serde_json = "1"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1.48", default-features = false }
+# The client half of the door's tests: the version axum's `ws` feature links.
+tokio-tungstenite = "0.29"
+tower = { version = "0.5.2", features = ["util"] }
 tracing = "0.1"
 url = "2.5"
