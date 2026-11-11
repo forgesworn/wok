@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/wok-bench", "crates/wok-store", "crates/wok-ws"]
+members = ["crates/wok-bench", "crates/wok-store", "crates/wok-ws", "crates/wokd"]
 
 [workspace.package]
 version = "0.4.0"

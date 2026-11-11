@@ -1,0 +1,31 @@
+# wokd: a members-only Nostr relay. Every field below is read and checked at start;
+# an unknown field, an empty member list or a malformed key stops it.
+
+# Where to listen. The default is loopback only: put a TLS proxy in front
+# for clients elsewhere. Loopback connections are not capped per address,
+# so behind a local proxy no client is: the 32-connection budget and the
+# AUTH deadline below are what hold strangers back.
+# listen = "127.0.0.1:7447"
+
+# The address clients connect to. Their NIP-42 AUTH must name it, so it is
+# the public wss:// URL when a proxy is in front.
+url = "ws://127.0.0.1:7447/events"
+
+# The event store, and its limits in bytes. Both limits are required.
+data_dir = "/var/lib/wokd"
+max_store_bytes = 1073741824
+min_free_bytes = 268435456
+
+# The group: public keys (npub) only. Every member reads everything the
+# group stores. A change takes a restart.
+members = [
+  # "npub1...",
+]
+
+# Sockets one remote address may hold at once (loopback is not capped; the
+# relay's own budget of 32 connections still holds).
+# sockets_per_address = 8
+
+# Seconds a connection may stay unauthenticated. Stock clients answer at
+# once; raise it only for a remote signer that asks its owner first.
+# auth_deadline_secs = 15

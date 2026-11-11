@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Add `wokd`, a members-only Nostr relay built on `wok-store` and `wok-ws`.
+  `wokd --config <file>` serves one group, whose `npub` keys its operator
+  lists. Every read, write, count and reconciliation needs NIP-42 as a
+  listed key; there is no open mode, no public door and no NIP-11 document
+  yet. It listens on `127.0.0.1:7447` unless configured otherwise, sends
+  nothing anywhere, creates its data directory owner-only on Unix, and on
+  SIGINT or SIGTERM answers what each socket has read and closes it.
+- `wokd remove --config <file> --id <event id>` (or `--author <npub>`) is an
+  operator's removal with the relay stopped, through `wok-store`'s removal.
+  The relay holds a lock on its data directory, so a removal is refused
+  while it runs.
+- `wokd`'s configuration is strict: an unknown field, an empty member list, a
+  hex key or an `nsec` stops it, and no error repeats a value.
+  `crates/wokd/README.md` says what an operator runs and what they may owe.
+  `wokd` is source only: it is not published to crates.io, and no binaries
+  are built.
 - `wok-ws`: a shutdown is taken between frames, so a write a connection has
   read when the shutdown lands is queued and answered before the close. Until
   now the frame being worked on was dropped: not stored and never answered.

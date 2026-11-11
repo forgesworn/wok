@@ -1,0 +1,181 @@
+//! `wokd --config <file>`: run a members-only Nostr relay.
+//! `wokd remove --config <file> ...`: an operator's removal, with the relay
+//! stopped. See the crate documentation for both.
+
+use std::process::ExitCode;
+
+use nostr::event::EventId;
+use nostr::key::PublicKey;
+use nostr::nips::nip19::FromBech32;
+use wokd::{Config, Target};
+
+const USAGE: &str = "usage:
+  wokd --config <file>
+  wokd remove --config <file> --id <event id> [--id <event id> ...]
+  wokd remove --config <file> --author <npub>";
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--help" | "-h") => {
+            println!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        Some("remove") => remove(&args[1..]),
+        _ => serve(&args),
+    }
+}
+
+fn usage() -> ExitCode {
+    eprintln!("{USAGE}");
+    ExitCode::from(2)
+}
+
+fn read_config(path: &str) -> Result<Config, ExitCode> {
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        eprintln!("wokd: could not read {path}: {error}");
+        ExitCode::from(2)
+    })?;
+    Config::from_toml(&text).map_err(|error| {
+        eprintln!("wokd: {path}: {error}");
+        ExitCode::from(2)
+    })
+}
+
+fn serve(args: &[String]) -> ExitCode {
+    let [flag, path] = args else {
+        return usage();
+    };
+    if flag != "--config" {
+        return usage();
+    }
+    let config = match read_config(path) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_target(false)
+        .init();
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("wokd: could not start the runtime: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match runtime.block_on(wokd::run(config, shutdown_signal())) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            tracing::error!("{error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `remove`: exit 0 when everything asked for was removed, 3 when some ids
+/// were not stored, 2 for a usage or configuration mistake, 1 otherwise.
+fn remove(args: &[String]) -> ExitCode {
+    let mut path = None;
+    let mut ids = Vec::new();
+    let mut author = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--config" => path = args.next().cloned(),
+            "--id" => match args
+                .next()
+                .filter(|value| value.len() == 64)
+                .and_then(|value| EventId::from_hex(value).ok())
+            {
+                Some(id) => ids.push(id),
+                None => {
+                    eprintln!("wokd remove: --id takes an event id, 64 hex characters");
+                    return ExitCode::from(2);
+                }
+            },
+            "--author" => match args.next() {
+                Some(value) if value.starts_with("nsec1") => {
+                    eprintln!(
+                        "wokd remove: --author takes a public key (npub), not a secret key; \
+                         treat that secret key as exposed"
+                    );
+                    return ExitCode::from(2);
+                }
+                Some(value) => match PublicKey::from_bech32(value) {
+                    Ok(key) => author = Some(key),
+                    Err(_) => {
+                        eprintln!("wokd remove: --author takes an npub public key");
+                        return ExitCode::from(2);
+                    }
+                },
+                None => return usage(),
+            },
+            _ => return usage(),
+        }
+    }
+    let target = match (ids.is_empty(), author) {
+        (false, None) => Target::Ids(ids),
+        (true, Some(author)) => Target::Author(author),
+        _ => return usage(),
+    };
+    let Some(path) = path else {
+        return usage();
+    };
+    let config = match read_config(&path) {
+        Ok(config) => config,
+        Err(code) => return code,
+    };
+    match wokd::remove(&config, &target) {
+        Ok(done) => {
+            println!("removed {} event(s)", done.removed.len());
+            for id in &done.removed {
+                println!("  {}", id.to_hex());
+            }
+            if !done.removed.is_empty() && !done.erased {
+                println!(
+                    "the write-ahead log could not be truncated: the removed bytes leave it \
+                     when the relay next truncates it"
+                );
+            }
+            if done.not_found.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                println!("not stored, so nothing removed or barred:");
+                for id in &done.not_found {
+                    println!("  {}", id.to_hex());
+                }
+                ExitCode::from(3)
+            }
+        }
+        Err(error) => {
+            eprintln!("wokd remove: {error}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// SIGINT, or SIGTERM where there is one.
+async fn shutdown_signal() {
+    let interrupt = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = interrupt => {},
+        _ = terminate => {},
+    }
+}
