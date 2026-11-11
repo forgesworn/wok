@@ -332,7 +332,10 @@ pub async fn serve(
     .map_err(|error| RunError::Store(error.to_string()))?
     .map_err(|error| RunError::Store(error.to_string()))?;
     let members = config.members.len();
-    let relay = EventRelay::new(Arc::new(store), Arc::new(Members::new(config.members)));
+    // A non-member's refused AUTH is final: a stock client would otherwise
+    // be sent a fresh challenge and sign it, over and over.
+    let relay = EventRelay::new(Arc::new(store), Arc::new(Members::new(config.members)))
+        .with_final_access_refusal();
     let defaults = Timings::default();
     let door = Door::with_timings(
         Arc::new(relay),
