@@ -2171,7 +2171,7 @@ checksum = "1ebf944e87a7c253233ad6766e082e3cd714b5d03812acc24c318f549614536e"
 
 [[package]]
 name = "wok-bench"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -2188,7 +2188,7 @@ dependencies = [
 
 [[package]]
 name = "wok-store"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "fs2",
  "hex",
@@ -2206,7 +2206,7 @@ dependencies = [
 
 [[package]]
 name = "wok-ws"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "futures-util",
@@ -2225,7 +2225,7 @@ dependencies = [
 
 [[package]]
 name = "wokd"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "axum",
  "fs2",
