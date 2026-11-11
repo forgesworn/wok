@@ -15,8 +15,13 @@ Whoever runs one operates it, and is responsible for it.
 - It listens on loopback (`127.0.0.1:7447`) unless you say otherwise. Anyone
   who can reach the address can open a connection and receive the AUTH
   challenge; only members can authenticate.
-- There is no open mode and no public door. There is no relay information
-  document (NIP-11) yet.
+- There is no open mode and no public door.
+- It answers a NIP-11 request for its relay information document with the
+  same static document for everyone: the NIPs it supports, its limits, and
+  that every read and write needs NIP-42. The document names no member, no
+  operator and no address. It tells a client no more than the AUTH challenge
+  any connection is sent, and it lets a browser page read that without
+  opening a socket. `relay_information = false` turns it off.
 - It sends nothing anywhere: no telemetry, no update check, no contact with
   ForgeSworn.
 

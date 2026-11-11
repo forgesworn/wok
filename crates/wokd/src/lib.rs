@@ -46,6 +46,14 @@ pub const SOCKETS_PER_ADDRESS: usize = 8;
 /// is for a remote signer that asks its owner first.
 pub const AUTH_DEADLINE_SECS: u64 = 15;
 
+/// Whether the relay serves a NIP-11 relay information document, unless the
+/// configuration says otherwise. The document is static and the same for
+/// everyone: the NIPs it supports, its limits, and that every read and write
+/// needs NIP-42. It names no member, operator or address. Anyone who can
+/// reach the relay can already open a socket and be sent the AUTH challenge,
+/// which says as much; the document lets a client know before it connects.
+pub const RELAY_INFORMATION: bool = true;
+
 /// How often expired events are swept (NIP-40).
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -136,6 +144,7 @@ struct File {
     members: Vec<String>,
     sockets_per_address: Option<usize>,
     auth_deadline_secs: Option<u64>,
+    relay_information: Option<bool>,
 }
 
 /// A checked configuration.
@@ -157,6 +166,8 @@ pub struct Config {
     pub sockets_per_address: usize,
     /// See [`AUTH_DEADLINE_SECS`].
     pub auth_deadline: Duration,
+    /// See [`RELAY_INFORMATION`].
+    pub relay_information: bool,
 }
 
 /// Why a configuration was refused. No message repeats a value from the
@@ -263,6 +274,7 @@ impl Config {
             members,
             sockets_per_address,
             auth_deadline: Duration::from_secs(auth_deadline_secs),
+            relay_information: file.relay_information.unwrap_or(RELAY_INFORMATION),
         })
     }
 }
@@ -346,7 +358,12 @@ pub async fn serve(
         ),
     );
     let admission = Arc::new(PerAddress::new(config.sockets_per_address));
-    let app = door.sheltered_router(config.url, Arc::clone(&admission) as Arc<dyn Admission>);
+    let admitting = Arc::clone(&admission) as Arc<dyn Admission>;
+    let app = if config.relay_information {
+        door.sheltered_router_with_information(config.url, admitting)
+    } else {
+        door.sheltered_router(config.url, admitting)
+    };
     let sweeper = door.clone();
     let expiry = tokio::spawn(async move {
         let mut tick = tokio::time::interval(EXPIRY_INTERVAL);
@@ -553,6 +570,24 @@ mod tests {
             Duration::from_secs(AUTH_DEADLINE_SECS)
         );
         assert_eq!(config.members, vec![alice.public_key()]);
+        assert_eq!(config.relay_information, RELAY_INFORMATION);
+    }
+
+    #[test]
+    fn the_relay_information_document_can_be_turned_off() {
+        let alice = Keys::generate();
+        let members = format!("\"{}\"", npub(&alice));
+        for (line, expected) in [
+            ("relay_information = false", false),
+            ("relay_information = true", true),
+        ] {
+            let config = Config::from_toml(&file(&members, line)).unwrap();
+            assert_eq!(config.relay_information, expected, "{line}");
+        }
+        let error =
+            Config::from_toml(&file(&members, "relay_information = \"nsec1x\"")).unwrap_err();
+        assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
+        assert!(!error.to_string().contains("nsec1x"), "{error}");
     }
 
     #[test]
