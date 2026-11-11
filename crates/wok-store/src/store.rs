@@ -123,17 +123,16 @@ impl Checkpoint for SqliteCheckpoint {
 /// The server cache sizes come from the 2026-10-30 cache spike (three rounds,
 /// system allocator), which compared writer/reader caches of 2 MiB/1 MiB (the
 /// slice-4 defaults) with 512 KiB/256 KiB: household live footprint 10.7 to
-/// 8.9 MB, room catch-up 16.4 to 11.5 MB, with page p99 and throughput still
-/// ahead of strfry. Turning lookaside off as well saved only 0.3 MB more and
-/// cost about 3 percent of pages and some p99, so it stays on. The writer
-/// then went back up to 1 MiB: with 512 KiB the final rounds put the
-/// household-live publisher's OK p99 at 115 ms against strfry's 98 ms, and
-/// the spike's 1 MiB writer arms ran at 97 to 98 ms for about 0.4 MB more
-/// footprint (household live 1.55x and room catch-up 1.43x strfry's).
+/// 8.9 MB, room catch-up 16.4 to 11.5 MB. Turning lookaside off as well
+/// saved only 0.3 MB more and cost about 3 percent of pages and some p99, so
+/// it stays on. The writer then went back up to 1 MiB: with 512 KiB the
+/// final rounds put the household-live publisher's OK p99 at 115 ms, and the
+/// spike's 1 MiB writer arms ran at 97 to 98 ms for about 0.4 MB more
+/// footprint.
 #[derive(Clone, Debug)]
 pub struct StoreOptions {
     /// Page cache of the writer connection, in KiB (heap). Server default
-    /// 1 MiB (512 KiB lost the publisher's OK p99 to strfry; see above);
+    /// 1 MiB (512 KiB cost the publisher's OK p99 about 17 ms; see above);
     /// phone 1 MiB. A larger cache did not speed up a burst on its own
     /// (first touches miss at any size) and costs heap.
     pub writer_cache_kib: u32,
