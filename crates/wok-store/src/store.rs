@@ -7474,25 +7474,31 @@ PRAGMA user_version=2;")).unwrap();
                 watched.peak_pages.load(AtomicOrdering::Relaxed) >= 12
             });
             std::thread::sleep(Duration::from_millis(50));
+            let held_to = watched.peak_pages.load(AtomicOrdering::Relaxed);
             drop(pin);
+            held_to
         });
         write_notes(&db, &key, 10, 60, 1);
-        release.join().unwrap();
+        let held_to = release.join().unwrap();
         let shared = &db.maintenance.shared;
         assert!(
             shared.blocking_runs.load(AtomicOrdering::Relaxed) >= 1,
             "the writer fell back to a blocking checkpoint"
         );
-        // Unbounded, sixty commits of about six pages would be 360 pages.
-        // Until the release thread runs, a blocking checkpoint refused at once
-        // (the checkpoint thread holds the lock) lets the next commit through,
-        // so how far past the ceiling the log gets depends on scheduling: four
-        // commits (36 pages) on a two-core CI runner. A third of unbounded
-        // still says the ceiling held.
+        // While the reader holds its snapshot, how far past the ceiling the
+        // log gets depends on scheduling, not on the store: a blocking
+        // checkpoint refused at once (the checkpoint thread holds the lock)
+        // lets the next commit through, and a slow runner reaches the release
+        // late. A two-core runner usually stops at four commits (36 pages);
+        // a Windows runner once reached 144. So the bound is taken from where
+        // the log stood when the reader let go: from there it is cleared
+        // within a few commits of about six pages, where unbounded, sixty
+        // commits would run on towards 360 pages.
+        let peak = shared.peak_pages.load(AtomicOrdering::Relaxed);
         assert!(
-            shared.peak_pages.load(AtomicOrdering::Relaxed) < 120,
-            "the WAL reached {} pages against a ceiling of 12",
-            shared.peak_pages.load(AtomicOrdering::Relaxed)
+            peak <= held_to + 24,
+            "the WAL reached {peak} pages after the reader let go at {held_to}, \
+             against a ceiling of 12"
         );
         assert_eq!(count_events(&path), 62);
     }
