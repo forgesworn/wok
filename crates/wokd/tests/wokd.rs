@@ -3,6 +3,8 @@
 //! sockets.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
@@ -43,6 +45,11 @@ impl Running {
 async fn start(dir: &Path, members: &[&Keys]) -> Running {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+    start_at(dir, members, listener, url).await
+}
+
+/// [`start`] on `listener`, with `url` as the address clients name.
+async fn start_at(dir: &Path, members: &[&Keys], listener: TcpListener, url: String) -> Running {
     let members = members
         .iter()
         .map(|keys| format!("\"{}\"", keys.public_key().to_bech32().unwrap()))
@@ -64,6 +71,56 @@ async fn start(dir: &Path, members: &[&Keys]) -> Running {
         stop,
         task,
     }
+}
+
+/// A WebSocket proxy in front of `upstream`, counting the AUTH frames its
+/// clients send: its address, and the count.
+async fn counting_proxy(upstream: String) -> (String, Arc<AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+    let auths = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&auths);
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = listener.accept().await {
+            let upstream = upstream.clone();
+            let counted = Arc::clone(&counted);
+            tokio::spawn(async move {
+                let Ok(client) = tokio_tungstenite::accept_async(tcp).await else {
+                    return;
+                };
+                let Ok((relay, _)) = tokio_tungstenite::connect_async(upstream.as_str()).await
+                else {
+                    return;
+                };
+                let (mut to_client, mut from_client) = client.split();
+                let (mut to_relay, mut from_relay) = relay.split();
+                let up = async {
+                    while let Some(Ok(message)) = from_client.next().await {
+                        if let Message::Text(text) = &message
+                            && text.as_str().starts_with("[\"AUTH\"")
+                        {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                        }
+                        if to_relay.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                let down = async {
+                    while let Some(Ok(message)) = from_relay.next().await {
+                        if to_client.send(message).await.is_err() {
+                            break;
+                        }
+                    }
+                };
+                tokio::select! {
+                    () = up => {}
+                    () = down => {}
+                }
+            });
+        }
+    });
+    (url, auths)
 }
 
 fn note(keys: &Keys, text: &str) -> Event {
@@ -207,6 +264,52 @@ async fn a_member_publishes_and_reads_back_with_a_stock_client() {
 }
 
 #[tokio::test]
+async fn a_stock_client_with_a_refused_key_signs_once_and_its_publish_fails() {
+    let tmp = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+    let (url, auths) = counting_proxy(upstream).await;
+    let server = start_at(tmp.path(), &[&alice], listener, url.clone()).await;
+    let client = nostr_sdk::client::Client::builder()
+        .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+            bob.clone(),
+        ))
+        .build();
+    client.add_relay(url.as_str()).await.unwrap();
+    client.connect().await;
+    // The relay challenges on connect and the client answers it unasked.
+    timeout(Duration::from_secs(5), async {
+        while auths.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the client answers the first challenge");
+
+    let event = note(&bob, "let me in");
+    let output = timeout(Duration::from_secs(5), client.send_event(&event))
+        .await
+        .expect("a refused key's publish ends within five seconds");
+    eprintln!("refused key's publish: {output:?}");
+    let failure = match output {
+        Ok(output) => {
+            assert!(output.success.is_empty(), "nothing was stored");
+            output.failed.into_values().collect::<Vec<_>>().join("; ")
+        }
+        Err(error) => error.to_string(),
+    };
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let signed = auths.load(Ordering::SeqCst);
+    eprintln!("AUTH frames the client sent: {signed}");
+    assert!(failure.contains("restricted:"), "{failure}");
+    assert_eq!(signed, 1, "a refused key is not prompted to sign again");
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn before_auth_a_read_is_refused_with_the_nip42_prefix() {
     let tmp = TempDir::new().unwrap();
     let alice = Keys::generate();
@@ -242,21 +345,25 @@ async fn an_authenticated_non_member_gets_nothing_on_the_wire() {
     );
 
     // What a stock client sees next: each EVENT after the refused AUTH is
-    // refused, after a fresh challenge that invites it to try again.
+    // refused as restricted, with no fresh challenge to sign.
     for round in 0..3 {
         send(&mut bob_socket, json!(["EVENT", note(&bob, "let me in")])).await;
         let (reply, challenges) = reply_past_challenges(&mut bob_socket).await;
         eprintln!("non-member EVENT, round {round}: {challenges} new challenge(s), then {reply}");
+        assert_eq!(challenges, 0, "no challenge invites the key to try again");
         assert_eq!(reply[0], "OK");
         assert_eq!(reply[2], false);
+        assert_eq!(reply[3], "restricted: this key has no sheltered access");
     }
     send(&mut bob_socket, json!(["REQ", "q", {"kinds": [1]}])).await;
     let (read, challenges) = reply_past_challenges(&mut bob_socket).await;
     eprintln!("non-member REQ: {challenges} new challenge(s), then {read}");
+    assert_eq!(challenges, 0);
     assert_eq!(
         read[0], "CLOSED",
         "a non-member's REQ is closed, not answered"
     );
+    assert_eq!(read[2], "restricted: this key has no sheltered access");
     send(&mut bob_socket, json!(["COUNT", "c", {"kinds": [1]}])).await;
     let (counted, challenges) = reply_past_challenges(&mut bob_socket).await;
     eprintln!("non-member COUNT: {challenges} new challenge(s), then {counted}");
@@ -280,6 +387,24 @@ async fn an_authenticated_non_member_gets_nothing_on_the_wire() {
     );
     drop(bob_socket);
     drop(alice_socket);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn after_a_refused_key_a_member_authenticates_on_the_same_socket() {
+    let tmp = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let bob = Keys::generate();
+    let server = start(tmp.path(), &[&alice]).await;
+    let (mut socket, challenge) = connect(&server.url).await;
+    let refused = auth(&mut socket, &server.url, &challenge, &bob).await;
+    assert_eq!(refused[2], false, "{refused}");
+    // The refusal sent no new challenge: the first one is still current.
+    let accepted = auth(&mut socket, &server.url, &challenge, &alice).await;
+    assert_eq!(accepted[2], true, "{accepted}");
+    let stored = note(&alice, "after all");
+    assert_eq!(publish(&mut socket, &stored).await[2], true);
+    drop(socket);
     server.stop().await;
 }
 

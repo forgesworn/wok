@@ -9,7 +9,9 @@ Whoever runs one operates it, and is responsible for it.
 
 - Every read, write, count and reconciliation needs NIP-42 authentication as
   a listed key. A key that is not listed is refused when it authenticates,
-  and gets nothing.
+  and gets nothing. It is not challenged again, so a client does not keep
+  signing: everything else it sends on that connection is refused as
+  `restricted:`, and a listed key can still authenticate there.
 - It listens on loopback (`127.0.0.1:7447`) unless you say otherwise. Anyone
   who can reach the address can open a connection and receive the AUTH
   challenge; only members can authenticate.

@@ -161,6 +161,7 @@ pub struct InstallRequest<'a> {
     pub signature: SignatureCheck,
     pub now: u64,
     authenticated: &'a BTreeSet<PublicKey>,
+    access_refused: bool,
     access: &'a dyn KeeperAccess,
 }
 
@@ -187,7 +188,7 @@ impl InstallRequest<'_> {
 
     /// The door's refusal for a session without the authority to act.
     pub fn refusal(&self) -> &'static str {
-        refusal_for(self.authenticated)
+        refusal_for(self.authenticated, self.access_refused)
     }
 }
 
@@ -272,6 +273,8 @@ pub struct EventRelay {
     writer: Arc<EventWriter>,
     /// Frames a session may send in a rolling minute.
     frame_limit: u32,
+    /// See [`Self::with_final_access_refusal`].
+    final_access_refusal: bool,
     /// The wall clock a queued write is judged by when the writer reaches it.
     clock: Clock,
 }
@@ -340,6 +343,7 @@ impl EventRelay {
             live,
             writer,
             frame_limit: MAX_FRAMES_PER_MINUTE,
+            final_access_refusal: false,
             clock: Arc::new(wall_clock),
         }
     }
@@ -363,6 +367,22 @@ impl EventRelay {
     /// client that pipelines bursts of events needs more; so do the benches.
     pub fn with_frame_limit(mut self, frames_per_minute: u32) -> Self {
         self.frame_limit = frames_per_minute;
+        self
+    }
+
+    /// Make an AUTH refused only because its key has no access final for
+    /// that key: its signature, challenge, relay and time were good, but the
+    /// key is neither a keeper nor a guest with scopes. The refusal sends no
+    /// replacement challenge, and until an AUTH succeeds every frame that
+    /// needs authority is answered `restricted:` rather than
+    /// `auth-required:`. A stock NIP-42 client signs every challenge it is
+    /// sent, so without this a refused key is prompted again and signs
+    /// again, as fast as the frame allowance lets it. The challenge it
+    /// answered stays the one to answer, so a key with access can still
+    /// authenticate on the same connection. An AUTH refused for anything
+    /// else is unchanged. Off by default.
+    pub fn with_final_access_refusal(mut self) -> Self {
+        self.final_access_refusal = true;
         self
     }
 
@@ -457,6 +477,7 @@ impl EventRelay {
             challenge: fresh_challenge(None),
             authenticated: BTreeSet::new(),
             authenticated_as_keeper: false,
+            access_refused: false,
             guest_snapshot: None,
             live_cache: None,
             authority: self.authority_changes(),
@@ -969,6 +990,9 @@ pub struct RelaySession {
     challenge: String,
     authenticated: BTreeSet<PublicKey>,
     authenticated_as_keeper: bool,
+    /// An AUTH was refused for its key's access, under
+    /// [`EventRelay::with_final_access_refusal`].
+    access_refused: bool,
     guest_snapshot: Option<Vec<GuestScope>>,
     /// Verdict for live delivery; see [`LiveAccessCache`].
     live_cache: Option<LiveAccessCache>,
@@ -1471,7 +1495,7 @@ impl RelaySession {
         Ok(Some(scopes).filter(|scopes| !scopes.is_empty()))
     }
     fn refusal(&self) -> &'static str {
-        refusal_for(&self.authenticated)
+        refusal_for(&self.authenticated, self.access_refused)
     }
     /// Used by the socket adapter before sending a private batch. Revocation
     /// invalidates existing subscriptions as well as new requests.
@@ -1750,8 +1774,16 @@ impl RelaySession {
             })
             .flatten();
         if !keeper && guest_scopes.is_none() {
-            return self.auth_failure(id, "restricted: this key has no sheltered access");
+            if self.relay.final_access_refusal && self.authenticated.is_empty() {
+                // Nothing prompts a stock client to sign again, and the
+                // challenge it answered is still the one to answer.
+                self.challenge = consumed_challenge;
+                self.access_refused = true;
+                return vec![ok(id, false, NO_ACCESS)];
+            }
+            return self.auth_failure(id, NO_ACCESS);
         }
+        self.access_refused = false;
         self.authenticated.insert(event.pubkey);
         self.authenticated_as_keeper = keeper;
         self.guest_snapshot = guest_scopes;
@@ -1872,6 +1904,7 @@ impl RelaySession {
                 signature,
                 now,
                 authenticated: &self.authenticated,
+                access_refused: self.access_refused,
                 access: self.relay.access.as_ref(),
             };
             if let Some(answer) = events.install(&request) {
@@ -2412,11 +2445,16 @@ impl LiveAccessCache {
 
 /// The refusal for a session without sheltered authority: one that has not
 /// authenticated is told to, one that has is told it no longer counts.
-fn refusal_for(authenticated: &BTreeSet<PublicKey>) -> &'static str {
-    if authenticated.is_empty() {
-        "auth-required: authenticate for sheltered access"
-    } else {
+/// The AUTH refusal for a key that is neither a keeper nor a guest.
+const NO_ACCESS: &str = "restricted: this key has no sheltered access";
+
+fn refusal_for(authenticated: &BTreeSet<PublicKey>, access_refused: bool) -> &'static str {
+    if !authenticated.is_empty() {
         "restricted: this identity no longer has sheltered access"
+    } else if access_refused {
+        NO_ACCESS
+    } else {
+        "auth-required: authenticate for sheltered access"
     }
 }
 
@@ -2656,6 +2694,91 @@ mod tests {
         let mut client = Negentropy::owned(storage, MAX_NEGENTROPY_MESSAGE_BYTES as u64).unwrap();
         let initial = hex::encode(client.initiate().unwrap());
         (client, initial)
+    }
+
+    #[test]
+    fn by_default_a_key_refused_for_access_is_challenged_again() {
+        let (_tmp, relay, _access, _key) = setup();
+        let mut a = session(&relay, Visibility::Sheltered);
+        let stranger = Keys::generate();
+        let signed = auth_event(&a, &stranger);
+        let replies = send(&mut a, json!(["AUTH", signed]));
+        assert_eq!(replies[0][2], false);
+        assert_eq!(
+            replies[0][3],
+            "restricted: this key has no sheltered access"
+        );
+        assert_eq!(replies[1], json!(["AUTH", a.challenge]));
+        let later = event(&stranger, 1, NOW, "", &[]);
+        assert_eq!(
+            send(&mut a, json!(["EVENT", later]))[0][3],
+            "auth-required: authenticate for sheltered access"
+        );
+    }
+
+    #[test]
+    fn a_final_access_refusal_prompts_no_retry_and_answers_restricted() {
+        let tmp = TempDir::new().unwrap();
+        let keeper = Keys::generate();
+        let access = Arc::new(Access(RwLock::new([keeper.public_key()].into())));
+        let store = Arc::new(
+            SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap(),
+        );
+        let relay = Arc::new(EventRelay::new(store, access).with_final_access_refusal());
+        let stranger = Keys::generate();
+        const NO_ACCESS: &str = "restricted: this key has no sheltered access";
+
+        let mut a = session(&relay, Visibility::Sheltered);
+        let answered = a.challenge.clone();
+        let signed = auth_event(&a, &stranger);
+        let replies = send(&mut a, json!(["AUTH", signed]));
+        assert_eq!(replies.len(), 1, "no replacement challenge: {replies:?}");
+        assert_eq!(replies[0][2], false);
+        assert_eq!(replies[0][3], NO_ACCESS);
+        assert_eq!(
+            a.challenge, answered,
+            "the answered challenge stays current"
+        );
+        let later = event(&stranger, 1, NOW, "", &[]);
+        assert_eq!(
+            send(&mut a, json!(["EVENT", later])),
+            vec![json!(["OK", later.id.to_hex(), false, NO_ACCESS])]
+        );
+        assert_eq!(
+            send(&mut a, json!(["REQ", "q", {"kinds": [1]}])),
+            vec![json!(["CLOSED", "q", NO_ACCESS])]
+        );
+        assert_eq!(
+            send(&mut a, json!(["COUNT", "c", {"kinds": [1]}])),
+            vec![json!(["CLOSED", "c", NO_ACCESS])]
+        );
+        // Signing the same challenge again is refused the same way.
+        let signed = auth_event(&a, &stranger);
+        let again = send(&mut a, json!(["AUTH", signed]));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again[0][3], NO_ACCESS);
+
+        // A keeper still authenticates on the same connection, answering
+        // the challenge the stranger answered, and is served.
+        auth(&mut a, &keeper);
+        assert_eq!(
+            send(&mut a, json!(["REQ", "q", {"kinds": [1]}])),
+            vec![json!(["EOSE", "q"])]
+        );
+
+        // Any other refusal still comes with a fresh challenge.
+        let mut b = session(&relay, Visibility::Sheltered);
+        let mut tampered = auth_event(&b, &stranger);
+        tampered.content = "tampered".into();
+        let replies = send(&mut b, json!(["AUTH", tampered]));
+        assert_eq!(replies.len(), 2);
+        assert!(replies[0][3].as_str().unwrap().starts_with("invalid:"));
+        assert_eq!(replies[1], json!(["AUTH", b.challenge]));
+        let later = event(&stranger, 1, NOW, "", &[]);
+        assert_eq!(
+            send(&mut b, json!(["EVENT", later]))[0][3],
+            "auth-required: authenticate for sheltered access"
+        );
     }
 
     #[test]

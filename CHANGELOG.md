@@ -16,6 +16,19 @@
   `127.0.0.1` on an ephemeral port for it, and its guest authorities (one in
   memory, one a model over a small SQLite file) live in `wok-bench` only and
   are not for applications.
+- `wok-store`: `EventRelay::with_final_access_refusal` makes an AUTH refused
+  because its key has no access final for that key. The refusal sends no
+  replacement challenge, and until an AUTH succeeds every frame that needs
+  authority is answered `restricted: this key has no sheltered access`
+  instead of `auth-required:`. A stock NIP-42 client signs every challenge it
+  is sent, so a refused key otherwise signs again as fast as the frame
+  allowance lets it: nostr-sdk 0.45 sent 119 AUTH frames in two seconds. The
+  challenge it answered stays current, so a key with access can still
+  authenticate on the connection. An AUTH refused for anything else still
+  gets a fresh challenge. Off by default, so the default replies are
+  unchanged.
+- `wokd` turns it on. A non-member's client signs once, and its publish
+  fails at once with `restricted:` instead of `authentication failed`.
 
 ## 0.5.0 - 2026-11-11
 
