@@ -7,6 +7,16 @@
   now the frame being worked on was dropped: not stored and never answered.
   A turn still running a second after the shutdown (waiting on a work permit,
   say, or a slow peer) is interrupted as before, so a shutdown stays bounded.
+- `wok-store`: an operator's removal. `SqliteEventStore::remove` takes events
+  out of a partition by id, whoever signed them, and `remove_author` every
+  event one key signed, in transactions of at most `MAX_EXPIRE_EVENTS`. Each
+  removed event is barred from being stored again; a replaceable head that
+  points at it goes too, so its coordinate text is not left behind; deletion
+  events are removable like any other; and the write-ahead log is truncated
+  afterwards (`Removal::erased` says whether it was). It is for acting on a
+  report with nothing else serving the store, and `StoreOptions::offline`
+  opens one with no background checkpoint or warm-up. NIP-09 deletion is
+  unchanged.
 - `wok-bench` gains a `socket` scenario: acknowledged writes through
   `wok-ws`'s two doors over real WebSocket connections, beside the same
   events driven straight at the session engine in the same run. Each cell
