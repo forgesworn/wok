@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- `wok-bench` gains a `socket` scenario: acknowledged writes through
+  `wok-ws`'s two doors over real WebSocket connections, beside the same
+  events driven straight at the session engine in the same run. Each cell
+  starts its own store, relay, door and server runtime; clients authenticate
+  with NIP-42 and every event is signed and verified. Server worker and
+  blocking threads, the doors' work permits and `TCP_NODELAY` can be varied
+  per run, and each door's refusals are checked before anything is measured.
+- The libraries are unchanged and still open no port. The unpublished bench
+  binary binds `127.0.0.1` on an ephemeral port for this scenario, refuses
+  any other address, and a default `all` run now does so. Its sheltered door
+  uses an admit-everything `Admission` that lives in `wok-bench` only and is
+  not for applications.
+
 ## 0.4.0 - 2026-11-11
 
 - Add `wok-ws`, the relay's WebSocket doors, moved from Bothy's node

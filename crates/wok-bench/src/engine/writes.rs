@@ -46,8 +46,8 @@ use wok_store::{
 };
 
 use super::{
-    FRAME_LIMIT, Keepers, PRODUCTION_FRAME_LIMIT, STALL, authenticate, describe, event_text,
-    relay_over, relay_url, runtime,
+    Clock, FRAME_LIMIT, Keepers, PRODUCTION_FRAME_LIMIT, STALL, authenticate_at, describe,
+    event_text, relay_on, relay_url, runtime,
 };
 use crate::config::Config;
 use crate::corpus::{Corpus, NOW};
@@ -138,17 +138,17 @@ fn doors<'a>(cfg: &Config, corpus: &'a Corpus, keepers: &Keepers) -> Result<Vec<
 
 /// What a session did, kept per lane and merged after the run.
 #[derive(Default)]
-struct Lane {
+pub(crate) struct Lane {
     /// Frame start to acknowledgement, in nanoseconds.
-    latencies: Vec<u64>,
-    parse_ns: u64,
-    begin_ns: u64,
+    pub(crate) latencies: Vec<u64>,
+    pub(crate) parse_ns: u64,
+    pub(crate) begin_ns: u64,
     /// End of `begin_prepared` (or the reservation, for the baseline) to the
     /// acknowledgement.
-    queue_ns: u64,
+    pub(crate) queue_ns: u64,
     /// Time inside `reserve` (or `reserve_until`) alone.
-    reserve_ns: u64,
-    finished: Option<Instant>,
+    pub(crate) reserve_ns: u64,
+    pub(crate) finished: Option<Instant>,
 }
 
 impl Lane {
@@ -262,12 +262,15 @@ fn expect_put(label: &str, index: usize, result: &PutResult) -> Result<(), Strin
     }
 }
 
-/// One session's frames through the engine.
+/// One session's frames through the engine. `clock` gives the `now` of every
+/// frame: fixed for the engine scenario, the wall clock where the figures are
+/// read beside a door's, which stamps frames with wall time.
 async fn engine_lane(
     label: String,
     mut session: wok_store::relay::RelaySession,
     frames: Vec<String>,
     window: usize,
+    clock: Clock,
     start: Arc<Barrier>,
 ) -> Result<Lane, String> {
     let mut lane = Lane {
@@ -280,12 +283,12 @@ async fn engine_lane(
         let started = Instant::now();
         let prepared = PreparedFrame::parse(text);
         let parsed = Instant::now();
-        if !session.admit_frame(NOW) {
+        if !session.admit_frame(clock.now()) {
             return Err(format!(
                 "{label}: frame {index}: the frame allowance refused it"
             ));
         }
-        let handled = session.begin_prepared(prepared, NOW);
+        let handled = session.begin_prepared(prepared, clock.now());
         let begun = Instant::now();
         lane.parse_ns += (parsed - started).as_nanos() as u64;
         lane.begin_ns += (begun - parsed).as_nanos() as u64;
@@ -406,18 +409,18 @@ fn finish_baseline(
 }
 
 /// The lanes merged.
-struct Merged {
-    latencies: Vec<u64>,
-    parse_ns: u64,
-    begin_ns: u64,
-    queue_ns: u64,
-    reserve_ns: u64,
-    lanes_with_events: usize,
-    wall: Duration,
+pub(crate) struct Merged {
+    pub(crate) latencies: Vec<u64>,
+    pub(crate) parse_ns: u64,
+    pub(crate) begin_ns: u64,
+    pub(crate) queue_ns: u64,
+    pub(crate) reserve_ns: u64,
+    pub(crate) lanes_with_events: usize,
+    pub(crate) wall: Duration,
 }
 
 /// Release the lanes together, wait for them all and merge what they did.
-fn drive(
+pub(crate) fn drive(
     runtime: &Runtime,
     tasks: Vec<JoinHandle<Result<Lane, String>>>,
     start: &Arc<Barrier>,
@@ -460,14 +463,14 @@ fn mean_us(total_ns: u64, events: usize) -> f64 {
     us((total_ns as u128 / events.max(1) as u128) as u64)
 }
 
-fn mean(events: u64, batches: u64) -> f64 {
+pub(crate) fn mean(events: u64, batches: u64) -> f64 {
     if batches == 0 {
         return 0.0;
     }
     (events as f64 / batches as f64 * 100.0).round() / 100.0
 }
 
-fn writer_json(stats: WriterStats, commits: u64) -> Value {
+pub(crate) fn writer_json(stats: WriterStats, commits: u64) -> Value {
     json!({
         "batches": stats.batches,
         "events": stats.events,
@@ -477,10 +480,18 @@ fn writer_json(stats: WriterStats, commits: u64) -> Value {
     })
 }
 
-/// The store holds exactly the door's subset and nothing in the other
-/// partition, and the writer stored exactly that many.
-fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Result<(), String> {
-    let sent = door.events.len();
+/// The store holds exactly the events sent to `visibility` and nothing in the
+/// other partition, and the writer stored exactly that many. `now` is the time
+/// the store's expiry checks are made at.
+pub(crate) fn verify_cell(
+    store: &SqliteEventStore,
+    visibility: Visibility,
+    events: &[&Event],
+    stats: WriterStats,
+    now: u64,
+) -> Result<(), String> {
+    let name = partition_name(visibility);
+    let sent = events.len();
     if stats.events != sent as u64 {
         return Err(format!(
             "the writer stored {} events for a subset of {sent}",
@@ -490,12 +501,11 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
     // The count is capped at the exact-count bound plus one.
     let expected = sent.min(MAX_EXACT_COUNT as usize + 1) as u64;
     let counted = store
-        .count(door.visibility, &[Filter::new()], NOW)
-        .map_err(|e| format!("count the {} partition: {e}", door.name()))?;
+        .count(visibility, &[Filter::new()], now)
+        .map_err(|e| format!("count the {name} partition: {e}"))?;
     if counted != expected {
         return Err(format!(
-            "the {} partition holds {counted} events, expected {expected}",
-            door.name()
+            "the {name} partition holds {counted} events, expected {expected}"
         ));
     }
     // The partition-wide count stops at the exact-count bound, so the subset
@@ -503,7 +513,7 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
     // the corpus allows. With the writer's own event count above, this fixes
     // the stored total.
     let mut groups: BTreeMap<(nostr::key::PublicKey, u16), u64> = BTreeMap::new();
-    for event in &door.events {
+    for event in events {
         *groups
             .entry((event.pubkey, event.kind.as_u16()))
             .or_default() += 1;
@@ -511,22 +521,21 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
     for ((author, kind), sent_in_group) in groups {
         let filter = Filter::new().author(author).kind(Kind::from(kind));
         let counted = store
-            .count(door.visibility, &[filter], NOW)
+            .count(visibility, &[filter], now)
             .map_err(|e| format!("count kind {kind} of one author: {e}"))?;
         let expected = sent_in_group.min(MAX_EXACT_COUNT + 1);
         if counted != expected {
             return Err(format!(
-                "the {} partition holds {counted} kind {kind} events of one author, expected {expected}",
-                door.name()
+                "the {name} partition holds {counted} kind {kind} events of one author, expected {expected}"
             ));
         }
     }
-    let other = match door.visibility {
+    let other = match visibility {
         Visibility::Public => Visibility::Sheltered,
         Visibility::Sheltered => Visibility::Public,
     };
     let strays = store
-        .count(other, &[Filter::new()], NOW)
+        .count(other, &[Filter::new()], now)
         .map_err(|e| format!("count the {} partition: {e}", partition_name(other)))?;
     if strays != 0 {
         return Err(format!(
@@ -535,8 +544,7 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
         ));
     }
     let step = (sent / ID_SAMPLE).max(1);
-    let sample: Vec<&Event> = door
-        .events
+    let sample: Vec<&Event> = events
         .iter()
         .copied()
         .step_by(step)
@@ -545,7 +553,7 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
     for chunk in sample.chunks(ID_CHUNK) {
         let filter = Filter::new().ids(chunk.iter().map(|event| event.id));
         let mut found: Vec<String> = store
-            .query_stored(door.visibility, &filter, NOW)
+            .query_stored(visibility, &filter, now)
             .map_err(|e| format!("look up sampled ids: {e}"))?
             .into_iter()
             .map(|row| row.id)
@@ -555,8 +563,7 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
         wanted.sort_unstable();
         if found != wanted {
             return Err(format!(
-                "the {} partition does not hold the sampled events: {} found of {}",
-                door.name(),
+                "the {name} partition does not hold the sampled events: {} found of {}",
                 found.len(),
                 wanted.len()
             ));
@@ -566,7 +573,7 @@ fn verify_cell(store: &SqliteEventStore, door: &Door, stats: WriterStats) -> Res
 }
 
 /// The cell's shared figures.
-fn cell_json(merged: &mut Merged, events: usize, window: usize) -> Value {
+pub(crate) fn cell_json(merged: &mut Merged, events: usize, window: usize) -> Value {
     json!({
         "events": events,
         "lanes_with_events": merged.lanes_with_events,
@@ -577,30 +584,46 @@ fn cell_json(merged: &mut Merged, events: usize, window: usize) -> Value {
     })
 }
 
-struct Cell<'a> {
-    cfg: &'a Config,
-    runtime: &'a Runtime,
-    door: &'a Door<'a>,
-    total_events: usize,
-    connections: usize,
-    window: usize,
+/// One cell: the events one partition takes, a connection count, a window and
+/// the clock the frames are stamped with.
+pub(crate) struct Cell<'a> {
+    pub(crate) cfg: &'a Config,
+    pub(crate) runtime: &'a Runtime,
+    pub(crate) visibility: Visibility,
+    /// The events sent, in the order they are dealt to the sessions.
+    pub(crate) events: &'a [&'a Event],
+    /// Sizes the store's ceiling.
+    pub(crate) total_events: usize,
+    pub(crate) connections: usize,
+    pub(crate) window: usize,
+    pub(crate) clock: Clock,
 }
 
-fn engine_cell(
+pub(crate) fn engine_cell(
     cell: &Cell,
     frames: &[String],
     keepers: &Arc<Keepers>,
     keys: &[Keys],
 ) -> Result<Value, String> {
     let (_dir, store) = fresh_store(cell.cfg, cell.total_events)?;
-    let relay = relay_over(Arc::clone(&store) as Arc<dyn EventStore>, keepers, None);
+    let relay = relay_on(
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        keepers,
+        None,
+        cell.clock,
+    );
     let url = relay_url()?;
     let start = Arc::new(Barrier::new(cell.connections + 1));
     let mut tasks = Vec::with_capacity(cell.connections);
     for lane in 0..cell.connections {
-        let label = format!("{} door, session {lane}", cell.door.name());
-        let mut session = relay.session(cell.door.visibility, url.clone(), NOW);
-        authenticate(&mut session, &keys[lane % keys.len()], &label)?;
+        let label = format!("{} door, session {lane}", partition_name(cell.visibility));
+        let mut session = relay.session(cell.visibility, url.clone(), cell.clock.now());
+        authenticate_at(
+            &mut session,
+            &keys[lane % keys.len()],
+            &label,
+            cell.clock.now(),
+        )?;
         let lane_frames: Vec<String> = frames
             .iter()
             .skip(lane)
@@ -612,6 +635,7 @@ fn engine_cell(
             session,
             lane_frames,
             cell.window,
+            cell.clock,
             Arc::clone(&start),
         )));
     }
@@ -619,7 +643,13 @@ fn engine_cell(
     relay.flush();
     let stats = relay.writer_stats();
     let commits = store.commits();
-    verify_cell(&store, cell.door, stats)?;
+    verify_cell(
+        &store,
+        cell.visibility,
+        cell.events,
+        stats,
+        cell.clock.now(),
+    )?;
     let events = frames.len();
     let mut out = cell_json(&mut merged, events, cell.window);
     out["stage_mean_us"] = json!({
@@ -642,7 +672,7 @@ fn baseline_cell(cell: &Cell, corpus_events: &[&Event]) -> Result<Value, String>
     // Checked into puts before the clock, as `ingest.rs` does.
     let mut lanes: Vec<Vec<PreparedPut>> = (0..cell.connections).map(|_| Vec::new()).collect();
     for (index, event) in corpus_events.iter().enumerate() {
-        let put = PreparedPut::new(cell.door.visibility, (*event).clone(), NOW, false)
+        let put = PreparedPut::new(cell.visibility, (*event).clone(), cell.clock.now(), false)
             .map_err(|e| format!("prepare an event: {e}"))?;
         lanes[index % cell.connections].push(put);
     }
@@ -654,7 +684,10 @@ fn baseline_cell(cell: &Cell, corpus_events: &[&Event]) -> Result<Value, String>
     let start = Arc::new(Barrier::new(cell.connections + 1));
     let mut tasks = Vec::with_capacity(cell.connections);
     for (lane, puts) in lanes.into_iter().enumerate() {
-        let label = format!("{} baseline, submitter {lane}", cell.door.name());
+        let label = format!(
+            "{} baseline, submitter {lane}",
+            partition_name(cell.visibility)
+        );
         tasks.push(cell.runtime.spawn(baseline_lane(
             label,
             Arc::clone(&writer),
@@ -667,7 +700,13 @@ fn baseline_cell(cell: &Cell, corpus_events: &[&Event]) -> Result<Value, String>
     writer.flush();
     let stats = writer.stats();
     let commits = store.commits();
-    verify_cell(&store, cell.door, stats)?;
+    verify_cell(
+        &store,
+        cell.visibility,
+        cell.events,
+        stats,
+        cell.clock.now(),
+    )?;
     let events = corpus_events.len();
     let mut out = cell_json(&mut merged, events, cell.window);
     out["stage_mean_us"] = json!({
@@ -702,9 +741,14 @@ fn refusal_check(
         .find(|event| event.kind.as_u16() == kind)
         .ok_or("a refused kind has no event")?;
     let (_dir, store) = fresh_store(cfg, corpus.items.len())?;
-    let relay = relay_over(Arc::clone(&store) as Arc<dyn EventStore>, keepers, None);
+    let relay = relay_on(
+        Arc::clone(&store) as Arc<dyn EventStore>,
+        keepers,
+        None,
+        Clock::Fixed(NOW),
+    );
     let mut session = relay.session(door.visibility, relay_url()?, NOW);
-    authenticate(&mut session, &keys[0], "refusal check")?;
+    authenticate_at(&mut session, &keys[0], "refusal check", NOW)?;
     let replies = session.handle(&event_text(event)?, NOW);
     let reply = replies.first().cloned().unwrap_or_default();
     let refused = replies.len() == 1
@@ -784,10 +828,12 @@ pub fn run(
                 let cell = Cell {
                     cfg,
                     runtime: &runtime,
-                    door: &door,
+                    visibility: door.visibility,
+                    events: &door.events,
                     total_events: corpus.items.len(),
                     connections,
                     window,
+                    clock: Clock::Fixed(NOW),
                 };
                 let engine = engine_cell(&cell, &frames, keepers, keys)?;
                 let baseline = baseline_cell(&cell, &door.events)?;

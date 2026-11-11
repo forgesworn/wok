@@ -10,6 +10,14 @@
 //! result is one JSON document, and a refused put, a wrong answer or a
 //! lagging reader fails the run instead of being reported.
 //!
+//! A fifth, `socket`, is the one scenario with a network: acknowledged writes
+//! through `wok-ws`'s WebSocket doors, over loopback to a listener on
+//! `127.0.0.1`, set beside the engine driven directly on the same events. It
+//! builds no corpus; it signs its own notes. Client and server share one
+//! process and one host, so its figures are loopback figures: CPU is not
+//! attributed to either side, and nothing in them speaks for a real network,
+//! TLS, a proxy or another host.
+//!
 //! The figures are for holding later changes to "no slower" on one machine.
 //! They say nothing about other relay implementations, and are only
 //! comparable between runs with the same header and sizes.
@@ -21,6 +29,7 @@ mod engine;
 mod fanout;
 mod ingest;
 mod query;
+mod socket;
 mod support;
 
 use std::process::ExitCode;
@@ -83,6 +92,9 @@ fn run(cfg: &Config) -> Result<Value, String> {
     }
     if cfg.fanout {
         document.insert("fanout".into(), fanout::run(cfg)?);
+    }
+    if cfg.socket {
+        document.insert("socket".into(), socket::run(cfg)?);
     }
     Ok(Value::Object(document))
 }
@@ -153,6 +165,11 @@ mod tests {
             engine_workers: 2,
             engine_subscribers: 6,
             engine_publish: 5,
+            socket_connections: vec![1, 2],
+            socket_window: 4,
+            socket_events: 24,
+            socket_serial_events: 6,
+            socket_rounds: 1,
             ..Config::default()
         };
         let document = run(&cfg).unwrap_or_else(|e| panic!("the smoke run failed: {e}"));
@@ -214,6 +231,11 @@ mod tests {
         assert!(engine["note"].is_string());
         assert_eq!(engine["subscribers"]["subscribers"], 6);
         assert_eq!(engine["subscribers"]["delivery"]["events"], 5);
+
+        let socket = &document["socket"];
+        assert_eq!(socket["rounds"].as_array().unwrap().len(), 1);
+        assert_eq!(socket["refusal_checks"].as_array().unwrap().len(), 2);
+        assert_eq!(header["params"]["socket_events"], 24);
 
         // Nothing identifies the machine or the person who ran it.
         let text = document.to_string();
