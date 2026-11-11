@@ -178,10 +178,14 @@ pub struct StoreOptions {
     /// this many pages in the WAL. Server default 1,000 (about 4 MiB at the
     /// 4 KiB page size, SQLite's own default threshold), phone default 500.
     pub checkpoint_pages: u32,
-    /// Hard ceiling, in WAL pages. If a commit leaves the WAL this long, which
+    /// Ceiling, in WAL pages. If a commit leaves the WAL this long, which
     /// happens only when readers pin snapshots or the disk cannot keep up, the
-    /// writer itself runs one blocking (FULL) checkpoint, waiting up to
-    /// [`CEILING_WAIT`] for the readers, so the log cannot grow without bound.
+    /// writer itself runs one blocking (FULL) checkpoint before it takes
+    /// another batch. It waits up to [`CEILING_WAIT`] in all, first for any
+    /// other checkpoint to let go of the checkpoint lock and then for the
+    /// readers, so intake slows rather than the log growing. It is not a hard
+    /// limit: if that wait runs out, commits go through for a second before
+    /// the writer tries again, and the log grows in that time.
     /// Server default 8,192 pages (32 MiB, equal to the `journal_size_limit`),
     /// phone default 4,096.
     pub wal_ceiling_pages: u32,
@@ -257,10 +261,16 @@ impl Default for StoreOptions {
     }
 }
 
-/// How long the writer waits for readers when the WAL is over its ceiling.
+/// How long the writer waits in all, for the checkpoint lock and then for
+/// readers, when the WAL is over its ceiling.
 pub const CEILING_WAIT: Duration = Duration::from_secs(2);
-/// The writer runs at most one blocking checkpoint in this interval.
+/// After a blocking checkpoint that was held off until [`CEILING_WAIT`] ran
+/// out, the writer starts no other for this long.
 const CEILING_RETRY: Duration = Duration::from_secs(1);
+/// While another checkpoint holds the checkpoint lock, the writer tries for it
+/// again after this, doubling each time up to [`CEILING_LOCK_STEP_MAX`].
+const CEILING_LOCK_STEP: Duration = Duration::from_millis(1);
+const CEILING_LOCK_STEP_MAX: Duration = Duration::from_millis(10);
 /// The checkpoint thread starts at most one PASSIVE checkpoint per interval.
 const CHECKPOINT_MIN_GAP: Duration = Duration::from_millis(50);
 /// The checkpoint thread does not hold the writer off for longer than this
@@ -540,6 +550,50 @@ fn run_checkpoint(conn: &Connection, mode: &str) -> Result<(i64, i64, i64), rusq
     })
 }
 
+/// How the writer's blocking checkpoint ended ([`checkpoint_within`]).
+#[derive(Debug)]
+enum CeilingCheckpoint {
+    /// It copied the whole log.
+    Finished,
+    /// It ran, but readers kept it from finishing before the wait ran out.
+    HeldByReaders,
+    /// Another checkpoint held the checkpoint lock until the wait ran out.
+    HeldByCheckpoint,
+    Failed(rusqlite::Error),
+}
+
+/// One blocking checkpoint within `wait`. `attempt(timeout)` runs it with that
+/// busy timeout and returns the `PRAGMA wal_checkpoint` row.
+///
+/// SQLite does not call the busy handler for the checkpoint lock: a
+/// checkpoint that finds another one running is refused at once, and reports
+/// busy with no log size (-1). Such a refusal is tried again here after a
+/// short sleep, until the lock is free or `wait` has passed. The busy timeout
+/// then covers the wait for readers, from whatever time is left. It is never
+/// zero, which would remove the busy handler.
+fn checkpoint_within(
+    wait: Duration,
+    mut attempt: impl FnMut(Duration) -> Result<(i64, i64, i64), rusqlite::Error>,
+) -> CeilingCheckpoint {
+    let deadline = Instant::now() + wait;
+    let mut step = CEILING_LOCK_STEP;
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match attempt(left.max(Duration::from_millis(1))) {
+            Ok((0, _, _)) => return CeilingCheckpoint::Finished,
+            Ok((_, -1, _)) => {}
+            Ok(_) => return CeilingCheckpoint::HeldByReaders,
+            Err(error) => return CeilingCheckpoint::Failed(error),
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return CeilingCheckpoint::HeldByCheckpoint;
+        }
+        std::thread::sleep(step.min(left));
+        step = (step * 2).min(CEILING_LOCK_STEP_MAX);
+    }
+}
+
 /// The checkpoint thread. It sleeps with no timer while the store is idle.
 /// After a commit it wakes when the quiet spell would end, to see whether
 /// commits continue (so at most once per `idle_truncate_after`); a
@@ -719,12 +773,12 @@ pub struct CheckpointStats {
     /// TRUNCATE checkpoints the checkpoint thread has finished on a quiet
     /// store.
     pub truncating: u64,
-    /// Blocking checkpoints the writer has attempted because a commit left
-    /// the WAL at its ceiling. One refused at once, because the checkpoint
-    /// thread held the checkpoint lock, is counted too; `blocking_time` tells
-    /// them apart.
+    /// Blocking checkpoints the writer has run because a commit left the WAL
+    /// at its ceiling, each counted once however long it waited for the
+    /// checkpoint lock.
     pub blocking: u64,
-    /// Time the writer has spent in those, during which it took no batch.
+    /// Time the writer has spent in those, its waits for the checkpoint lock
+    /// and for readers included, during which it took no batch.
     pub blocking_time: Duration,
     /// The longest single one.
     pub longest_blocking: Duration,
@@ -1846,11 +1900,12 @@ PRAGMA user_version=2;"))?;
 
     /// The one place the writer checkpoints. Normally the checkpoint thread
     /// keeps the WAL short and this does nothing. If a commit has left the WAL
-    /// at its hard ceiling (readers have pinned old snapshots, or the disk is
-    /// slower than intake), run a blocking FULL checkpoint here and wait up to
-    /// [`CEILING_WAIT`] for the readers, once per [`CEILING_RETRY`] at most.
-    /// Writes stall for that time, which is the point: intake is slowed
-    /// rather than the log allowed to grow without bound.
+    /// at its ceiling (readers have pinned old snapshots, or the disk is
+    /// slower than intake), run a blocking FULL checkpoint here, waiting up to
+    /// [`CEILING_WAIT`] in all for the checkpoint lock and then for the
+    /// readers. Writes stall for that time, which is the point: intake is
+    /// slowed rather than the log allowed to grow. After a wait that ran out,
+    /// no other is started for [`CEILING_RETRY`].
     fn enforce_wal_ceiling(&self, conn: &Connection) {
         let shared = &self.maintenance.shared;
         if !self.maintenance.background || !shared.over_ceiling.swap(false, AtomicOrdering::AcqRel)
@@ -1866,8 +1921,10 @@ PRAGMA user_version=2;"))?;
             return;
         }
         let began = Instant::now();
-        let _ = conn.busy_timeout(CEILING_WAIT);
-        let result = run_checkpoint(conn, "FULL");
+        let outcome = checkpoint_within(CEILING_WAIT, |timeout| {
+            let _ = conn.busy_timeout(timeout);
+            run_checkpoint(conn, "FULL")
+        });
         let _ = conn.busy_timeout(BUSY_TIMEOUT);
         let took = began.elapsed();
         let took_ns = u64::try_from(took.as_nanos()).unwrap_or(u64::MAX);
@@ -1878,25 +1935,29 @@ PRAGMA user_version=2;"))?;
         shared
             .blocking_longest_ns
             .fetch_max(took_ns, AtomicOrdering::Relaxed);
-        // A checkpoint that finished needs no pause before the next. Neither
-        // does one that was refused at once (the checkpoint thread held the
-        // checkpoint lock): the next commit tries again. Only one that waited
-        // for readers and still could not finish is not repeated for a
-        // second, so a reader that never lets go costs the writer at most
-        // CEILING_WAIT in every CEILING_WAIT + CEILING_RETRY.
-        let waited = took >= CEILING_WAIT / 2;
-        let finished = matches!(result, Ok((0, _, _)));
+        // A checkpoint that finished needs no pause before the next, and nor
+        // does one that failed: the next commit over the ceiling tries again.
+        // One held off until the wait ran out, by readers or by another
+        // checkpoint, is not repeated for a second, so a reader or checkpoint
+        // that never lets go costs the writer at most CEILING_WAIT in every
+        // CEILING_WAIT + CEILING_RETRY.
+        let held = matches!(
+            outcome,
+            CeilingCheckpoint::HeldByReaders | CeilingCheckpoint::HeldByCheckpoint
+        );
         *shared
             .last_blocking
             .lock()
-            .unwrap_or_else(|e| e.into_inner()) = (!finished && waited).then(Instant::now);
-        match result {
-            Ok((0, _, _)) => {}
-            Ok(_) if !waited => {}
-            Ok(_) => tracing::warn!(
+            .unwrap_or_else(|e| e.into_inner()) = held.then(Instant::now);
+        match outcome {
+            CeilingCheckpoint::Finished => {}
+            CeilingCheckpoint::HeldByReaders => tracing::warn!(
                 "event-store WAL is over its ceiling and readers kept the blocking checkpoint from finishing"
             ),
-            Err(error) => {
+            CeilingCheckpoint::HeldByCheckpoint => tracing::warn!(
+                "event-store WAL is over its ceiling and another checkpoint held the checkpoint lock throughout the wait"
+            ),
+            CeilingCheckpoint::Failed(error) => {
                 tracing::warn!(%error, "event-store blocking checkpoint did not complete");
             }
         }
@@ -7446,14 +7507,132 @@ PRAGMA user_version=2;")).unwrap();
     }
 
     #[test]
+    fn a_blocking_checkpoint_refused_at_the_lock_is_tried_again() {
+        // SQLite's answer while another checkpoint holds the lock: busy, with
+        // no log size.
+        let mut rows = [Ok((1, -1, -1)), Ok((1, -1, -1)), Ok((0, 40, 40))].into_iter();
+        let mut timeouts = Vec::new();
+        let outcome = checkpoint_within(Duration::from_secs(2), |timeout| {
+            timeouts.push(timeout);
+            rows.next().unwrap()
+        });
+        assert!(
+            matches!(outcome, CeilingCheckpoint::Finished),
+            "{outcome:?}"
+        );
+        assert_eq!(timeouts.len(), 3);
+        // Each try waits for readers only for the time that is left.
+        assert!(timeouts[0] <= Duration::from_secs(2), "{timeouts:?}");
+        assert!(timeouts.windows(2).all(|w| w[1] <= w[0]), "{timeouts:?}");
+    }
+
+    #[test]
+    fn a_checkpoint_lock_held_throughout_ends_the_wait_when_it_runs_out() {
+        let wait = Duration::from_millis(100);
+        let mut least = Duration::MAX;
+        let began = Instant::now();
+        let outcome = checkpoint_within(wait, |timeout| {
+            least = least.min(timeout);
+            Ok((1, -1, -1))
+        });
+        let took = began.elapsed();
+        assert!(
+            matches!(outcome, CeilingCheckpoint::HeldByCheckpoint),
+            "{outcome:?}"
+        );
+        assert!(took >= wait, "gave up after {took:?}");
+        // A zero busy timeout would remove the busy handler.
+        assert!(least >= Duration::from_millis(1), "{least:?}");
+    }
+
+    #[test]
+    fn readers_or_an_error_end_a_blocking_checkpoint_without_another_try() {
+        let mut attempts = 0;
+        let outcome = checkpoint_within(Duration::from_secs(2), |_| {
+            attempts += 1;
+            Ok((1, 120, 40))
+        });
+        assert!(
+            matches!(outcome, CeilingCheckpoint::HeldByReaders),
+            "{outcome:?}"
+        );
+        assert_eq!(attempts, 1);
+        let outcome = checkpoint_within(Duration::from_secs(2), |_| {
+            Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_IOERR),
+                None,
+            ))
+        });
+        assert!(
+            matches!(outcome, CeilingCheckpoint::Failed(_)),
+            "{outcome:?}"
+        );
+    }
+
+    /// What the ceiling wait rests on: SQLite refuses a checkpoint at once
+    /// while another holds the checkpoint lock, reporting busy with no log
+    /// size, and does not call the busy handler for it.
+    #[test]
+    fn sqlite_refuses_a_checkpoint_at_once_while_another_holds_the_lock() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("lock.sqlite");
+        let writer = Connection::open(&path).unwrap();
+        writer
+            .execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE t(x); INSERT INTO t VALUES(1);")
+            .unwrap();
+        // A reader on a snapshot older than the log's end, which a FULL
+        // checkpoint waits for.
+        let reader = Connection::open(&path).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM t", [], |r| r.get::<_, i64>(0))
+            .unwrap();
+        writer.execute("INSERT INTO t VALUES(2)", []).unwrap();
+        let holder = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let conn = Connection::open(&path).unwrap();
+                conn.busy_timeout(Duration::from_secs(60)).unwrap();
+                // Tried again only if the probe below held the lock just then.
+                loop {
+                    let row = run_checkpoint(&conn, "FULL").unwrap();
+                    if row != (1, -1, -1) {
+                        return row;
+                    }
+                }
+            })
+        };
+        let probe = Connection::open(&path).unwrap();
+        eventually("the other checkpoint to take the lock", || {
+            run_checkpoint(&probe, "PASSIVE").unwrap() == (1, -1, -1)
+        });
+        probe.busy_timeout(Duration::from_secs(30)).unwrap();
+        let began = Instant::now();
+        let refused = run_checkpoint(&probe, "FULL").unwrap();
+        let took = began.elapsed();
+        reader.execute_batch("COMMIT").unwrap();
+        let held = holder.join().unwrap();
+        assert_eq!(refused, (1, -1, -1));
+        assert!(
+            took < Duration::from_secs(10),
+            "the refused checkpoint took {took:?}, as if it had waited for its busy handler"
+        );
+        assert_eq!(held.0, 0, "the other checkpoint finished: {held:?}");
+    }
+
+    #[test]
     fn the_writer_clears_a_wal_that_a_pinned_reader_would_let_grow() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("events.sqlite");
+        // One of these commits adds about eight pages, so the first two leave
+        // the WAL well short of the ceiling, which is first reached under the
+        // pin.
+        let ceiling = 40;
         let db = io_store(
             &tmp,
             StoreOptions {
                 checkpoint_pages: 4,
-                wal_ceiling_pages: 12,
+                wal_ceiling_pages: ceiling,
                 idle_truncate_after: Duration::from_secs(3600),
                 ..StoreOptions::default()
             },
@@ -7471,30 +7650,95 @@ PRAGMA user_version=2;")).unwrap();
         let watched = Arc::clone(&db.maintenance.shared);
         let release = std::thread::spawn(move || {
             eventually("the WAL to reach its ceiling", || {
-                watched.peak_pages.load(AtomicOrdering::Relaxed) >= 12
+                watched.peak_pages.load(AtomicOrdering::Relaxed) >= ceiling
             });
+            let seen = Instant::now();
             std::thread::sleep(Duration::from_millis(50));
             drop(pin);
+            seen.elapsed()
         });
         write_notes(&db, &key, 10, 60, 1);
-        release.join().unwrap();
-        let shared = &db.maintenance.shared;
+        let held_for = release.join().unwrap();
+        let stats = db.checkpoint_stats();
         assert!(
-            shared.blocking_runs.load(AtomicOrdering::Relaxed) >= 1,
-            "the writer fell back to a blocking checkpoint"
+            stats.blocking >= 1,
+            "the writer never ran a blocking checkpoint: {stats:?}"
         );
-        // Unbounded, sixty commits of about six pages would be 360 pages.
-        // Until the release thread runs, a blocking checkpoint refused at once
-        // (the checkpoint thread holds the lock) lets the next commit through,
-        // so how far past the ceiling the log gets depends on scheduling: four
-        // commits (36 pages) on a two-core CI runner. A third of unbounded
-        // still says the ceiling held.
-        assert!(
-            shared.peak_pages.load(AtomicOrdering::Relaxed) < 120,
-            "the WAL reached {} pages against a ceiling of 12",
-            shared.peak_pages.load(AtomicOrdering::Relaxed)
+        // The commit that reaches the ceiling waits in its blocking checkpoint
+        // until the pin lets go, and a later one that meets the checkpoint
+        // thread's checkpoint waits for the lock instead of letting the next
+        // commit through.
+        assert_the_ceiling_held(
+            &stats,
+            ceiling,
+            &format!("the pin let go {held_for:?} after the release thread saw the ceiling"),
         );
         assert_eq!(count_events(&path), 62);
+    }
+
+    /// What the ceiling promises: the log ends at most one commit (about
+    /// eight pages in these tests) past it, unless a blocking checkpoint
+    /// waited out CEILING_WAIT, after which the writer lets commits through
+    /// for a second.
+    fn assert_the_ceiling_held(stats: &CheckpointStats, ceiling: u32, context: &str) {
+        let waited_out = stats.longest_blocking >= CEILING_WAIT;
+        if waited_out {
+            println!("a blocking checkpoint waited out CEILING_WAIT ({context}): {stats:?}");
+        }
+        assert!(
+            stats.peak_wal_pages < ceiling + 12 || waited_out,
+            "the WAL reached {} pages against a ceiling of {ceiling}, and no blocking checkpoint \
+             waited out {CEILING_WAIT:?}; {context}; {stats:?}",
+            stats.peak_wal_pages
+        );
+    }
+
+    #[test]
+    fn the_writer_waits_for_another_checkpoint_rather_than_let_the_wal_grow() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("events.sqlite");
+        let ceiling = 40;
+        let db = io_store(
+            &tmp,
+            StoreOptions {
+                checkpoint_pages: 4,
+                wal_ceiling_pages: ceiling,
+                idle_truncate_after: Duration::from_secs(3600),
+                ..StoreOptions::default()
+            },
+        );
+        let key = Keys::generate();
+        // Another connection checkpoints without pause, so the writer's
+        // blocking checkpoint often finds the checkpoint lock taken and is
+        // refused at once. When the writer let the next commit through after
+        // such a refusal, the log could pass the ceiling many times over. On a
+        // loaded machine that connection can keep the lock for the whole of
+        // CEILING_WAIT, and the log may then grow while the writer pauses.
+        let stop = Arc::new(AtomicBool::new(false));
+        let other = {
+            let stop = Arc::clone(&stop);
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let conn = Connection::open(&path).unwrap();
+                while !stop.load(AtomicOrdering::Relaxed) {
+                    run_checkpoint(&conn, "PASSIVE").unwrap();
+                }
+            })
+        };
+        write_notes(&db, &key, 0, 60, 1);
+        stop.store(true, AtomicOrdering::Relaxed);
+        other.join().unwrap();
+        let stats = db.checkpoint_stats();
+        assert!(
+            stats.blocking >= 1,
+            "the WAL never reached its ceiling: {stats:?}"
+        );
+        assert_the_ceiling_held(
+            &stats,
+            ceiling,
+            "another connection checkpointing without pause",
+        );
+        assert_eq!(count_events(&path), 60);
     }
 
     #[test]

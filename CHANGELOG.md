@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- `wok-store`: when a commit leaves the WAL at `wal_ceiling_pages` and
+  another checkpoint holds SQLite's checkpoint lock, the writer now waits for
+  the lock, within the same `CEILING_WAIT` as its wait for readers, and then
+  runs its blocking checkpoint. SQLite refuses a checkpoint at once while
+  another runs, and the writer used to let the next commit through after such
+  a refusal, so the log could pass the ceiling for as long as its attempts
+  kept meeting another checkpoint. Writes can now stall in this case where
+  they used to pass. The ceiling is still not a hard limit: if a reader or
+  another checkpoint holds on for longer than `CEILING_WAIT`, commits go
+  through for a second before the writer tries again. `CheckpointStats`
+  counts each blocking checkpoint once, and `blocking_time` now includes the
+  wait for the lock.
+
 ## 0.5.2 - 2026-11-11
 
 - `wok-store`: `SqliteEventStore::checkpoint_stats` reports what the store's
