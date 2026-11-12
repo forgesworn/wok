@@ -277,6 +277,8 @@ pub struct EventRelay {
     final_access_refusal: bool,
     /// The wall clock a queued write is judged by when the writer reaches it.
     clock: Clock,
+    /// See [`Self::auth_relay_mismatches`].
+    auth_relay_mismatches: std::sync::atomic::AtomicU64,
 }
 
 /// Seconds since the epoch, read when a queued write's grants are re-judged.
@@ -345,7 +347,21 @@ impl EventRelay {
             frame_limit: MAX_FRAMES_PER_MINUTE,
             final_access_refusal: false,
             clock: Arc::new(wall_clock),
+            auth_relay_mismatches: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// AUTH events refused only because their one `relay` tag named another
+    /// relay than the session's URL: the kind, signature, time and challenge
+    /// were all good. Counted since this relay was built, for every door and
+    /// session it serves, and before any access check, so anyone who can open
+    /// a socket can raise it with a throwaway key. Real clients raising it
+    /// usually means the address they connect to is not the URL this relay
+    /// was given. The reply is the same generic refusal as for any other bad
+    /// AUTH.
+    pub fn auth_relay_mismatches(&self) -> u64 {
+        self.auth_relay_mismatches
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Replace the wall clock (seconds since the epoch) that re-judges a
@@ -1743,14 +1759,22 @@ impl RelaySession {
         let matched_challenge = challenge.len() == 1
             && challenge[0].len() == 2
             && challenge[0][1] == consumed_challenge;
-        let matched_relay =
-            relay.len() == 1 && relay[0].len() == 2 && names_relay(&relay[0][1], &self.relay_url);
-        if event.kind.as_u16() != 22242
-            || event.verify().is_err()
-            || event.created_at.as_secs().abs_diff(now) > AUTH_WINDOW_SECS
-            || !matched_challenge
-            || !matched_relay
-        {
+        let one_relay = relay.len() == 1 && relay[0].len() == 2;
+        let matched_relay = one_relay && names_relay(&relay[0][1], &self.relay_url);
+        // In the order the checks have always run: the signature only for
+        // the right kind, and once.
+        let sound = event.kind.as_u16() == 22242
+            && event.verify().is_ok()
+            && event.created_at.as_secs().abs_diff(now) <= AUTH_WINDOW_SECS
+            && matched_challenge;
+        if !sound || !matched_relay {
+            // Only its one relay tag let it down, so the URL the client
+            // connected to may not be the one this relay was given.
+            if sound && one_relay {
+                self.relay
+                    .auth_relay_mismatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             return self.auth_failure(
                 id,
                 "invalid: authentication challenge, relay, time or signature",
@@ -2779,6 +2803,63 @@ mod tests {
             send(&mut b, json!(["EVENT", later]))[0][3],
             "auth-required: authenticate for sheltered access"
         );
+    }
+
+    #[test]
+    fn only_an_auth_let_down_by_its_one_relay_tag_counts_as_a_url_mismatch() {
+        let (_tmp, relay, _access, key) = setup();
+        let mut a = session(&relay, Visibility::Sheltered);
+        let other = || vec!["relay".to_owned(), "wss://other.example/events".to_owned()];
+        let challenge = |a: &RelaySession| vec!["challenge".to_owned(), a.challenge.clone()];
+        let refused = |a: &mut RelaySession, auth: Value| {
+            let replies = send(a, json!(["AUTH", auth]));
+            assert_eq!(replies[0][2], false, "{replies:?}");
+            assert_eq!(
+                replies[0][3],
+                "invalid: authentication challenge, relay, time or signature"
+            );
+        };
+
+        let wrong_relay = event(&key, 22242, NOW, "", &[other(), challenge(&a)]);
+        refused(&mut a, json!(wrong_relay));
+        assert_eq!(relay.auth_relay_mismatches(), 1);
+
+        // Something else wrong as well, or not one relay tag: not counted.
+        let stale = event(
+            &key,
+            22242,
+            NOW,
+            "",
+            &[other(), vec!["challenge".into(), "not it".into()]],
+        );
+        refused(&mut a, json!(stale));
+        let mut tampered = event(&key, 22242, NOW, "", &[other(), challenge(&a)]);
+        tampered.content = "tampered".into();
+        refused(&mut a, json!(tampered));
+        let expired = event(&key, 22242, NOW - 601, "", &[other(), challenge(&a)]);
+        refused(&mut a, json!(expired));
+        let wrong_kind = event(&key, 1, NOW, "", &[other(), challenge(&a)]);
+        refused(&mut a, json!(wrong_kind));
+        let no_relay = event(&key, 22242, NOW, "", &[challenge(&a)]);
+        refused(&mut a, json!(no_relay));
+        let two_relays = event(
+            &key,
+            22242,
+            NOW,
+            "",
+            &[
+                vec!["relay".into(), a.relay_url.to_string()],
+                other(),
+                challenge(&a),
+            ],
+        );
+        refused(&mut a, json!(two_relays));
+        assert_eq!(send(&mut a, json!(["AUTH", {}]))[0][2], false);
+        assert_eq!(relay.auth_relay_mismatches(), 1);
+
+        let accepted = auth_event(&a, &key);
+        assert_eq!(send(&mut a, json!(["AUTH", accepted]))[0][2], true);
+        assert_eq!(relay.auth_relay_mismatches(), 1);
     }
 
     #[test]

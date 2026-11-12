@@ -63,6 +63,41 @@ const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a shutdown waits for every socket to finish closing.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How often the count of AUTH events that named another relay URL is read.
+const MISMATCH_POLL: Duration = Duration::from_secs(1);
+
+/// The least time between two warnings about AUTH events that named another
+/// relay URL. The first is logged at once.
+const MISMATCH_LOG_EVERY: Duration = Duration::from_secs(60);
+
+/// When to warn that AUTH events named another relay URL than `url`: at the
+/// first, so an operator watching the log sees it while the client fails,
+/// then at most once every [`MISMATCH_LOG_EVERY`] with what came since.
+#[derive(Debug, Default)]
+struct MismatchLog {
+    reported: u64,
+    last: Option<std::time::Instant>,
+}
+
+impl MismatchLog {
+    /// Given the relay's count so far, the attempts to warn about now, if any.
+    fn due(&mut self, count: u64, now: std::time::Instant) -> Option<u64> {
+        if count <= self.reported {
+            return None;
+        }
+        if self
+            .last
+            .is_some_and(|last| now.duration_since(last) < MISMATCH_LOG_EVERY)
+        {
+            return None;
+        }
+        let attempts = count - self.reported;
+        self.reported = count;
+        self.last = Some(now);
+        Some(attempts)
+    }
+}
+
 /// The group: the keys that may authenticate. Asked on every operation, and
 /// replaced whole on a reload ([`Members::replace`]).
 pub struct Members {
@@ -459,14 +494,16 @@ pub async fn serve(
     let running = config.clone();
     // A non-member's refused AUTH is final: a stock client would otherwise
     // be sent a fresh challenge and sign it, over and over.
-    let relay = EventRelay::new(
-        Arc::new(store),
-        Arc::clone(&members) as Arc<dyn KeeperAccess>,
-    )
-    .with_final_access_refusal();
+    let relay = Arc::new(
+        EventRelay::new(
+            Arc::new(store),
+            Arc::clone(&members) as Arc<dyn KeeperAccess>,
+        )
+        .with_final_access_refusal(),
+    );
     let defaults = Timings::default();
     let door = Door::with_timings(
-        Arc::new(relay),
+        Arc::clone(&relay),
         Timings::new(
             config.auth_deadline,
             defaults.heartbeat(),
@@ -510,6 +547,25 @@ pub async fn serve(
             }
         }
     });
+    // A client that names another URL in its AUTH is refused like any bad
+    // AUTH, and the reply does not say why. Say it here, in counts only:
+    // nothing a client sent reaches the log.
+    let mismatches = tokio::spawn(async move {
+        let mut log = MismatchLog::default();
+        let mut tick = tokio::time::interval(MISMATCH_POLL);
+        loop {
+            tick.tick().await;
+            if let Some(attempts) =
+                log.due(relay.auth_relay_mismatches(), std::time::Instant::now())
+            {
+                tracing::warn!(
+                    attempts,
+                    "AUTH named a relay URL other than `url`; if these are your members' \
+                     clients, `url` must be the address they connect to"
+                );
+            }
+        }
+    });
     tracing::info!(members = config.members.len(), "wokd serving its members");
     let stopping = door.clone();
     // A reply is one small frame; do not let Nagle hold it back.
@@ -538,6 +594,7 @@ pub async fn serve(
     }
     expiry.abort();
     reloader.abort();
+    mismatches.abort();
     tracing::info!("wokd stopped");
     served.map_err(RunError::Serve)
 }
@@ -897,6 +954,24 @@ mod tests {
             ]
         );
         assert!(done.members.unchanged());
+    }
+
+    #[test]
+    fn a_url_mismatch_is_reported_at_once_then_at_most_once_a_minute() {
+        let start = std::time::Instant::now();
+        let at = |secs| start + Duration::from_secs(secs);
+        let mut log = MismatchLog::default();
+        assert_eq!(log.due(0, at(0)), None, "nothing yet");
+        assert_eq!(log.due(1, at(1)), Some(1), "the first at once");
+        assert_eq!(log.due(5, at(2)), None, "more within the minute wait");
+        assert_eq!(log.due(9, at(60)), None);
+        assert_eq!(log.due(9, at(61)), Some(8), "then together");
+        assert_eq!(log.due(9, at(200)), None, "nothing new, nothing said");
+        assert_eq!(
+            log.due(10, at(201)),
+            Some(1),
+            "a new one after a quiet spell"
+        );
     }
 
     #[test]
