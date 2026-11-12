@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.6 - 2026-11-12
 
 - `wok-store`: `EventRelay::auth_relay_mismatches` counts the AUTH events
   refused only because their one `relay` tag named another relay URL than
