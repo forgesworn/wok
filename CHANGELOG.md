@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.5 - 2026-11-12
 
 - `wokd` reloads its members on SIGHUP, without a restart. A removed key's
   open subscriptions are closed with `CLOSED` and then its connection, and
