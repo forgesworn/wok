@@ -492,14 +492,16 @@ pub async fn serve(
     .map_err(|error| RunError::Store(error.to_string()))?;
     let members = Arc::new(Members::new(config.members.iter().copied()));
     let running = config.clone();
-    // A non-member's refused AUTH is final: a stock client would otherwise
-    // be sent a fresh challenge and sign it, over and over.
+    // A non-member's refused AUTH is final, and so is one that names another
+    // relay URL than `url`: a stock client would otherwise be sent a fresh
+    // challenge and sign it, over and over.
     let relay = Arc::new(
         EventRelay::new(
             Arc::new(store),
             Arc::clone(&members) as Arc<dyn KeeperAccess>,
         )
-        .with_final_access_refusal(),
+        .with_final_access_refusal()
+        .with_final_url_refusal(),
     );
     let defaults = Timings::default();
     let door = Door::with_timings(

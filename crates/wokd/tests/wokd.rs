@@ -393,6 +393,75 @@ async fn a_stock_client_with_a_refused_key_signs_once_and_its_publish_fails() {
 }
 
 #[tokio::test]
+async fn an_auth_naming_another_url_is_final_and_the_same_challenge_still_works() {
+    let tmp = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let server = start(tmp.path(), &[&alice]).await;
+    let (mut socket, challenge) = connect(&server.url).await;
+    let refused = auth(
+        &mut socket,
+        "wss://elsewhere.example/events",
+        &challenge,
+        &alice,
+    )
+    .await;
+    assert_eq!(refused[2], false, "{refused}");
+    assert_eq!(
+        refused[3],
+        "invalid: authentication challenge, relay, time or signature"
+    );
+    // Had a replacement challenge been sent, it would come before this OK.
+    let accepted = auth(&mut socket, &server.url, &challenge, &alice).await;
+    assert_eq!(accepted[0], "OK", "no replacement challenge: {accepted}");
+    assert_eq!(accepted[2], true, "{accepted}");
+    drop(socket);
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_stock_client_naming_another_url_signs_once() {
+    let tmp = TempDir::new().unwrap();
+    let alice = Keys::generate();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let upstream = format!("ws://{}{PATH}", listener.local_addr().unwrap());
+    let (url, auths) = counting_proxy(upstream).await;
+    // `url` is not the address the client connects to, so every AUTH it
+    // signs names another relay.
+    let server = start_at(
+        tmp.path(),
+        &[&alice],
+        listener,
+        "wss://relay.example/events".to_owned(),
+    )
+    .await;
+    let client = nostr_sdk::client::Client::builder()
+        .authenticator(nostr_sdk::authenticator::SignerAuthenticator::new(
+            alice.clone(),
+        ))
+        .build();
+    client.add_relay(url.as_str()).await.unwrap();
+    client.connect().await;
+    timeout(Duration::from_secs(5), async {
+        while auths.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the client answers the first challenge");
+    // Without the final refusal, a stock client signed 120 within a fifth
+    // of a second, until the frame allowance closed the connection.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let signed = auths.load(Ordering::SeqCst);
+    eprintln!("AUTH frames the client sent: {signed}");
+    assert_eq!(
+        signed, 1,
+        "a client naming another URL is not prompted again"
+    );
+    client.shutdown().await;
+    server.stop().await;
+}
+
+#[tokio::test]
 async fn before_auth_a_read_is_refused_with_the_nip42_prefix() {
     let tmp = TempDir::new().unwrap();
     let alice = Keys::generate();
