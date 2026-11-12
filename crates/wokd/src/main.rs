@@ -1,4 +1,5 @@
-//! `wokd --config <file>`: run a members-only Nostr relay.
+//! `wokd --config <file>`: run a members-only Nostr relay. On SIGHUP it reads
+//! the file again and applies its members.
 //! `wokd remove --config <file> ...`: an operator's removal, with the relay
 //! stopped. See the crate documentation for both.
 
@@ -67,13 +68,59 @@ fn serve(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(wokd::run(config, shutdown_signal())) {
+    let served = runtime.block_on(async {
+        let (reload, reloads) = tokio::sync::mpsc::channel(1);
+        // Before the listener binds, so a relay that accepts connections
+        // also takes SIGHUP as a reload rather than dying of it.
+        #[cfg(unix)]
+        reload_on_hangup(path.clone(), reload);
+        #[cfg(not(unix))]
+        drop(reload);
+        wokd::run(config, reloads, shutdown_signal()).await
+    });
+    match served {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             tracing::error!("{error}");
             ExitCode::FAILURE
         }
     }
+}
+
+/// On each SIGHUP, read `path` again and hand the relay what it says. A file
+/// that cannot be read, or is not a valid configuration, changes nothing.
+#[cfg(unix)]
+fn reload_on_hangup(path: String, reload: tokio::sync::mpsc::Sender<Config>) {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut hangups = match signal(SignalKind::hangup()) {
+        Ok(hangups) => hangups,
+        Err(error) => {
+            tracing::warn!("no reload on SIGHUP ({error}): membership changes take a restart");
+            return;
+        }
+    };
+    tokio::spawn(async move {
+        while hangups.recv().await.is_some() {
+            let text = match std::fs::read_to_string(&path) {
+                Ok(text) => text,
+                Err(error) => {
+                    tracing::error!(
+                        "reload refused, nothing changed: could not read {path}: {error}"
+                    );
+                    continue;
+                }
+            };
+            match Config::from_toml(&text) {
+                Ok(next) => {
+                    if reload.send(next).await.is_err() {
+                        return;
+                    }
+                }
+                // No message repeats a value from the file.
+                Err(error) => tracing::error!("reload refused, nothing changed: {path}: {error}"),
+            }
+        }
+    });
 }
 
 /// `remove`: exit 0 when everything asked for was removed, 3 when some ids

@@ -15,7 +15,7 @@ use nostr::nips::nip19::ToBech32;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::Message;
 use wok_ws::PATH;
@@ -27,11 +27,23 @@ type Socket =
 struct Running {
     url: String,
     config: Config,
+    reload: mpsc::Sender<Config>,
     stop: oneshot::Sender<()>,
     task: tokio::task::JoinHandle<Result<(), RunError>>,
 }
 
 impl Running {
+    /// Hand the relay its configuration again, with `members` as the group,
+    /// as the binary does on SIGHUP.
+    async fn reload(&self, members: &[&Keys]) {
+        let text = config_text(&self.config.data_dir, members, &self.url, "");
+        let next = Config::from_toml(&text).expect("a valid configuration");
+        self.reload
+            .send(next)
+            .await
+            .expect("the relay takes reloads");
+    }
+
     async fn stop(self) {
         let _ = self.stop.send(());
         timeout(Duration::from_secs(10), self.task)
@@ -67,26 +79,53 @@ async fn start_at_with(
     url: String,
     extra: &str,
 ) -> Running {
-    let members = members
-        .iter()
-        .map(|keys| format!("\"{}\"", keys.public_key().to_bech32().unwrap()))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let text = format!(
-        "url = \"{url}\"\ndata_dir = '{}'\nmax_store_bytes = 67108864\n\
-         min_free_bytes = 0\nmembers = [{members}]\n{extra}",
-        dir.display()
-    );
+    let text = config_text(dir, members, &url, extra);
     let config = Config::from_toml(&text).expect("a valid configuration");
     let (stop, stopped) = oneshot::channel();
-    let task = tokio::spawn(serve(config.clone(), listener, async move {
+    let (reload, reloads) = mpsc::channel(1);
+    let task = tokio::spawn(serve(config.clone(), listener, reloads, async move {
         let _ = stopped.await;
     }));
     Running {
         url,
         config,
+        reload,
         stop,
         task,
+    }
+}
+
+/// A configuration file's text: `members` as the group, `url` as the
+/// address clients name, the store in `dir`, and `extra` appended.
+fn config_text(dir: &Path, members: &[&Keys], url: &str, extra: &str) -> String {
+    let members = members
+        .iter()
+        .map(|keys| format!("\"{}\"", keys.public_key().to_bech32().unwrap()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "url = \"{url}\"\ndata_dir = '{}'\nmax_store_bytes = 67108864\n\
+         min_free_bytes = 0\nmembers = [{members}]\n{extra}",
+        dir.display()
+    )
+}
+
+/// Read until the relay closes the socket: the text frames before the close,
+/// and the close code.
+async fn until_closed(socket: &mut Socket) -> (Vec<Value>, Option<u16>) {
+    let mut frames = Vec::new();
+    loop {
+        match timeout(Duration::from_secs(5), socket.next())
+            .await
+            .expect("the relay closes the socket within five seconds")
+        {
+            Some(Ok(Message::Text(text))) => frames.push(serde_json::from_str(&text).unwrap()),
+            Some(Ok(Message::Close(frame))) => {
+                return (frames, frame.map(|frame| u16::from(frame.code)));
+            }
+            Some(Ok(_)) => {}
+            other => panic!("the socket ended without a close frame: {other:?}"),
+        }
     }
 }
 
@@ -500,6 +539,248 @@ async fn a_restart_keeps_the_events_and_drops_a_removed_member() {
     server.stop().await;
 }
 
+#[tokio::test]
+async fn a_reload_closes_a_removed_members_connection_and_admits_an_added_one() {
+    let tmp = TempDir::new().unwrap();
+    let (alice, bob, carol) = (Keys::generate(), Keys::generate(), Keys::generate());
+    let server = start(tmp.path(), &[&alice, &carol]).await;
+    let mut alice_socket = member(&server.url, &alice).await;
+    assert!(
+        query(&mut alice_socket, json!({"kinds": [1]}))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let mut carol_socket = member(&server.url, &carol).await;
+    assert!(
+        query(&mut carol_socket, json!({"kinds": [1]}))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Alice out, Bob in, in one reload, with no restart.
+    server.reload(&[&bob, &carol]).await;
+    let (frames, code) = until_closed(&mut alice_socket).await;
+    assert_eq!(
+        frames,
+        vec![json!([
+            "CLOSED",
+            "q",
+            "restricted: sheltered authority changed"
+        ])],
+        "the removed member's subscription is closed, then its connection"
+    );
+    assert_eq!(code, Some(1008));
+
+    let mut bob_socket = member(&server.url, &bob).await;
+    let after = note(&bob, "after the reload");
+    assert_eq!(publish(&mut bob_socket, &after).await[2], true);
+    // The member who stayed keeps its subscription through the change.
+    let live = receive(&mut carol_socket).await;
+    assert_eq!(live[0], "EVENT", "{live}");
+    assert_eq!(live[1], "q");
+    assert_eq!(live[2]["id"], after.id.to_hex());
+
+    let (mut again, challenge) = connect(&server.url).await;
+    let refused = auth(&mut again, &server.url, &challenge, &alice).await;
+    assert_eq!(refused[2], false, "a removed key is refused: {refused}");
+    assert!(
+        refused[3].as_str().unwrap().starts_with("restricted:"),
+        "{refused}"
+    );
+    drop((again, bob_socket, carol_socket));
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn a_reload_spares_a_socket_still_authenticating_and_drops_an_idle_removed_member() {
+    let tmp = TempDir::new().unwrap();
+    let (alice, bob) = (Keys::generate(), Keys::generate());
+    let server = start(tmp.path(), &[&alice]).await;
+    // Authenticated, with nothing open.
+    let mut alice_socket = member(&server.url, &alice).await;
+    // Connected before the reload, not yet authenticated.
+    let (mut waiting, challenge) = connect(&server.url).await;
+
+    server.reload(&[&bob]).await;
+    let (frames, code) = until_closed(&mut alice_socket).await;
+    assert!(frames.is_empty(), "nothing was open to close: {frames:?}");
+    assert_eq!(code, Some(1008), "the connection goes all the same");
+
+    // The waiting socket was left alone, and the challenge it was sent
+    // before the reload lets the added key in.
+    let ok = auth(&mut waiting, &server.url, &challenge, &bob).await;
+    assert_eq!(ok[2], true, "{ok}");
+    let stored = note(&bob, "on a socket opened before the reload");
+    assert_eq!(publish(&mut waiting, &stored).await[2], true);
+    drop(waiting);
+    server.stop().await;
+}
+
+/// The binary itself: SIGHUP reloads the file, a bad file changes nothing,
+/// SIGHUP does not stop it, and no key reaches its log.
+#[cfg(unix)]
+#[test]
+fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
+    use std::io::BufRead as _;
+    use std::process::{Command, Stdio};
+
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let signal = |name: &str, pid: u32| {
+        let sent = Command::new("kill")
+            .args([name, &pid.to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill {name}");
+    };
+
+    let tmp = TempDir::new().unwrap();
+    let data = tmp.path().join("data");
+    let path = tmp.path().join("wokd.toml");
+    let (alice, bob) = (Keys::generate(), Keys::generate());
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("ws://127.0.0.1:{port}{PATH}");
+    let write = |text: String| {
+        std::fs::write(&path, format!("listen = \"127.0.0.1:{port}\"\n{text}")).unwrap();
+    };
+    write(config_text(&data, &[&alice], &url, ""));
+
+    let mut child = Child(
+        Command::new(env!("CARGO_BIN_EXE_wokd"))
+            .arg("--config")
+            .arg(&path)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    let pid = child.0.id();
+    let (line, lines) = std::sync::mpsc::channel::<String>();
+    let stdout = child.0.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for text in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = line.send(text);
+        }
+    });
+    let mut log = Vec::new();
+    let mut wait_for = |needle: &str| {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let text = lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no log line with {needle:?} in: {log:#?}"));
+            let found = text.contains(needle);
+            log.push(text);
+            if found {
+                return;
+            }
+        }
+    };
+
+    let client = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let secret = alice.secret_key().to_bech32().unwrap();
+    client.block_on(async {
+        let mut tries = 0;
+        let mut alice_socket = loop {
+            match tokio_tungstenite::connect_async(&url).await {
+                Ok((mut socket, _)) => {
+                    let challenge = receive(&mut socket).await;
+                    let challenge = challenge[1].as_str().unwrap().to_owned();
+                    assert_eq!(auth(&mut socket, &url, &challenge, &alice).await[2], true);
+                    break socket;
+                }
+                Err(_) if tries < 250 => {
+                    tries += 1;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("wokd never listened: {error}"),
+            }
+        };
+        assert!(
+            query(&mut alice_socket, json!({"kinds": [1]}))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        // A secret key pasted by mistake: refused, members unchanged.
+        write(
+            config_text(&data, &[&bob], &url, "")
+                .replace(&bob.public_key().to_bech32().unwrap(), &secret),
+        );
+        signal("-HUP", pid);
+        wait_for("reload refused");
+        send(&mut alice_socket, json!(["COUNT", "c", {"kinds": [1]}])).await;
+        let counted = receive(&mut alice_socket).await;
+        assert_eq!(counted[0], "COUNT", "still a member: {counted}");
+
+        // Alice out, Bob in, and one setting only a restart applies.
+        write(config_text(
+            &data,
+            &[&bob],
+            &url,
+            "relay_information = false",
+        ));
+        signal("-HUP", pid);
+        let (frames, code) = until_closed(&mut alice_socket).await;
+        assert_eq!(frames.len(), 1, "{frames:?}");
+        assert_eq!(frames[0][0], "CLOSED");
+        assert_eq!(code, Some(1008));
+        let mut bob_socket = member(&url, &bob).await;
+        let stored = note(&bob, "after SIGHUP");
+        assert_eq!(publish(&mut bob_socket, &stored).await[2], true);
+    });
+    wait_for("membership changed");
+    wait_for("relay_information");
+
+    // SIGHUP did not stop it; SIGTERM does, cleanly.
+    assert!(child.0.try_wait().unwrap().is_none(), "still running");
+    signal("-TERM", pid);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "wokd stops on SIGTERM"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(status.success(), "{status}");
+    reader.join().unwrap();
+    log.extend(lines.try_iter());
+    let log = log.join("\n");
+    for key in [
+        secret,
+        alice.public_key().to_bech32().unwrap(),
+        bob.public_key().to_bech32().unwrap(),
+        alice.public_key().to_hex(),
+        bob.public_key().to_hex(),
+    ] {
+        assert!(!log.contains(&key), "a key in the log:\n{log}");
+    }
+}
+
 #[test]
 fn shutdown_answers_and_closes_an_open_socket_before_run_returns() {
     let tmp = TempDir::new().unwrap();
@@ -518,6 +799,7 @@ fn shutdown_answers_and_closes_an_open_socket_before_run_returns() {
     );
     let config = Config::from_toml(&text).unwrap();
     let (stop, stopped) = oneshot::channel::<()>();
+    let (_reload, reloads) = mpsc::channel(1);
     // The server gets a runtime of its own, dropped as soon as `run`
     // returns, as in `main`.
     let server = std::thread::spawn(move || {
@@ -525,7 +807,7 @@ fn shutdown_answers_and_closes_an_open_socket_before_run_returns() {
             .enable_all()
             .build()
             .unwrap()
-            .block_on(wokd::run(config, async move {
+            .block_on(wokd::run(config, reloads, async move {
                 let _ = stopped.await;
             }))
     });
