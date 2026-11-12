@@ -275,6 +275,8 @@ pub struct EventRelay {
     frame_limit: u32,
     /// See [`Self::with_final_access_refusal`].
     final_access_refusal: bool,
+    /// See [`Self::with_final_url_refusal`].
+    final_url_refusal: bool,
     /// The wall clock a queued write is judged by when the writer reaches it.
     clock: Clock,
     /// See [`Self::auth_relay_mismatches`].
@@ -346,6 +348,7 @@ impl EventRelay {
             writer,
             frame_limit: MAX_FRAMES_PER_MINUTE,
             final_access_refusal: false,
+            final_url_refusal: false,
             clock: Arc::new(wall_clock),
             auth_relay_mismatches: std::sync::atomic::AtomicU64::new(0),
         }
@@ -399,6 +402,22 @@ impl EventRelay {
     /// else is unchanged. Off by default.
     pub fn with_final_access_refusal(mut self) -> Self {
         self.final_access_refusal = true;
+        self
+    }
+
+    /// Make an AUTH refused only because its one `relay` tag names another
+    /// relay ([`Self::auth_relay_mismatches`]) send no replacement challenge:
+    /// its kind, signature, time and challenge were good. A stock NIP-42
+    /// client signs every challenge it is sent, and would sign the next one
+    /// with the same URL at once, again and again until the frame allowance
+    /// closes the connection, and then reconnect and start over. The reply
+    /// is the same generic refusal, and the challenge it answered stays the
+    /// one to answer, so a client that names the right URL can still
+    /// authenticate on the same connection. Frames that need authority are
+    /// still answered `auth-required:`. An AUTH refused for anything else is
+    /// unchanged. Off by default.
+    pub fn with_final_url_refusal(mut self) -> Self {
+        self.final_url_refusal = true;
         self
     }
 
@@ -1774,11 +1793,14 @@ impl RelaySession {
                 self.relay
                     .auth_relay_mismatches
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if self.relay.final_url_refusal && self.authenticated.is_empty() {
+                    // The same client would sign the next challenge with the
+                    // same URL: send none, and keep this one to answer.
+                    self.challenge = consumed_challenge;
+                    return vec![ok(id, false, BAD_AUTH)];
+                }
             }
-            return self.auth_failure(
-                id,
-                "invalid: authentication challenge, relay, time or signature",
-            );
+            return self.auth_failure(id, BAD_AUTH);
         }
         if self
             .identity()
@@ -2471,6 +2493,8 @@ impl LiveAccessCache {
 /// authenticated is told to, one that has is told it no longer counts.
 /// The AUTH refusal for a key that is neither a keeper nor a guest.
 const NO_ACCESS: &str = "restricted: this key has no sheltered access";
+/// The AUTH refusal for a bad kind, signature, time, challenge or relay tag.
+const BAD_AUTH: &str = "invalid: authentication challenge, relay, time or signature";
 
 fn refusal_for(authenticated: &BTreeSet<PublicKey>, access_refused: bool) -> &'static str {
     if !authenticated.is_empty() {
@@ -2738,6 +2762,61 @@ mod tests {
             send(&mut a, json!(["EVENT", later]))[0][3],
             "auth-required: authenticate for sheltered access"
         );
+    }
+
+    #[test]
+    fn a_final_url_refusal_prompts_no_retry_and_the_answered_challenge_still_works() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let access = Arc::new(Access(RwLock::new([key.public_key()].into())));
+        let store = Arc::new(
+            SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap(),
+        );
+        let relay = Arc::new(EventRelay::new(store, access).with_final_url_refusal());
+        let other = || vec!["relay".to_owned(), "wss://other.example/events".to_owned()];
+        let challenge = |a: &RelaySession| vec!["challenge".to_owned(), a.challenge.clone()];
+
+        let mut a = session(&relay, Visibility::Sheltered);
+        let answered = a.challenge.clone();
+        let wrong_url = event(&key, 22242, NOW, "", &[other(), challenge(&a)]);
+        let replies = send(&mut a, json!(["AUTH", wrong_url]));
+        assert_eq!(replies.len(), 1, "no replacement challenge: {replies:?}");
+        assert_eq!(replies[0][2], false);
+        assert_eq!(replies[0][3], BAD_AUTH);
+        assert_eq!(
+            a.challenge, answered,
+            "the answered challenge stays current"
+        );
+        assert_eq!(relay.auth_relay_mismatches(), 1);
+        // Frames that need authority still say how to get it.
+        let read = send(&mut a, json!(["REQ", "q", {}]));
+        assert_eq!(
+            read[0][2],
+            "auth-required: authenticate for sheltered access"
+        );
+        // The same challenge, naming this relay, lets the key in.
+        let right_url = auth_event(&a, &key);
+        assert_eq!(send(&mut a, json!(["AUTH", right_url]))[0][2], true);
+
+        // Anything else wrong is refused as before, with a replacement.
+        let mut b = session(&relay, Visibility::Sheltered);
+        let consumed = b.challenge.clone();
+        let expired = event(
+            &key,
+            22242,
+            NOW - 601,
+            "",
+            &[vec!["relay".into(), b.relay_url.to_string()], challenge(&b)],
+        );
+        let replies = send(&mut b, json!(["AUTH", expired]));
+        assert_eq!(replies[0][3], BAD_AUTH);
+        assert_eq!(replies[1], json!(["AUTH", b.challenge]));
+        assert_ne!(b.challenge, consumed);
+        let mut tampered = event(&key, 22242, NOW, "", &[other(), challenge(&b)]);
+        tampered.content = "tampered".into();
+        let replies = send(&mut b, json!(["AUTH", tampered]));
+        assert_eq!(replies[1], json!(["AUTH", b.challenge]));
+        assert_eq!(relay.auth_relay_mismatches(), 1);
     }
 
     #[test]

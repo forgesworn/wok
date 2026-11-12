@@ -11,6 +11,17 @@
   minute, with the number of attempts and nothing a client sent. A `url` that
   is not the address clients connect to used to show only as every client
   failing AUTH.
+- `wok-store`: `EventRelay::with_final_url_refusal` makes an AUTH refused only
+  because its one `relay` tag named another relay send no replacement
+  challenge, and keeps the challenge it answered current, so a client that
+  names the right URL can still authenticate on that connection. The reply
+  and the `auth-required:` answer to later frames are unchanged. Without it, a
+  stock client that signs every challenge it is sent (nostr-sdk 0.45 does)
+  signed again at once with the same URL until the frame allowance closed the
+  connection, then reconnected and started over. Off by default.
+- `wokd` turns it on. A nostr-sdk client against a mismatched `url` now signs
+  once per connection, and a publish on that connection fails at the
+  client's own timeout instead of at once.
 
 ## 0.5.5 - 2026-11-12
 
