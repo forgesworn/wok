@@ -618,80 +618,147 @@ async fn a_reload_spares_a_socket_still_authenticating_and_drops_an_idle_removed
     server.stop().await;
 }
 
+/// The built `wokd` binary serving the configuration at `path`, its log read
+/// line by line. Killed if a test fails before stopping it.
+#[cfg(unix)]
+struct Daemon {
+    child: std::process::Child,
+    lines: std::sync::mpsc::Receiver<String>,
+    log: Vec<String>,
+    reader: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(unix)]
+impl Daemon {
+    fn start(path: &Path) -> Self {
+        use std::io::BufRead as _;
+        use std::process::{Command, Stdio};
+        let mut child = Command::new(env!("CARGO_BIN_EXE_wokd"))
+            .arg("--config")
+            .arg(path)
+            .env("NO_COLOR", "1")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let (line, lines) = std::sync::mpsc::channel();
+        let stdout = child.stdout.take().unwrap();
+        let reader = std::thread::spawn(move || {
+            for text in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = line.send(text);
+            }
+        });
+        Self {
+            child,
+            lines,
+            log: Vec::new(),
+            reader: Some(reader),
+        }
+    }
+
+    /// Send it `name`, such as `-HUP`.
+    fn signal(&self, name: &str) {
+        let sent = std::process::Command::new("kill")
+            .args([name, &self.child.id().to_string()])
+            .status()
+            .unwrap();
+        assert!(sent.success(), "kill {name}");
+    }
+
+    /// Read its log until a line contains `needle`, within ten seconds.
+    fn wait_for(&mut self, needle: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let text = self
+                .lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no log line with {needle:?} in: {:#?}", self.log));
+            let found = text.contains(needle);
+            self.log.push(text);
+            if found {
+                return;
+            }
+        }
+    }
+
+    /// Stop it with SIGTERM, which it must still be running to take, and
+    /// return its whole log once it has exited cleanly.
+    fn stop(mut self) -> String {
+        assert!(self.child.try_wait().unwrap().is_none(), "still running");
+        self.signal("-TERM");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "wokd stops on SIGTERM"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(status.success(), "{status}");
+        if let Some(reader) = self.reader.take() {
+            reader.join().unwrap();
+        }
+        self.log.extend(self.lines.try_iter());
+        self.log.join("\n")
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// A port nothing listens on, for a configuration's `listen`.
+#[cfg(unix)]
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Authenticate as `keys` once the binary at `url` listens.
+#[cfg(unix)]
+async fn member_once_listening(url: &str, keys: &Keys) -> Socket {
+    for _ in 0..250 {
+        if let Ok((mut socket, _)) = tokio_tungstenite::connect_async(url).await {
+            let challenge = receive(&mut socket).await;
+            let challenge = challenge[1].as_str().unwrap().to_owned();
+            assert_eq!(auth(&mut socket, url, &challenge, keys).await[2], true);
+            return socket;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("wokd never listened on {url}");
+}
+
 /// The binary itself: SIGHUP reloads the file, a bad file changes nothing,
 /// SIGHUP does not stop it, and no key reaches its log.
 #[cfg(unix)]
 #[test]
 fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
-    use std::io::BufRead as _;
-    use std::process::{Command, Stdio};
-
-    struct Child(std::process::Child);
-    impl Drop for Child {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let signal = |name: &str, pid: u32| {
-        let sent = Command::new("kill")
-            .args([name, &pid.to_string()])
-            .status()
-            .unwrap();
-        assert!(sent.success(), "kill {name}");
-    };
-
     let tmp = TempDir::new().unwrap();
     let data = tmp.path().join("data");
     let path = tmp.path().join("wokd.toml");
     let (alice, bob) = (Keys::generate(), Keys::generate());
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let port = free_port();
     let url = format!("ws://127.0.0.1:{port}{PATH}");
     let write = |text: String| {
         std::fs::write(&path, format!("listen = \"127.0.0.1:{port}\"\n{text}")).unwrap();
     };
     write(config_text(&data, &[&alice], &url, ""));
-
-    let mut child = Child(
-        Command::new(env!("CARGO_BIN_EXE_wokd"))
-            .arg("--config")
-            .arg(&path)
-            .env("NO_COLOR", "1")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap(),
-    );
-    let pid = child.0.id();
-    let (line, lines) = std::sync::mpsc::channel::<String>();
-    let stdout = child.0.stdout.take().unwrap();
-    let reader = std::thread::spawn(move || {
-        for text in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = line.send(text);
-        }
-    });
-    let mut log = Vec::new();
-    let mut wait_for = |needle: &str| {
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        loop {
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let text = lines
-                .recv_timeout(left)
-                .unwrap_or_else(|_| panic!("no log line with {needle:?} in: {log:#?}"));
-            let found = text.contains(needle);
-            log.push(text);
-            if found {
-                return;
-            }
-        }
-    };
+    let mut daemon = Daemon::start(&path);
 
     let client = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -699,22 +766,7 @@ fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
         .unwrap();
     let secret = alice.secret_key().to_bech32().unwrap();
     client.block_on(async {
-        let mut tries = 0;
-        let mut alice_socket = loop {
-            match tokio_tungstenite::connect_async(&url).await {
-                Ok((mut socket, _)) => {
-                    let challenge = receive(&mut socket).await;
-                    let challenge = challenge[1].as_str().unwrap().to_owned();
-                    assert_eq!(auth(&mut socket, &url, &challenge, &alice).await[2], true);
-                    break socket;
-                }
-                Err(_) if tries < 250 => {
-                    tries += 1;
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(error) => panic!("wokd never listened: {error}"),
-            }
-        };
+        let mut alice_socket = member_once_listening(&url, &alice).await;
         assert!(
             query(&mut alice_socket, json!({"kinds": [1]}))
                 .await
@@ -727,8 +779,8 @@ fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
             config_text(&data, &[&bob], &url, "")
                 .replace(&bob.public_key().to_bech32().unwrap(), &secret),
         );
-        signal("-HUP", pid);
-        wait_for("reload refused");
+        daemon.signal("-HUP");
+        daemon.wait_for("reload refused");
         send(&mut alice_socket, json!(["COUNT", "c", {"kinds": [1]}])).await;
         let counted = receive(&mut alice_socket).await;
         assert_eq!(counted[0], "COUNT", "still a member: {counted}");
@@ -740,7 +792,7 @@ fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
             &url,
             "relay_information = false",
         ));
-        signal("-HUP", pid);
+        daemon.signal("-HUP");
         let (frames, code) = until_closed(&mut alice_socket).await;
         assert_eq!(frames.len(), 1, "{frames:?}");
         assert_eq!(frames[0][0], "CLOSED");
@@ -749,27 +801,11 @@ fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
         let stored = note(&bob, "after SIGHUP");
         assert_eq!(publish(&mut bob_socket, &stored).await[2], true);
     });
-    wait_for("membership changed");
-    wait_for("relay_information");
+    daemon.wait_for("membership changed");
+    daemon.wait_for("relay_information");
 
     // SIGHUP did not stop it; SIGTERM does, cleanly.
-    assert!(child.0.try_wait().unwrap().is_none(), "still running");
-    signal("-TERM", pid);
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.0.try_wait().unwrap() {
-            break status;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "wokd stops on SIGTERM"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    };
-    assert!(status.success(), "{status}");
-    reader.join().unwrap();
-    log.extend(lines.try_iter());
-    let log = log.join("\n");
+    let log = daemon.stop();
     for key in [
         secret,
         alice.public_key().to_bech32().unwrap(),
@@ -778,6 +814,59 @@ fn sighup_reloads_the_members_and_a_bad_file_changes_nothing() {
         bob.public_key().to_hex(),
     ] {
         assert!(!log.contains(&key), "a key in the log:\n{log}");
+    }
+}
+
+/// The binary itself: an AUTH naming another relay URL is refused as any bad
+/// AUTH is, and the log says so at once, in a count, repeating nothing the
+/// client sent.
+#[cfg(unix)]
+#[test]
+fn an_auth_naming_another_url_is_logged_at_once_without_what_it_named() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("wokd.toml");
+    let alice = Keys::generate();
+    let port = free_port();
+    let url = format!("ws://127.0.0.1:{port}{PATH}");
+    std::fs::write(
+        &path,
+        format!(
+            "listen = \"127.0.0.1:{port}\"\n{}",
+            config_text(&tmp.path().join("data"), &[&alice], &url, "")
+        ),
+    )
+    .unwrap();
+    let mut daemon = Daemon::start(&path);
+    let client = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    client.block_on(async {
+        // Naming `url` raises nothing.
+        let _member = member_once_listening(&url, &alice).await;
+        let (mut stray, challenge) = connect(&url).await;
+        let refused = auth(
+            &mut stray,
+            "wss://elsewhere.example/events",
+            &challenge,
+            &alice,
+        )
+        .await;
+        assert_eq!(refused[2], false, "{refused}");
+        assert_eq!(
+            refused[3],
+            "invalid: authentication challenge, relay, time or signature"
+        );
+    });
+    daemon.wait_for("AUTH named a relay URL other than `url`");
+    let log = daemon.stop();
+    assert!(log.contains("attempts=1"), "{log}");
+    for sent in [
+        "elsewhere.example".to_owned(),
+        alice.public_key().to_bech32().unwrap(),
+        alice.public_key().to_hex(),
+    ] {
+        assert!(!log.contains(&sent), "{sent} in the log:\n{log}");
     }
 }
 

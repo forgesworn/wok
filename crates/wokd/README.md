@@ -40,7 +40,11 @@ secret key as exposed.
 `wokd` serves plain `ws://`. For clients on other machines, put a TLS proxy
 in front and set `url` to the `wss://` address clients use; their AUTH must
 name it, and its path must be `/events`. The proxy, its certificates and its
-logs are yours.
+logs are yours. A client that names another address (the one behind the
+proxy, or the host without its port) is refused, and `wokd` logs a warning
+that AUTH named a relay URL other than `url`, with a count and nothing the
+client sent. Anyone who can connect can cause that warning, so it points at
+`url` only when your members' clients are the ones failing.
 
 Several groups means one instance each.
 

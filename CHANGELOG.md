@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- `wok-store`: `EventRelay::auth_relay_mismatches` counts the AUTH events
+  refused only because their one `relay` tag named another relay URL than
+  the session's, with the kind, signature, time and challenge all good. The
+  refusal a client gets is unchanged. The count is taken before any access
+  check, so anyone who can open a socket can raise it.
+- `wokd` logs a warning when that count rises: at once, then at most once a
+  minute, with the number of attempts and nothing a client sent. A `url` that
+  is not the address clients connect to used to show only as every client
+  failing AUTH.
+
 ## 0.5.5 - 2026-11-12
 
 - `wokd` reloads its members on SIGHUP, without a restart. A removed key's
