@@ -17,7 +17,8 @@ max_store_bytes = 1073741824
 min_free_bytes = 268435456
 
 # The group: public keys (npub) only. Every member reads everything the
-# group stores. A change takes a restart.
+# group stores. SIGHUP applies a change without a restart; every other
+# setting takes one.
 members = [
   # "npub1...",
 ]

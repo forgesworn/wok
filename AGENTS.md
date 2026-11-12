@@ -36,8 +36,8 @@ crates/
     src/lib.rs     - Door: the WebSocket doors, their budgets, Admission
   wok-bench/       - store-level baseline benchmark (not published)
   wokd/
-    src/lib.rs     - Config, Members, PerAddress, run/serve, remove
-    src/main.rs    - the wokd command line
+    src/lib.rs     - Config, Members, PerAddress, run/serve, reload, remove
+    src/main.rs    - the wokd command line and its SIGHUP reload
     README.md      - what an operator runs and owes
 ```
 

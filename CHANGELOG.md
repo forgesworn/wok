@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- `wokd` reloads its members on SIGHUP, without a restart. A removed key's
+  open subscriptions are closed with `CLOSED` and then its connection, and
+  it is refused from then on; an added key can authenticate. A file that
+  cannot be read or does not pass the checks changes nothing. Every other
+  setting still takes a restart, and a reload that changes one says so in
+  the log. SIGHUP no longer stops `wokd`: stop it with SIGTERM or Ctrl-C. On
+  Windows there is no SIGHUP, and a change of members takes a restart.
+- `wokd` library: `run` and `serve` take a channel of reloaded
+  configurations, `reload` applies one, and `Members::replace` swaps the
+  group and announces the change to open connections.
+
 ## 0.5.4 - 2026-11-11
 
 - `wok-ws`: `Door::sheltered_router_with_information` is the sheltered door

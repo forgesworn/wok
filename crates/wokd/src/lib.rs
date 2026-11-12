@@ -7,14 +7,17 @@
 //! served, and the listener binds to loopback unless the operator says
 //! otherwise.
 //!
-//! Membership is read from the configuration at start: adding or removing a
-//! key takes a restart. Several groups means one instance each.
+//! Membership is read from the configuration at start, and again whenever
+//! [`serve`] is handed a reloaded configuration (the binary reloads on
+//! SIGHUP). A removed key loses its open subscriptions and its connection;
+//! every other setting takes a restart. Several groups means one instance
+//! each.
 
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use axum::extract::ConnectInfo;
@@ -25,7 +28,7 @@ use nostr::key::PublicKey;
 use nostr::nips::nip19::FromBech32;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, mpsc, watch};
 use url::Url;
 use wok_store::relay::{EventRelay, KeeperAccess};
 use wok_store::{SqliteEventStore, StoreOptions, Visibility};
@@ -60,18 +63,76 @@ const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a shutdown waits for every socket to finish closing.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
-/// The group: the keys that may authenticate. Asked on every operation.
-pub struct Members(HashSet<PublicKey>);
+/// The group: the keys that may authenticate. Asked on every operation, and
+/// replaced whole on a reload ([`Members::replace`]).
+pub struct Members {
+    keys: RwLock<HashSet<PublicKey>>,
+    /// Moved after every change. The engine trusts a verdict it has checked
+    /// until this moves, so it must move after the swap, never before, and
+    /// live as long as the set does.
+    changes: watch::Sender<u64>,
+}
+
+/// What [`Members::replace`] changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemberChange {
+    /// Keys in the new set that were not in the old one.
+    pub added: usize,
+    /// Keys in the old set that are not in the new one.
+    pub removed: usize,
+    /// Keys in the set now.
+    pub members: usize,
+}
+
+impl MemberChange {
+    /// Whether the set is the same as before.
+    pub fn unchanged(&self) -> bool {
+        self.added == 0 && self.removed == 0
+    }
+}
 
 impl Members {
     pub fn new(keys: impl IntoIterator<Item = PublicKey>) -> Self {
-        Self(keys.into_iter().collect())
+        Self {
+            keys: RwLock::new(keys.into_iter().collect()),
+            changes: watch::channel(0).0,
+        }
+    }
+
+    /// Make `keys` the group. Any change is announced to open connections:
+    /// a removed key's subscriptions are closed with `CLOSED` and then its
+    /// connection, and nothing more is read or stored for it. Events it
+    /// stored or was sent stay where they are. An added key can
+    /// authenticate from then on, on any socket that has not yet
+    /// authenticated. The same set again announces nothing.
+    pub fn replace(&self, keys: impl IntoIterator<Item = PublicKey>) -> MemberChange {
+        let next: HashSet<PublicKey> = keys.into_iter().collect();
+        let change = {
+            let mut current = self.keys.write().expect("members");
+            let change = MemberChange {
+                added: next.difference(&current).count(),
+                removed: current.difference(&next).count(),
+                members: next.len(),
+            };
+            if !change.unchanged() {
+                *current = next;
+            }
+            change
+        };
+        if !change.unchanged() {
+            self.changes.send_modify(|generation| *generation += 1);
+        }
+        change
     }
 }
 
 impl KeeperAccess for Members {
     fn owns(&self, key: &PublicKey) -> bool {
-        self.0.contains(key)
+        self.keys.read().expect("members").contains(key)
+    }
+
+    fn subscribe(&self) -> Option<watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
     }
 }
 
@@ -296,9 +357,58 @@ pub enum RunError {
     Serve(std::io::Error),
 }
 
-/// Bind `config.listen` and serve until `shutdown` completes.
+/// What a reload did: the membership change, and the settings that differ
+/// from the ones the relay started with, which only a restart applies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reloaded {
+    pub members: MemberChange,
+    pub restart_only: Vec<&'static str>,
+}
+
+/// Apply `next`'s members, and name the settings in `next` that differ from
+/// `running` (the configuration the relay started with, so a setting still
+/// waiting for a restart is named on every reload).
+pub fn reload(running: &Config, members: &Members, next: Config) -> Reloaded {
+    let mut restart_only = Vec::new();
+    let mut differs = |field, changed: bool| {
+        if changed {
+            restart_only.push(field);
+        }
+    };
+    differs("listen", running.listen != next.listen);
+    differs("url", running.url != next.url);
+    differs("data_dir", running.data_dir != next.data_dir);
+    differs(
+        "max_store_bytes",
+        running.max_store_bytes != next.max_store_bytes,
+    );
+    differs(
+        "min_free_bytes",
+        running.min_free_bytes != next.min_free_bytes,
+    );
+    differs(
+        "sockets_per_address",
+        running.sockets_per_address != next.sockets_per_address,
+    );
+    differs(
+        "auth_deadline_secs",
+        running.auth_deadline != next.auth_deadline,
+    );
+    differs(
+        "relay_information",
+        running.relay_information != next.relay_information,
+    );
+    Reloaded {
+        members: members.replace(next.members),
+        restart_only,
+    }
+}
+
+/// Bind `config.listen` and serve until `shutdown` completes, taking each
+/// configuration `reloads` delivers as a reload ([`reload`]).
 pub async fn run(
     config: Config,
+    reloads: mpsc::Receiver<Config>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), RunError> {
     let listen = config.listen;
@@ -312,15 +422,17 @@ pub async fn run(
              though only members can authenticate"
         );
     }
-    serve(config, listener, shutdown).await
+    serve(config, listener, reloads, shutdown).await
 }
 
 /// Serve on `listener` until `shutdown` completes: open the store, sweep
-/// expired events every minute, and on shutdown close every socket and let
-/// the server drain.
+/// expired events every minute, apply each configuration `reloads` delivers
+/// ([`reload`]; a closed channel means no more reloads), and on shutdown
+/// close every socket and let the server drain.
 pub async fn serve(
     config: Config,
     listener: TcpListener,
+    mut reloads: mpsc::Receiver<Config>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> Result<(), RunError> {
     private_dir(&config.data_dir).map_err(RunError::DataDir)?;
@@ -343,11 +455,15 @@ pub async fn serve(
     .await
     .map_err(|error| RunError::Store(error.to_string()))?
     .map_err(|error| RunError::Store(error.to_string()))?;
-    let members = config.members.len();
+    let members = Arc::new(Members::new(config.members.iter().copied()));
+    let running = config.clone();
     // A non-member's refused AUTH is final: a stock client would otherwise
     // be sent a fresh challenge and sign it, over and over.
-    let relay = EventRelay::new(Arc::new(store), Arc::new(Members::new(config.members)))
-        .with_final_access_refusal();
+    let relay = EventRelay::new(
+        Arc::new(store),
+        Arc::clone(&members) as Arc<dyn KeeperAccess>,
+    )
+    .with_final_access_refusal();
     let defaults = Timings::default();
     let door = Door::with_timings(
         Arc::new(relay),
@@ -372,7 +488,29 @@ pub async fn serve(
             sweeper.expire().await;
         }
     });
-    tracing::info!(members, "wokd serving its members");
+    let reloader = tokio::spawn(async move {
+        while let Some(next) = reloads.recv().await {
+            // Counts and field names only: never a key.
+            let done = reload(&running, &members, next);
+            if done.members.unchanged() {
+                tracing::info!(
+                    members = done.members.members,
+                    "configuration reloaded; membership unchanged"
+                );
+            } else {
+                tracing::info!(
+                    members = done.members.members,
+                    added = done.members.added,
+                    removed = done.members.removed,
+                    "configuration reloaded; membership changed"
+                );
+            }
+            for field in done.restart_only {
+                tracing::warn!(field, "changed, but only a restart applies it");
+            }
+        }
+    });
+    tracing::info!(members = config.members.len(), "wokd serving its members");
     let stopping = door.clone();
     // A reply is one small frame; do not let Nagle hold it back.
     let listener = listener.tap_io(|stream| {
@@ -399,6 +537,7 @@ pub async fn serve(
         tracing::warn!(left, "sockets still open at the end of the shutdown grace");
     }
     expiry.abort();
+    reloader.abort();
     tracing::info!("wokd stopped");
     served.map_err(RunError::Serve)
 }
@@ -685,6 +824,79 @@ mod tests {
             .map(|port| admission.admit(&from(&format!("127.0.0.1:{}", 2000 + port))))
             .collect();
         assert!(local.iter().all(Result::is_ok));
+    }
+
+    #[test]
+    fn a_replaced_set_is_announced_after_the_swap_and_the_same_set_is_not() {
+        let (alice, bob, carol) = (Keys::generate(), Keys::generate(), Keys::generate());
+        let members = Members::new([alice.public_key(), bob.public_key()]);
+        let mut changes = members.subscribe().expect("wokd's members signal changes");
+        assert!(members.owns(&alice.public_key()));
+
+        // One key for another: the count stays, the set does not.
+        let change = members.replace([alice.public_key(), carol.public_key()]);
+        assert_eq!(
+            change,
+            MemberChange {
+                added: 1,
+                removed: 1,
+                members: 2
+            }
+        );
+        assert!(changes.has_changed().unwrap(), "a swap is announced");
+        changes.mark_unchanged();
+        assert!(!members.owns(&bob.public_key()));
+        assert!(members.owns(&carol.public_key()));
+
+        let same = members.replace([carol.public_key(), alice.public_key()]);
+        assert!(same.unchanged(), "{same:?}");
+        assert!(!changes.has_changed().unwrap(), "the same set is not");
+
+        let removed = members.replace([carol.public_key()]);
+        assert_eq!((removed.added, removed.removed), (0, 1));
+        assert!(changes.has_changed().unwrap());
+        assert!(!members.owns(&alice.public_key()));
+    }
+
+    #[test]
+    fn a_reload_names_every_setting_only_a_restart_applies() {
+        let (alice, bob) = (Keys::generate(), Keys::generate());
+        let running = Config::from_toml(&file(&format!("\"{}\"", npub(&alice)), "")).unwrap();
+        let members = Members::new(running.members.iter().copied());
+
+        let next = Config::from_toml(&file(&format!("\"{}\"", npub(&bob)), "")).unwrap();
+        let done = reload(&running, &members, next);
+        assert!(done.restart_only.is_empty(), "{done:?}");
+        assert_eq!((done.members.added, done.members.removed), (1, 1));
+        assert!(members.owns(&bob.public_key()));
+
+        let changed = file(
+            &format!("\"{}\"", npub(&bob)),
+            "listen = \"127.0.0.1:7448\"\nsockets_per_address = 2\nauth_deadline_secs = 30\n\
+             relay_information = false",
+        )
+        .replace(
+            "ws://relay.example:7447/events",
+            "wss://relay.example/events",
+        )
+        .replace("/tmp/wokd", "/tmp/elsewhere")
+        .replace("max_store_bytes = 1000000", "max_store_bytes = 2000000")
+        .replace("min_free_bytes = 0", "min_free_bytes = 1");
+        let done = reload(&running, &members, Config::from_toml(&changed).unwrap());
+        assert_eq!(
+            done.restart_only,
+            vec![
+                "listen",
+                "url",
+                "data_dir",
+                "max_store_bytes",
+                "min_free_bytes",
+                "sockets_per_address",
+                "auth_deadline_secs",
+                "relay_information",
+            ]
+        );
+        assert!(done.members.unchanged());
     }
 
     #[test]

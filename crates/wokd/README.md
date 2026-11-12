@@ -42,8 +42,37 @@ in front and set `url` to the `wss://` address clients use; their AUTH must
 name it, and its path must be `/events`. The proxy, its certificates and its
 logs are yours.
 
-Membership is read at start: adding or removing a key takes a restart.
 Several groups means one instance each.
+
+## Changing the members
+
+Edit `members` and send `wokd` SIGHUP (`kill -HUP <pid>`; under systemd,
+`ExecReload=kill -HUP $MAINPID`). It reads the file again and applies the
+new list without a restart:
+
+- A removed key's open subscriptions are closed with `CLOSED`
+  (`restricted: sheltered authority changed`), then its connection. Nothing
+  more is read or stored for it, and it is refused if it comes back. What it
+  stored stays in the store, and what it was sent stays with its clients;
+  `wokd remove` is for the first.
+- An added key can authenticate, on a new connection or on one that had not
+  yet authenticated. A client that key used before the reload was refused
+  and, as stock clients do, will not try again on that connection: it needs
+  to reconnect.
+- Members on both lists are not disturbed.
+- A file that cannot be read or does not pass the checks changes nothing.
+  The error is logged, without repeating a key.
+
+SIGHUP gives no answer of its own, so check the log after a reload,
+especially after removing someone: `membership changed`, with the counts
+added and removed, means the new list is in force; `reload refused` means
+the old one still is.
+- Every other setting takes a restart. A reload that changes one says so in
+  the log and goes on as before.
+
+SIGHUP does not stop `wokd`, so closing the terminal it runs in leaves it
+running; stop it with SIGTERM or Ctrl-C. On Windows there is no SIGHUP, and
+a change of members takes a restart.
 
 ## What members and the operator can see
 
@@ -74,7 +103,8 @@ wokd remove --config wokd.toml --author <npub>
   new event. The store does not record which member sent an event, so
   finding who stores such copies is up to you.
 - `--author` removes what that key has signed so far, not what it signs
-  later; to stop a member, take the key out of `members` and restart.
+  later; to stop a member, take the key out of `members` and reload or
+  restart.
 - An id that is not stored is reported, and the command exits 3. Nothing can
   be barred for it.
 - It clears this store only. Backups, your proxy's logs and members' own
