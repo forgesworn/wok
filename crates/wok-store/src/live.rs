@@ -113,10 +113,20 @@ impl LiveEvent {
 /// `["EVENT","<subscription>",<json>]`, with the event's JSON spliced in as
 /// it is and the subscription id escaped as a JSON string.
 pub(crate) fn event_frame(subscription: &str, json: &str) -> String {
-    let id = Value::from(subscription).to_string();
-    let mut frame = String::with_capacity(json.len() + id.len() + 12);
+    escaped_event_frame(&escaped_subscription(subscription), json)
+}
+
+/// The subscription id as a JSON string, for [`escaped_event_frame`].
+pub(crate) fn escaped_subscription(subscription: &str) -> String {
+    Value::from(subscription).to_string()
+}
+
+/// [`event_frame`] with the subscription id already escaped by
+/// [`escaped_subscription`], so a reply of many events escapes it once.
+pub(crate) fn escaped_event_frame(escaped: &str, json: &str) -> String {
+    let mut frame = String::with_capacity(json.len() + escaped.len() + 12);
     frame.push_str("[\"EVENT\",");
-    frame.push_str(&id);
+    frame.push_str(escaped);
     frame.push(',');
     frame.push_str(json);
     frame.push(']');

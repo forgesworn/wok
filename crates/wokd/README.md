@@ -127,6 +127,11 @@ instance suits: 32 connections in all, 120 frames a minute for each, at most
 client is, and the connection budget and the AUTH deadline are what hold
 strangers back.
 
+The relay runs on 2 worker threads (`workers`) rather than one per core,
+with its store's work on threads of its own. On Linux with glibc it caps
+the allocator at 2 arenas at start-up, unless `MALLOC_ARENA_MAX` is already
+set in its environment, in which case that value stands.
+
 ## Your responsibilities
 
 Running a relay can bring legal duties. They depend on who your members are

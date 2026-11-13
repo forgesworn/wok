@@ -1,5 +1,59 @@
 # Changelog
 
+## Unreleased
+
+- `wok-store`: schema version 5. It is version 4 with one more index,
+  `events_kind` on `(visibility, kind, created_at, id)`, so a filter that
+  names one kind reads that kind newest first instead of walking the whole
+  partition in time order. A filter with several kinds keeps the time walk.
+  A NIP-45 count that names ids now always counts them from the id index, as
+  the query path already did.
+- A version 4 store, Bothy's included, is upgraded at its first open with
+  this build: the index is built, reading every event once and growing the
+  file by a few per cent, and the store is marked version 5 only once the
+  index is there, so an open stopped part way leaves it at 4 for the next
+  open to finish. `wokd`'s first start on a version 4 store takes longer for
+  this, in proportion to the events held. A version 5 store is refused
+  (`NewerSchema`) by every earlier build, current Bothy builds included.
+  Going back is `export_stored` with this build, which reads either version,
+  and an import with the older one.
+- `wok-store`: `EventStore::query_stored_each` hands a query's rows to a
+  callback as they are read, newest first and then by id, until it answers
+  `false`. Its default is built on `query_stored`, so other implementations
+  compile unchanged; `SqliteEventStore` steps its statement row by row.
+- `wok-store`: `RelaySession::begin_prepared_streaming` answers a `REQ` with
+  one filter by handing each EVENT frame to a sink as its row is read, and
+  every other frame as `begin_prepared` does. The reader's authority is
+  judged before the query and again after it. Frames already handed over
+  cannot be withdrawn; a loss of authority during the query turns the EOSE
+  into a CLOSED. `PreparedFrame::is_req_frame` says which frames it may
+  stream.
+- `wok-ws`: a one-filter REQ whose events pass 16 KiB is streamed, each event
+  sent as the store reads it, and the work permit is released before the
+  rest is written. A smaller page is still answered whole with its EOSE. A
+  member removed while a streamed page is being read may receive part of it
+  before the CLOSED, where a buffered page is withheld entirely. Each batch
+  written, rather than the whole page, has the I/O timeout to reach the peer
+  before the connection ends as stalled.
+- `wok-store`: the checkpoint thread starts a PASSIVE checkpoint at most
+  every 250 ms instead of every 50 ms, so the main file's sync holds up a
+  busy writer's commits less often. Durability is unchanged. A deletion's
+  follow-up pass can wait that long behind one already running.
+- `wok-store`: `StoredEvent::from_stored` reads a row in the layout the
+  store writes without serde, and leaves every other row to the serde
+  check as before; differential tests hold it to that check.
+- `wokd` runs on 2 runtime worker threads, set by a new `workers` setting,
+  instead of tokio's one per core. A change takes a restart, and a reload
+  names it as one.
+- `wokd` gives its store a 256 KiB writer page cache instead of the server
+  profile's 1 MiB. `StoreOptions::server()` itself is unchanged.
+- `wokd` caps glibc's malloc arenas at 2 at start-up on Linux, unless
+  `MALLOC_ARENA_MAX` is set in its environment. It adds a `libc` dependency
+  on that target only.
+- `wok-bench` gains a `relay` command: it exports a common corpus, seeds Wok
+  and drives query, write and fan-out workloads against remote Nostr relays
+  over WebSocket.
+
 ## 0.5.6 - 2026-11-12
 
 - `wok-store`: `EventRelay::auth_relay_mismatches` counts the AUTH events

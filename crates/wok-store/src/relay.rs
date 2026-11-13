@@ -21,13 +21,15 @@ use nostr::key::{Keys, PublicKey};
 use serde_json::{Value, json};
 use url::Url;
 
-use crate::live::{LIVE_QUEUE_BYTES, LIVE_TOTAL_BYTES, LiveFanout, event_frame};
+use crate::live::{
+    LIVE_QUEUE_BYTES, LIVE_TOTAL_BYTES, LiveFanout, escaped_event_frame, escaped_subscription,
+};
 pub use crate::live::{LiveEvent, LiveReceiver, LiveRecvError, LiveTryRecvError};
 pub use crate::writer::Cancel as WriteCancel;
 use crate::writer::{EventWriter, Reserved, WriterLimits};
 use crate::{
     EventStore, EventStoreError, MAX_EVENT_BYTES, MAX_EXACT_COUNT, MAX_QUERY_EVENTS, PreparedPut,
-    PutOutcome, PutResult, Recheck, Visibility, single_d_value,
+    PutOutcome, PutResult, Recheck, StoredEvent, Visibility, single_d_value,
 };
 
 pub const MAX_RELAY_FRAME_BYTES: usize = MAX_EVENT_BYTES + 1024;
@@ -1307,6 +1309,12 @@ impl PreparedFrame {
         self.event.is_some()
     }
 
+    /// Whether the frame's first element is literally `"REQ"`: the frames
+    /// [`RelaySession::begin_prepared_streaming`] may stream.
+    pub fn is_req_frame(&self) -> bool {
+        self.event.is_none() && frame_head(&self.text).starts_with("\"REQ\"")
+    }
+
     /// Whether the frame parsed as an EVENT whose signature failed.
     pub fn has_bad_signature(&self) -> bool {
         self.event.as_ref().is_some_and(|event| !event.signature_ok)
@@ -1410,6 +1418,168 @@ fn fresh_challenge(previous: Option<&str>) -> String {
         if previous != Some(challenge.as_str()) {
             return challenge;
         }
+    }
+}
+
+/// Whether `events` run strictly newest first and then by id, the order the
+/// merge in a `REQ` keys them by, which also means no id appears twice.
+fn newest_first(events: &[StoredEvent]) -> bool {
+    events.windows(2).all(|pair| {
+        (std::cmp::Reverse(pair[0].created_at), &pair[0].id)
+            < (std::cmp::Reverse(pair[1].created_at), &pair[1].id)
+    })
+}
+
+/// What a `REQ` is once its frame has been admitted and its filters parsed.
+struct ReqSetup<'a> {
+    id: &'a str,
+    filters: Vec<Filter>,
+    raw_filters: &'a [Value],
+}
+
+impl RelaySession {
+    /// The steps of a `REQ` before any store work: the subscription id, the
+    /// authority and bound checks, and the filters. `Err` carries the replies
+    /// that refuse it.
+    fn request_setup<'a>(
+        &mut self,
+        parts: &'a [Value],
+        now: u64,
+    ) -> Result<ReqSetup<'a>, Vec<String>> {
+        let Some(id) = subscription_id(&parts[1]) else {
+            return Err(vec![notice("invalid: subscription id")]);
+        };
+        // A rejected replacement must not leave the old subscription active.
+        self.subscriptions.remove(id);
+        if !self.can_read_at(now) {
+            return Err(vec![closed(id, self.refusal())]);
+        }
+        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS || parts.len() - 2 > MAX_FILTERS {
+            return Err(vec![closed(
+                id,
+                "restricted: too many subscriptions or filters",
+            )]);
+        }
+        let raw_filters = &parts[2..];
+        let mut filters = Vec::new();
+        let guest_scopes = self.guest_scopes(now);
+        for raw in raw_filters {
+            if let Some(fault) = filter_fault(raw) {
+                return Err(vec![closed(id, fault)]);
+            }
+            if let Some(scopes) = &guest_scopes
+                && !guest_filter_allowed(raw, scopes)
+            {
+                return Err(vec![closed(
+                    id,
+                    "restricted: filter is outside the circle grant",
+                )]);
+            }
+            let Ok(filter) = serde_json::from_value::<Filter>(raw.clone()) else {
+                return Err(vec![closed(id, "invalid: filter")]);
+            };
+            filters.push(filter);
+        }
+        Ok(ReqSetup {
+            id,
+            filters,
+            raw_filters,
+        })
+    }
+
+    /// [`Self::request`] for a single filter, with each EVENT frame handed to
+    /// `sink` as its row is read. The returned replies are what follows them.
+    ///
+    /// Differences from `request`, each forced by sending rows before the
+    /// query ends:
+    /// - a guest's scopes are read before the query, not after it, and apply
+    ///   to every row;
+    /// - authority is judged after the query as well, but a loss then can only
+    ///   refuse the rest: frames already sent stay sent;
+    /// - an error part way leaves the rows before it sent, then the CLOSED.
+    fn request_streaming(
+        &mut self,
+        parts: &[Value],
+        now: u64,
+        sink: &mut dyn FnMut(String),
+    ) -> Vec<String> {
+        let ReqSetup {
+            id,
+            filters,
+            raw_filters,
+        } = match self.request_setup(parts, now) {
+            Ok(setup) => setup,
+            Err(replies) => return replies,
+        };
+        debug_assert_eq!(filters.len(), 1);
+        let guest_scopes = self.guest_scopes(now);
+        let escaped = escaped_subscription(id);
+        let mut bytes = 0;
+        let mut rows = 0;
+        let mut previous: Option<(u64, String)> = None;
+        let mut disordered = false;
+        let result =
+            self.relay
+                .store
+                .query_stored_each(self.visibility, &filters[0], now, &mut |event| {
+                    if rows == MAX_QUERY_EVENTS {
+                        return false;
+                    }
+                    rows += 1;
+                    // The buffered path sends a lone filter's rows only if they run
+                    // strictly newest first and then by id (`newest_first`), and
+                    // merges them otherwise. A stream cannot merge, so
+                    // `query_stored_each` promises that order, and a row that
+                    // breaks it is a store fault that ends the page.
+                    match &mut previous {
+                        Some((at, last))
+                            if (std::cmp::Reverse(*at), last.as_str())
+                                >= (std::cmp::Reverse(event.created_at), event.id.as_str()) =>
+                        {
+                            disordered = true;
+                            return false;
+                        }
+                        Some((at, last)) => {
+                            *at = event.created_at;
+                            last.clear();
+                            last.push_str(&event.id);
+                        }
+                        None => previous = Some((event.created_at, event.id.clone())),
+                    }
+                    if let Some(scopes) = &guest_scopes
+                        && !guest_readable(event.kind, event.room.as_deref(), scopes)
+                    {
+                        return true;
+                    }
+                    let reply = escaped_event_frame(&escaped, &event.json);
+                    if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
+                        return false;
+                    }
+                    bytes += reply.len();
+                    sink(reply);
+                    true
+                });
+        match result {
+            Ok(()) if !disordered => {}
+            Err(EventStoreError::Query) => return vec![closed(id, TOO_LARGE)],
+            _ => return vec![closed(id, "error: stored events unavailable")],
+        }
+        if !self.can_read_at(now) {
+            return vec![closed(id, self.refusal())];
+        }
+        let guest_scopes = self.guest_scopes(now);
+        if let Some(scopes) = &guest_scopes
+            && raw_filters
+                .iter()
+                .any(|raw| !guest_filter_allowed(raw, scopes))
+        {
+            return vec![closed(
+                id,
+                "restricted: authority changed during the request",
+            )];
+        }
+        self.subscriptions.insert(id.to_string(), filters);
+        vec![frame(json!(["EOSE", id]))]
     }
 }
 
@@ -1674,6 +1844,28 @@ impl RelaySession {
         }
     }
 
+    /// [`Self::begin_prepared`], except that a `REQ` with exactly one filter
+    /// hands each EVENT frame to `sink` as its row is read, and the returned
+    /// replies hold only what follows them (the EOSE, or a CLOSED). Every
+    /// other frame is answered as `begin_prepared` answers it, with nothing
+    /// sent to `sink`.
+    ///
+    /// Unlike the buffered path, the reader's authority is judged before the
+    /// query, and a guest's scopes are those read then: frames already handed
+    /// to `sink` cannot be withdrawn. The authority is judged again after the
+    /// query, and a loss turns the final replies into the refusal.
+    pub fn begin_prepared_streaming(
+        &mut self,
+        prepared: PreparedFrame,
+        now: u64,
+        sink: &mut dyn FnMut(String),
+    ) -> Handled {
+        match prepared.event {
+            Some(_) => self.begin_prepared(prepared, now),
+            None => self.dispatch_with(&prepared.text, now, Some(sink)),
+        }
+    }
+
     /// A CLOSE frame, already admitted, answered on the caller's thread: it
     /// needs no store, no authority check and no work permit, and only removes
     /// a subscription. `None` for any other frame, and for a CLOSE frame
@@ -1714,6 +1906,17 @@ impl RelaySession {
 
     /// [`Self::handle_admitted`] up to the store write.
     fn dispatch(&mut self, text: &str, now: u64) -> Handled {
+        self.dispatch_with(text, now, None)
+    }
+
+    /// [`Self::dispatch`], with an optional frame sink for a single-filter
+    /// `REQ` (see [`Self::begin_prepared_streaming`]).
+    fn dispatch_with(
+        &mut self,
+        text: &str,
+        now: u64,
+        sink: Option<&mut dyn FnMut(String)>,
+    ) -> Handled {
         if text.len() > MAX_RELAY_FRAME_BYTES {
             return Handled::Replies(vec![notice("restricted: frame too large")]);
         }
@@ -1726,6 +1929,9 @@ impl RelaySession {
         let replies = match parts.first().and_then(Value::as_str) {
             Some("AUTH") if parts.len() == 2 => self.authenticate(&parts[1], now),
             Some("EVENT") if parts.len() == 2 => return self.publish(&parts[1], now),
+            Some("REQ") if parts.len() == 3 && sink.is_some() => {
+                self.request_streaming(parts, now, sink.unwrap())
+            }
             Some("REQ") if parts.len() >= 3 => self.request(parts, now),
             Some("COUNT") if parts.len() >= 3 => self.count(parts, now),
             Some(verb @ ("REQ" | "COUNT")) if parts.len() == 2 => {
@@ -2005,54 +2211,42 @@ impl RelaySession {
     }
 
     fn request(&mut self, parts: &[Value], now: u64) -> Vec<String> {
-        let Some(id) = subscription_id(&parts[1]) else {
-            return vec![notice("invalid: subscription id")];
+        let ReqSetup {
+            id,
+            filters,
+            raw_filters,
+        } = match self.request_setup(parts, now) {
+            Ok(setup) => setup,
+            Err(replies) => return replies,
         };
-        // A rejected replacement must not leave the old subscription active.
-        self.subscriptions.remove(id);
-        if !self.can_read_at(now) {
-            return vec![closed(id, self.refusal())];
-        }
-        if self.subscriptions.len() >= MAX_SUBSCRIPTIONS || parts.len() - 2 > MAX_FILTERS {
-            return vec![closed(id, "restricted: too many subscriptions or filters")];
-        }
-        let raw_filters = &parts[2..];
-        let mut filters = Vec::new();
-        let guest_scopes = self.guest_scopes(now);
-        for raw in raw_filters {
-            if let Some(fault) = filter_fault(raw) {
-                return vec![closed(id, fault)];
-            }
-            if let Some(scopes) = &guest_scopes
-                && !guest_filter_allowed(raw, scopes)
-            {
-                return vec![closed(id, "restricted: filter is outside the circle grant")];
-            }
-            let Ok(filter) = serde_json::from_value::<Filter>(raw.clone()) else {
-                return vec![closed(id, "invalid: filter")];
-            };
-            filters.push(filter);
-        }
-        // Each event as stored, keyed newest first and then by id, as the
-        // built events were: lowercase hex orders as the id's bytes do.
-        let mut found = BTreeMap::new();
+        // Each event as stored, newest first and then by id, as the built
+        // events were: lowercase hex orders as the id's bytes do.
+        let mut found = Vec::new();
+        let mut merged = BTreeMap::new();
         for filter in &filters {
-            match self.relay.store.query_stored(self.visibility, filter, now) {
-                Ok(events) => {
-                    for event in events {
-                        found.insert(
-                            (std::cmp::Reverse(event.created_at), event.id.clone()),
-                            event,
-                        );
-                        if found.len() > MAX_QUERY_EVENTS {
-                            found.pop_last();
-                        }
-                    }
-                }
+            let events = match self.relay.store.query_stored(self.visibility, filter, now) {
+                Ok(events) => events,
                 Err(EventStoreError::Query) => return vec![closed(id, TOO_LARGE)],
                 Err(_) => return vec![closed(id, "error: stored events unavailable")],
+            };
+            // A lone filter's rows already in that order, each id once, are
+            // what the merge would make of them; anything else is merged.
+            if filters.len() == 1 && newest_first(&events) {
+                found = events;
+                found.truncate(MAX_QUERY_EVENTS);
+                continue;
+            }
+            for event in events {
+                merged.insert(
+                    (std::cmp::Reverse(event.created_at), event.id.clone()),
+                    event,
+                );
+                if merged.len() > MAX_QUERY_EVENTS {
+                    merged.pop_last();
+                }
             }
         }
+        found.extend(merged.into_values());
         if !self.can_read_at(now) {
             return vec![closed(id, self.refusal())];
         }
@@ -2072,7 +2266,8 @@ impl RelaySession {
         }
         let mut bytes = 0;
         let mut replies = Vec::new();
-        for event in found.into_values() {
+        let escaped = escaped_subscription(id);
+        for event in found {
             // The same rule as `guest_event_readable`, on the kind and room
             // read from the stored JSON.
             if let Some(scopes) = &guest_scopes
@@ -2081,7 +2276,7 @@ impl RelaySession {
                 continue;
             }
             // The stored JSON, spliced as a live frame is.
-            let reply = event_frame(id, &event.json);
+            let reply = escaped_event_frame(&escaped, &event.json);
             if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
                 break;
             }
@@ -2734,6 +2929,331 @@ mod tests {
     fn auth(session: &mut RelaySession, key: &Keys) {
         let e = auth_event(session, key);
         assert_eq!(send(session, json!(["AUTH", e]))[0][2], true);
+    }
+
+    /// A store that answers every query backwards and with each event twice,
+    /// as a store other than SQLite's may.
+    struct Shuffled(SqliteEventStore);
+    impl EventStore for Shuffled {
+        fn put(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.0.put(v, e, n)
+        }
+        fn query(
+            &self,
+            v: Visibility,
+            f: &nostr::filter::Filter,
+            n: u64,
+        ) -> Result<Vec<Event>, EventStoreError> {
+            let mut events = self.0.query(v, f, n)?;
+            events.reverse();
+            events.extend(events.clone());
+            Ok(events)
+        }
+        fn logical_bytes(&self) -> Result<u64, EventStoreError> {
+            self.0.logical_bytes()
+        }
+        fn put_replicated(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.0.put_replicated(v, e, n)
+        }
+        fn expire(&self, now: u64) -> Result<usize, EventStoreError> {
+            self.0.expire(now)
+        }
+    }
+
+    #[test]
+    fn a_lone_filter_answered_out_of_order_is_still_sent_newest_first_once() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let access = Arc::new(Access(RwLock::new([key.public_key()].into())));
+        let inner = SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap();
+        let relay = Arc::new(EventRelay::new(Arc::new(Shuffled(inner)), access));
+        let mut a = session(&relay, Visibility::Sheltered);
+        auth(&mut a, &key);
+        // Two share a second, so the id breaks the tie.
+        let events: Vec<Event> = [NOW - 30, NOW - 10, NOW - 20, NOW - 10, NOW - 40]
+            .iter()
+            .enumerate()
+            .map(|(i, at)| event(&key, 1, *at, &format!("n{i}"), &[]))
+            .collect();
+        for e in &events {
+            assert_eq!(send(&mut a, json!(["EVENT", e]))[0][2], true);
+        }
+        let mut expected: Vec<(std::cmp::Reverse<u64>, String)> = events
+            .iter()
+            .map(|e| (std::cmp::Reverse(e.created_at.as_secs()), e.id.to_hex()))
+            .collect();
+        expected.sort();
+        let expected: Vec<String> = expected.into_iter().map(|(_, id)| id).collect();
+        let replies = send(&mut a, json!(["REQ", "q", {"kinds": [1]}]));
+        let ids: Vec<String> = replies[..replies.len() - 1]
+            .iter()
+            .map(|reply| reply[2]["id"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(ids, expected);
+        assert_eq!(replies.last().unwrap(), &json!(["EOSE", "q"]));
+    }
+
+    /// A frame through `begin_prepared_streaming`: what reached the sink, and
+    /// the replies that followed it.
+    fn stream(session: &mut RelaySession, value: Value) -> (Vec<String>, Vec<String>) {
+        let mut sent = Vec::new();
+        let handled = session.begin_prepared_streaming(
+            PreparedFrame::parse(value.to_string()),
+            NOW,
+            &mut |frame| sent.push(frame),
+        );
+        let Handled::Replies(replies) = handled else {
+            panic!("a REQ is answered without a write");
+        };
+        (sent, replies)
+    }
+
+    #[test]
+    fn a_streamed_single_filter_req_answers_as_the_buffered_one_does() {
+        let (_tmp, relay, _access, key) = setup();
+        let mut keeper = session(&relay, Visibility::Sheltered);
+        auth(&mut keeper, &key);
+        // Two share a second, so the id breaks the tie.
+        for (n, at) in [NOW - 30, NOW - 10, NOW - 20, NOW - 10, NOW - 40]
+            .iter()
+            .enumerate()
+        {
+            let e = event(&key, 1, *at, &format!("n{n}"), &[]);
+            assert_eq!(send(&mut keeper, json!(["EVENT", e]))[0][2], true);
+        }
+        let other = event(&key, 7, NOW - 5, "other kind", &[]);
+        assert_eq!(send(&mut keeper, json!(["EVENT", other]))[0][2], true);
+        for filter in [
+            json!({"kinds": [1]}),
+            json!({}),
+            json!({"limit": 3}),
+            json!({"kinds": [1], "limit": 1}),
+            json!({"limit": 0}),
+            json!({"kinds": [9]}),
+            json!({"since": NOW - 25, "until": NOW - 10}),
+        ] {
+            let frame = json!(["REQ", "q", filter]).to_string();
+            let buffered = keeper.handle_prepared(PreparedFrame::parse(frame.clone()), NOW);
+            let (mut sent, replies) = stream(&mut keeper, json!(["REQ", "q", filter]));
+            sent.extend(replies);
+            assert_eq!(sent, buffered, "{filter}");
+            assert!(keeper.has_subscriptions(), "{filter}");
+        }
+        // The subscription a streamed REQ registers is live.
+        let (_, replies) = stream(&mut keeper, json!(["REQ", "live", {"kinds": [1]}]));
+        assert_eq!(replies, vec![frame(json!(["EOSE", "live"]))]);
+        let live = live_event(
+            Visibility::Sheltered,
+            Arc::new(event(&key, 1, NOW, "live", &[])),
+        );
+        assert_eq!(keeper.on_live(&live, NOW).len(), 1);
+    }
+
+    #[test]
+    fn a_streamed_req_that_is_not_a_single_filter_req_sends_nothing_to_the_sink() {
+        let (_tmp, relay, _access, key) = setup();
+        let mut keeper = session(&relay, Visibility::Sheltered);
+        auth(&mut keeper, &key);
+        for n in 0..3 {
+            let e = event(&key, 1, NOW - n, &format!("n{n}"), &[]);
+            assert_eq!(send(&mut keeper, json!(["EVENT", e]))[0][2], true);
+        }
+        for frame in [
+            json!(["REQ", "m", {"kinds": [1]}, {"kinds": [7]}]),
+            json!(["COUNT", "c", {"kinds": [1]}]),
+            json!(["REQ", "bad", {"search": "x"}]),
+        ] {
+            let buffered = keeper.handle(&frame.to_string(), NOW);
+            let (sent, replies) = stream(&mut keeper, frame.clone());
+            assert!(sent.is_empty(), "{frame}");
+            assert_eq!(replies, buffered, "{frame}");
+        }
+        // A stranger is refused before the query, and nothing is sent.
+        let mut stranger = session(&relay, Visibility::Sheltered);
+        let (sent, replies) = stream(&mut stranger, json!(["REQ", "q", {}]));
+        assert!(sent.is_empty());
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].starts_with("[\"CLOSED\",\"q\","));
+    }
+
+    /// A store whose streamed rows break the order `query_stored_each`
+    /// promises: oldest first.
+    struct Disordered(SqliteEventStore);
+    impl EventStore for Disordered {
+        fn put(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.0.put(v, e, n)
+        }
+        fn query(
+            &self,
+            v: Visibility,
+            f: &nostr::filter::Filter,
+            n: u64,
+        ) -> Result<Vec<Event>, EventStoreError> {
+            self.0.query(v, f, n)
+        }
+        fn query_stored_each(
+            &self,
+            v: Visibility,
+            f: &nostr::filter::Filter,
+            n: u64,
+            each: &mut dyn FnMut(StoredEvent) -> bool,
+        ) -> Result<(), EventStoreError> {
+            let mut events = self.0.query_stored(v, f, n)?;
+            events.reverse();
+            for event in events {
+                if !each(event) {
+                    break;
+                }
+            }
+            Ok(())
+        }
+        fn logical_bytes(&self) -> Result<u64, EventStoreError> {
+            self.0.logical_bytes()
+        }
+        fn put_replicated(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.0.put_replicated(v, e, n)
+        }
+        fn expire(&self, now: u64) -> Result<usize, EventStoreError> {
+            self.0.expire(now)
+        }
+    }
+
+    /// A store that takes the reader's key out of the keepers once it has
+    /// handed over its first streamed row: a member removed mid-query.
+    struct Revoking {
+        inner: SqliteEventStore,
+        access: Arc<Access>,
+        key: PublicKey,
+    }
+    impl EventStore for Revoking {
+        fn put(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.inner.put(v, e, n)
+        }
+        fn query(
+            &self,
+            v: Visibility,
+            f: &nostr::filter::Filter,
+            n: u64,
+        ) -> Result<Vec<Event>, EventStoreError> {
+            self.inner.query(v, f, n)
+        }
+        fn query_stored_each(
+            &self,
+            v: Visibility,
+            f: &nostr::filter::Filter,
+            n: u64,
+            each: &mut dyn FnMut(StoredEvent) -> bool,
+        ) -> Result<(), EventStoreError> {
+            let mut first = true;
+            self.inner.query_stored_each(v, f, n, &mut |event| {
+                let more = each(event);
+                if std::mem::take(&mut first) {
+                    self.access.0.write().unwrap().remove(&self.key);
+                }
+                more
+            })
+        }
+        fn logical_bytes(&self) -> Result<u64, EventStoreError> {
+            self.inner.logical_bytes()
+        }
+        fn put_replicated(&self, v: Visibility, e: &Event, n: u64) -> PutResult {
+            self.inner.put_replicated(v, e, n)
+        }
+        fn expire(&self, now: u64) -> Result<usize, EventStoreError> {
+            self.inner.expire(now)
+        }
+    }
+
+    /// A keeper's session on a relay over `store`, with its events written.
+    fn keeper_over<S: EventStore + 'static>(
+        store: impl FnOnce(SqliteEventStore, Arc<Access>, PublicKey) -> S,
+        events: &[(u16, u64, String)],
+    ) -> (TempDir, RelaySession) {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let access = Arc::new(Access(RwLock::new([key.public_key()].into())));
+        let inner = SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap();
+        let store = store(inner, access.clone(), key.public_key());
+        // More frames than the default allowance: the bounds test writes 143.
+        let relay = Arc::new(EventRelay::new(Arc::new(store), access).with_frame_limit(1_000));
+        let mut keeper = session(&relay, Visibility::Sheltered);
+        auth(&mut keeper, &key);
+        for (kind, at, text) in events {
+            let e = event(&key, *kind, *at, text, &[]);
+            assert_eq!(send(&mut keeper, json!(["EVENT", e]))[0][2], true);
+        }
+        (tmp, keeper)
+    }
+
+    #[test]
+    fn a_streamed_req_over_a_shuffled_store_answers_as_the_buffered_one_does() {
+        let events: Vec<_> = [NOW - 30, NOW - 10, NOW - 20, NOW - 10, NOW - 40]
+            .iter()
+            .enumerate()
+            .map(|(n, at)| (1, *at, format!("n{n}")))
+            .collect();
+        let (_tmp, mut keeper) = keeper_over(|inner, _, _| Shuffled(inner), &events);
+        let frame = json!(["REQ", "q", {"kinds": [1]}]);
+        let buffered = keeper.handle_prepared(PreparedFrame::parse(frame.to_string()), NOW);
+        let (mut sent, replies) = stream(&mut keeper, frame);
+        sent.extend(replies);
+        assert_eq!(sent.len(), events.len() + 1);
+        assert_eq!(sent, buffered);
+    }
+
+    #[test]
+    fn a_streamed_req_over_rows_out_of_order_closes_with_an_error() {
+        let events: Vec<_> = (0..3).map(|n| (1, NOW - 10 * n, format!("n{n}"))).collect();
+        let (_tmp, mut keeper) = keeper_over(|inner, _, _| Disordered(inner), &events);
+        let (sent, replies) = stream(&mut keeper, json!(["REQ", "q", {"kinds": [1]}]));
+        // The oldest row went out before the next one broke the order.
+        assert_eq!(sent.len(), 1);
+        assert_eq!(
+            replies,
+            vec![closed("q", "error: stored events unavailable")]
+        );
+        assert!(!keeper.has_subscriptions());
+    }
+
+    #[test]
+    fn a_streamed_req_stops_at_the_bounds_the_buffered_one_does() {
+        // More events than one page may hold.
+        let many: Vec<_> = (0..MAX_QUERY_EVENTS as u64 + 5)
+            .map(|n| (1, NOW - 1000 + n, format!("n{n}")))
+            .collect();
+        // Large ones, more bytes than one reply may carry.
+        let body = "x".repeat(220 * 1024);
+        let large: Vec<_> = (0..10)
+            .map(|n| (2, NOW - 100 + n, format!("{n}{body}")))
+            .collect();
+        let all: Vec<_> = many.into_iter().chain(large).collect();
+        let (_tmp, mut keeper) = keeper_over(|inner, _, _| inner, &all);
+        for (filter, expected) in [
+            (json!({"kinds": [1]}), MAX_QUERY_EVENTS),
+            (json!({"kinds": [2]}), 9),
+        ] {
+            let frame = json!(["REQ", "q", filter]);
+            let buffered = keeper.handle_prepared(PreparedFrame::parse(frame.to_string()), NOW);
+            assert_eq!(buffered.len(), expected + 1, "{filter}");
+            let (mut sent, replies) = stream(&mut keeper, frame);
+            sent.extend(replies);
+            assert_eq!(sent, buffered, "{filter}");
+        }
+    }
+
+    #[test]
+    fn a_member_removed_mid_query_keeps_what_was_sent_and_gets_closed() {
+        let events: Vec<_> = (0..3).map(|n| (1, NOW - 10 * n, format!("n{n}"))).collect();
+        let (_tmp, mut keeper) = keeper_over(
+            |inner, access, key| Revoking { inner, access, key },
+            &events,
+        );
+        let (sent, replies) = stream(&mut keeper, json!(["REQ", "q", {"kinds": [1]}]));
+        // Rows handed over before the query ended cannot be recalled.
+        assert_eq!(sent.len(), events.len());
+        assert_eq!(replies.len(), 1);
+        assert!(replies[0].starts_with("[\"CLOSED\",\"q\","), "{replies:?}");
+        assert!(!keeper.has_subscriptions());
     }
 
     fn empty_negentropy_initial() -> (Negentropy<'static, NegentropyStorageVector>, String) {

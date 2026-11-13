@@ -27,7 +27,7 @@
 //! network, TLS, a proxy, another host or any other relay.
 
 mod ack_only;
-mod client;
+pub(crate) mod client;
 pub(crate) mod door_path;
 pub(crate) mod guest_path;
 mod server;

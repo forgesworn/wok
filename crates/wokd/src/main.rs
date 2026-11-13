@@ -54,11 +54,16 @@ fn serve(args: &[String]) -> ExitCode {
         Ok(config) => config,
         Err(code) => return code,
     };
+    let arenas_limited = limit_malloc_arenas();
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .with_target(false)
         .init();
+    if !arenas_limited {
+        tracing::warn!("could not limit the allocator's arenas; memory use may be higher");
+    }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(config.workers)
         .enable_all()
         .build()
     {
@@ -85,6 +90,31 @@ fn serve(args: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// glibc's malloc arenas, at most. Otherwise glibc gives a thread that meets
+/// contention an arena of its own, up to eight per core, and each arena holds
+/// on to memory freed into it.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+const MALLOC_ARENAS: libc::c_int = 2;
+
+/// Cap glibc's malloc arenas at [`MALLOC_ARENAS`], before the runtime starts
+/// any thread. An operator's own `MALLOC_ARENA_MAX` is left as it is. False
+/// only when glibc refused the setting.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn limit_malloc_arenas() -> bool {
+    if std::env::var_os("MALLOC_ARENA_MAX").is_some() {
+        return true;
+    }
+    // SAFETY: `mallopt` only sets an allocator parameter, and glibc takes its
+    // own locks to do so.
+    unsafe { libc::mallopt(libc::M_ARENA_MAX, MALLOC_ARENAS) == 1 }
+}
+
+/// Elsewhere there is no glibc arena setting to make.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn limit_malloc_arenas() -> bool {
+    true
 }
 
 /// On each SIGHUP, read `path` again and hand the relay what it says. A file
