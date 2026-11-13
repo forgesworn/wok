@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.0 - 2026-11-13
 
 - `wok-store`: schema version 5. It is version 4 with one more index,
   `events_kind` on `(visibility, kind, created_at, id)`, so a filter that
