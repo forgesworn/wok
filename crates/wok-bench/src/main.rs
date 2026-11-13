@@ -33,9 +33,10 @@
 //! counts every call the relay makes to the authority. It binds `127.0.0.1` on
 //! an ephemeral port as well.
 //!
-//! The figures are for holding later changes to "no slower" on one machine.
-//! They say nothing about other relay implementations, and are only
-//! comparable between runs with the same header and sizes.
+//! The local figures are for holding later changes to "no slower" on one
+//! machine, and are only comparable between runs with the same header and
+//! sizes. The separate `relay` command exports a common corpus, seeds Wok and
+//! drives query, write and fan-out workloads against remote Nostr relays.
 
 mod alloc;
 mod config;
@@ -44,6 +45,7 @@ mod engine;
 mod fanout;
 mod ingest;
 mod query;
+mod remote;
 mod socket;
 mod support;
 
@@ -59,7 +61,26 @@ use corpus::Corpus;
 static ALLOCATOR: alloc::Counting = alloc::Counting;
 
 fn main() -> ExitCode {
-    let cfg = match config::parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "relay") {
+        return match remote::run(&args[1..]) {
+            Ok(document) => match serde_json::to_string_pretty(&document) {
+                Ok(text) => {
+                    println!("{text}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("wok-bench: FAILED: serialise the remote result: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Err(message) => {
+                eprintln!("wok-bench: FAILED: {message}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+    let cfg = match config::parse(args) {
         Ok(Some(cfg)) => cfg,
         Ok(None) => {
             print!("{HELP}");

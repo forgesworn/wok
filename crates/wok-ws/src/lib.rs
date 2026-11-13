@@ -521,17 +521,134 @@ async fn apply<T: Send + 'static>(
 /// with no permit held, so waiting for its commit (which is shared with the
 /// other connections' events) occupies neither a permit nor a blocking thread.
 async fn handle_prepared(
+    socket: &mut WebSocket,
     session: RelaySession,
     state: &SocketState,
     prepared: PreparedFrame,
-) -> Option<(RelaySession, (Vec<String>, bool))> {
-    let (session, handled) =
-        apply(session, state, move |s| s.begin_prepared(prepared, now())).await?;
+) -> Result<Option<(RelaySession, (Vec<String>, bool))>, Closing> {
+    if prepared.is_req_frame() {
+        return stream_request(socket, session, state, prepared).await;
+    }
+    let Some((session, handled)) =
+        apply(session, state, move |s| s.begin_prepared(prepared, now())).await
+    else {
+        return Ok(None);
+    };
     let replies = match handled {
         Handled::Replies(replies) => replies,
         Handled::Write(write) => write.commit().await,
     };
-    Some((session, (replies, false)))
+    Ok(Some((session, (replies, false))))
+}
+
+/// How many bytes of EVENT frames a REQ holds before it starts streaming.
+const STREAM_AFTER_BYTES: usize = 16 * 1024;
+
+/// A held page goes out ahead of its EOSE. If the session answered otherwise
+/// (a CLOSED: authority changed during the query, or the rows were
+/// disordered), the page is dropped, as the buffered path sends no event then.
+fn with_held(held: Vec<String>, replies: Vec<String>) -> Vec<String> {
+    let ended = replies
+        .first()
+        .is_some_and(|reply| reply.starts_with("[\"EOSE\""));
+    if held.is_empty() || !ended {
+        return replies;
+    }
+    let mut out = held;
+    out.extend(replies);
+    out
+}
+
+/// A REQ whose events go to the socket as the store reads them. The session
+/// runs on the blocking pool under a work permit and sends each EVENT frame
+/// into an unbounded channel, so it never waits on a slow peer while holding
+/// the permit; the page is already bounded by `MAX_REQ_REPLY_BYTES`, so the
+/// channel holds no more than the reply vector did. The permit is dropped
+/// when the closure returns, before this task has written the rest. This task
+/// writes what has arrived and flushes whenever the channel is momentarily
+/// empty, so each such batch, rather than the page as a whole, has
+/// [`IO_TIMEOUT`] to reach the peer before the connection ends as stalled.
+/// The replies that follow the events (EOSE, or CLOSED) are returned for
+/// [`deliver`], as for any other frame.
+///
+/// A sheltered connection's authority is checked, as [`deliver`] checks it,
+/// before the query: on a refusal the buffered path answers, and `deliver`
+/// strips any event from its replies. The session judges its own authority
+/// before the query too, so no event is sent to a reader who fails either.
+async fn stream_request(
+    socket: &mut WebSocket,
+    session: RelaySession,
+    state: &SocketState,
+    prepared: PreparedFrame,
+) -> Result<Option<(RelaySession, (Vec<String>, bool))>, Closing> {
+    let sheltered = state.visibility == Visibility::Sheltered;
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let work = apply(session, state, move |s| {
+        if sheltered && !s.can_read_live(now()) {
+            return s.begin_prepared(prepared, now());
+        }
+        // A small page is held and answered with its EOSE in one batch, as
+        // the buffered path answers it, so [`deliver`] still judges it whole;
+        // only a page past `STREAM_AFTER_BYTES` goes out as it is read.
+        let mut held: Vec<String> = Vec::new();
+        let mut held_bytes = 0usize;
+        let mut streaming = false;
+        let handled = s.begin_prepared_streaming(prepared, now(), &mut |frame| {
+            if streaming {
+                let _ = tx.send(frame);
+                return;
+            }
+            held_bytes += frame.len();
+            held.push(frame);
+            if held_bytes >= STREAM_AFTER_BYTES {
+                streaming = true;
+                for frame in held.drain(..) {
+                    let _ = tx.send(frame);
+                }
+            }
+        });
+        match handled {
+            Handled::Replies(replies) => Handled::Replies(with_held(held, replies)),
+            other => other,
+        }
+    });
+    tokio::pin!(work);
+    let mut open = true;
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            received = rx.recv(), if open => {
+                let Some(first) = received else {
+                    // The closure has finished and dropped its sender; only
+                    // its result is left to wait for.
+                    open = false;
+                    continue;
+                };
+                let mut frames = vec![first];
+                while let Ok(frame) = rx.try_recv() {
+                    frames.push(frame);
+                }
+                send(socket, frames).await?;
+            },
+            done = &mut work => break done,
+        }
+    };
+    // Whatever the closure sent before it returned is still queued.
+    let mut frames = Vec::new();
+    while let Ok(frame) = rx.try_recv() {
+        frames.push(frame);
+    }
+    if !frames.is_empty() {
+        send(socket, frames).await?;
+    }
+    let Some((session, handled)) = outcome else {
+        return Ok(None);
+    };
+    let replies = match handled {
+        Handled::Replies(replies) => replies,
+        Handled::Write(write) => write.commit().await,
+    };
+    Ok(Some((session, (replies, false))))
 }
 
 /// Most EVENT writes one connection may have in flight at the writer, and the
@@ -1164,7 +1281,10 @@ async fn serve_connected(
                                     // no work permit and no blocking hop.
                                     match session.try_close(&prepared) {
                                         Some(replies) => Some((session, (replies, false))),
-                                        None => handle_prepared(session, state, prepared).await,
+                                        None => match handle_prepared(socket, session, state, prepared).await {
+                                            Ok(outcome) => outcome,
+                                            Err(closing) => return closing,
+                                        },
                                     }
                                 }
                             }
@@ -2569,6 +2689,72 @@ mod tests {
         let written: std::collections::BTreeSet<String> =
             writer.await.unwrap().into_iter().collect();
         assert_eq!(seen, written);
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// A held page is sent only ahead of an EOSE, never ahead of a CLOSED.
+    #[test]
+    fn a_held_page_goes_out_only_ahead_of_its_eose() {
+        let held = vec!["[\"EVENT\",\"q\",{}]".to_string()];
+        let eose = vec!["[\"EOSE\",\"q\"]".to_string()];
+        let closed = vec!["[\"CLOSED\",\"q\",\"restricted: authority changed\"]".to_string()];
+        assert_eq!(
+            with_held(held.clone(), eose.clone()),
+            vec![held[0].clone(), eose[0].clone()]
+        );
+        assert_eq!(with_held(held, closed.clone()), closed);
+        assert_eq!(with_held(Vec::new(), eose.clone()), eose);
+    }
+
+    /// A sheltered REQ is streamed: its events arrive newest first, then the
+    /// EOSE, and a stranger's REQ gets a CLOSED and no event.
+    #[tokio::test]
+    async fn a_sheltered_req_streams_its_events_then_eose() {
+        const TOTAL: u64 = 60;
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (url, task) = listen(&routes, Visibility::Sheltered).await;
+        let mut keeper = connect(&url, Some(&key)).await;
+        let base = now() - 1000;
+        for n in 0..TOTAL {
+            let e = event(&key, 1, base + n, &format!("row-{n}"), vec![]);
+            send_frame(&mut keeper, json!(["EVENT", e])).await;
+            assert_eq!(receive(&mut keeper).await[2], true);
+        }
+        send_frame(&mut keeper, json!(["REQ", "page", {"kinds": [1]}])).await;
+        let mut times = Vec::new();
+        loop {
+            let frame = receive(&mut keeper).await;
+            match frame[0].as_str().unwrap() {
+                "EVENT" => times.push(frame[2]["created_at"].as_u64().unwrap()),
+                "EOSE" => break,
+                other => panic!("unexpected {other}: {frame}"),
+            }
+        }
+        let expected: Vec<u64> = (0..TOTAL).rev().map(|n| base + n).collect();
+        assert_eq!(times, expected);
+
+        // A page under the streaming threshold is held and answered whole.
+        send_frame(
+            &mut keeper,
+            json!(["REQ", "small", {"kinds": [1], "limit": 2}]),
+        )
+        .await;
+        let first = receive(&mut keeper).await;
+        let second = receive(&mut keeper).await;
+        let end = receive(&mut keeper).await;
+        assert_eq!(first[2]["created_at"], base + TOTAL - 1);
+        assert_eq!(second[2]["created_at"], base + TOTAL - 2);
+        assert_eq!(end[0], "EOSE");
+
+        // A key with no access is refused with no event.
+        let (mut stranger, _) = connect_async(&url).await.unwrap();
+        assert_eq!(receive(&mut stranger).await[0], "AUTH");
+        send_frame(&mut stranger, json!(["REQ", "page", {"kinds": [1]}])).await;
+        let refused = receive(&mut stranger).await;
+        assert_eq!(refused[0], "CLOSED");
         routes.shutdown();
         task.abort();
     }

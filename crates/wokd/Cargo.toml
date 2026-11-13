@@ -25,6 +25,10 @@ url = { workspace = true }
 wok-store = { path = "../wok-store" }
 wok-ws = { path = "../wok-ws" }
 
+# glibc's malloc arena limit, set once at start-up (`mallopt`).
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 futures-util = { workspace = true, features = ["sink"] }
 # A stock client: does an ordinary Nostr library get through NIP-42 here?

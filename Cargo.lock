@@ -2230,6 +2230,7 @@ dependencies = [
  "axum",
  "fs2",
  "futures-util",
+ "libc",
  "nostr",
  "nostr-sdk",
  "serde",

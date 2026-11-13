@@ -1,6 +1,6 @@
 [package]
 name = "wok-bench"
-description = "Baseline benchmark for wok-store and wok-ws: ingest, query, live fan-out, the session engine and acknowledged writes through the WebSocket doors over loopback"
+description = "Baselines for wok-store and wok-ws, plus remote-relay comparisons over WebSocket"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

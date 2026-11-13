@@ -36,3 +36,7 @@ members = [
 # that every read and write needs NIP-42. It names no member, operator or
 # address.
 # relay_information = true
+
+# The runtime's worker threads. Store work runs on threads of its own, and a
+# group's relay holds at most 32 connections, so a few are enough.
+# workers = 2

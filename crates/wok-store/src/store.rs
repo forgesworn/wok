@@ -272,7 +272,17 @@ const CEILING_RETRY: Duration = Duration::from_secs(1);
 const CEILING_LOCK_STEP: Duration = Duration::from_millis(1);
 const CEILING_LOCK_STEP_MAX: Duration = Duration::from_millis(10);
 /// The checkpoint thread starts at most one PASSIVE checkpoint per interval.
-const CHECKPOINT_MIN_GAP: Duration = Duration::from_millis(50);
+///
+/// A PASSIVE that finds it has copied the whole log also syncs the main
+/// database file, and on a busy disk that sync holds up the writer's commit.
+/// With a gap this long, each pass has enough to copy that newer commits have
+/// extended the log by the time it ends, so SQLite skips the sync. Nothing
+/// becomes less durable: SQLite keeps every frame in the log, and never
+/// restarts the log, until a checkpoint that reached the end (the writer's
+/// ceiling checkpoint, the idle TRUNCATE) has synced the main file. The cost
+/// is that a deletion's follow-up pass can wait this long behind one already
+/// running.
+const CHECKPOINT_MIN_GAP: Duration = Duration::from_millis(250);
 /// The checkpoint thread does not hold the writer off for longer than this
 /// while a reader keeps a TRUNCATE from finishing.
 const CHECKPOINT_BUSY: Duration = Duration::from_millis(200);
@@ -953,6 +963,35 @@ pub trait EventStore: Send + Sync {
             .map(StoredEvent::from_event)
             .collect()
     }
+    /// [`EventStore::query_stored`], handing each row to `f` as it is read
+    /// rather than building the page first. `f` answers `false` to stop.
+    ///
+    /// Rows must come newest first, then by id, each id once: the order a
+    /// reply is sent in, which a caller sending rows as they arrive cannot
+    /// restore afterwards. The relay ends a page with an error at the first
+    /// row out of that order. A store that fails part way has already handed
+    /// over the rows before the failure. The default sorts what
+    /// `query_stored` returns into that order, drops repeats, and hands the
+    /// rows over.
+    fn query_stored_each(
+        &self,
+        visibility: Visibility,
+        filter: &Filter,
+        now: u64,
+        f: &mut dyn FnMut(StoredEvent) -> bool,
+    ) -> Result<(), EventStoreError> {
+        let mut events = self.query_stored(visibility, filter, now)?;
+        events.sort_unstable_by(|a, b| {
+            (std::cmp::Reverse(a.created_at), &a.id).cmp(&(std::cmp::Reverse(b.created_at), &b.id))
+        });
+        events.dedup_by(|a, b| a.id == b.id);
+        for event in events {
+            if !f(event) {
+                break;
+            }
+        }
+        Ok(())
+    }
     /// NIP-45: how many events in the partition match any of `filters`, each
     /// counted once, up to [`MAX_EXACT_COUNT`] + 1: a larger answer means
     /// "more than [`MAX_EXACT_COUNT`]". Each filter's `limit` is ignored. A
@@ -1048,16 +1087,30 @@ impl StoredEvent {
     /// Not checked here: that the author is a valid curve point and the
     /// signature well formed, which the write path verified.
     pub fn from_stored(json: String) -> Result<Self, EventStoreError> {
+        // The layout the store writes is read directly; anything else goes
+        // to the serde check below, which decides it.
+        if let Some(head) = fast_head(&json) {
+            return Ok(Self {
+                created_at: head.created_at,
+                id: json[ID_AT..ID_AT + 64].to_owned(),
+                kind: head.kind,
+                room: head.room.map(|(start, end)| json[start..end].to_owned()),
+                json,
+            });
+        }
+        Self::from_stored_serde(json)
+    }
+
+    /// The serde check: every row [`fast_head`] does not read, and the
+    /// oracle for its differential tests.
+    fn from_stored_serde(json: String) -> Result<Self, EventStoreError> {
         // A derived struct also accepts the array form; only an object will do.
         if !json.starts_with('{') {
             return Err(EventStoreError::Corrupt);
         }
         let head: StoredHead<'_> =
             serde_json::from_str(&json).map_err(|_| EventStoreError::Corrupt)?;
-        if head.tags.iter().any(Vec::is_empty) {
-            return Err(EventStoreError::Corrupt);
-        }
-        let room = single_d_value(head.tags.iter().map(Vec::as_slice)).map(str::to_owned);
+        let room = head.tags.room.map(|room| room.0.into_owned());
         let (created_at, kind) = (head.created_at, head.kind);
         // Owned before the head, which borrows the row, goes and the row moves.
         let id = head.id.0.0.into_owned();
@@ -1068,6 +1121,175 @@ impl StoredEvent {
             room,
             json,
         })
+    }
+}
+
+/// Where the id's hex starts in the layout the store writes.
+const ID_AT: usize = 7;
+
+/// What [`fast_head`] reads: the room as byte offsets into the row.
+#[derive(Debug, PartialEq, Eq)]
+struct FastHead {
+    created_at: u64,
+    kind: u16,
+    room: Option<(usize, usize)>,
+}
+
+/// The row read in the one layout the store writes (`serde_json::to_string`
+/// of an event: the seven fields in order, no whitespace), forward only.
+/// `None` for anything else, which the serde check then decides: a `None`
+/// here never refuses a row. A string with a `\u` escape, or any escape in
+/// a tag name or a `d` tag's value, is left to serde too.
+fn fast_head(json: &str) -> Option<FastHead> {
+    let b = json.as_bytes();
+    let mut i = 0;
+    literal(b, &mut i, b"{\"id\":\"")?;
+    debug_assert_eq!(i, ID_AT);
+    hex(b, &mut i, 64, true)?;
+    literal(b, &mut i, b"\",\"pubkey\":\"")?;
+    hex(b, &mut i, 64, false)?;
+    literal(b, &mut i, b"\",\"created_at\":")?;
+    let created_at = number(b, &mut i, u64::MAX)?;
+    literal(b, &mut i, b",\"kind\":")?;
+    let kind = u16::try_from(number(b, &mut i, u64::from(u16::MAX))?).ok()?;
+    literal(b, &mut i, b",\"tags\":[")?;
+    let room = tags(b, &mut i)?;
+    literal(b, &mut i, b",\"content\":\"")?;
+    string(b, &mut i)?;
+    literal(b, &mut i, b",\"sig\":\"")?;
+    hex(b, &mut i, 128, false)?;
+    literal(b, &mut i, b"\"}")?;
+    (i == b.len()).then_some(FastHead {
+        created_at,
+        kind,
+        room,
+    })
+}
+
+fn literal(b: &[u8], i: &mut usize, want: &[u8]) -> Option<()> {
+    let end = i.checked_add(want.len())?;
+    (b.get(*i..end)? == want).then(|| *i = end)
+}
+
+/// `n` hex digits, lowercase only when `lower`. The closing quote is the
+/// next literal's.
+fn hex(b: &[u8], i: &mut usize, n: usize, lower: bool) -> Option<()> {
+    let digits = b.get(*i..*i + n)?;
+    let ok = if lower {
+        digits
+            .iter()
+            .all(|&c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+    } else {
+        digits.iter().all(u8::is_ascii_hexdigit)
+    };
+    ok.then(|| *i += n)
+}
+
+/// A JSON integer without sign or leading zero, at most `max`.
+fn number(b: &[u8], i: &mut usize, max: u64) -> Option<u64> {
+    let first = *b.get(*i)?;
+    if !first.is_ascii_digit() {
+        return None;
+    }
+    let mut value = u64::from(first - b'0');
+    *i += 1;
+    if value == 0 {
+        // A leading zero, as in `01`, is serde's to refuse.
+        return (!b.get(*i).is_some_and(u8::is_ascii_digit)).then_some(0);
+    }
+    while let Some(&c) = b.get(*i) {
+        if !c.is_ascii_digit() {
+            break;
+        }
+        value = value.checked_mul(10)?.checked_add(u64::from(c - b'0'))?;
+        *i += 1;
+    }
+    (value <= max).then_some(value)
+}
+
+/// The rest of a JSON string after its opening quote, through the closing
+/// one. Returns whether it held an escape. Refuses (`None`) a control
+/// character, a `\u` escape and anything not a JSON escape; serde decides
+/// those rows.
+fn string(b: &[u8], i: &mut usize) -> Option<bool> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const HIGHS: u64 = 0x8080_8080_8080_8080;
+    let mut escaped = false;
+    loop {
+        // Eight bytes at a time while none is a quote, a backslash or a
+        // control character.
+        while let Some(chunk) = b.get(*i..*i + 8) {
+            let x = u64::from_le_bytes(chunk.try_into().ok()?);
+            let quote = x ^ (ONES * u64::from(b'"'));
+            let slash = x ^ (ONES * u64::from(b'\\'));
+            let special = (quote.wrapping_sub(ONES) & !quote)
+                | (slash.wrapping_sub(ONES) & !slash)
+                | (x.wrapping_sub(ONES * 0x20) & !x);
+            if special & HIGHS != 0 {
+                break;
+            }
+            *i += 8;
+        }
+        let c = *b.get(*i)?;
+        *i += 1;
+        match c {
+            b'"' => return Some(escaped),
+            b'\\' => {
+                let e = *b.get(*i)?;
+                if !matches!(e, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
+                    return None;
+                }
+                *i += 1;
+                escaped = true;
+            }
+            0..=0x1f => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The tags after the opening bracket, through the closing one: the room as
+/// byte offsets under `single_d_value`'s rule.
+fn tags(b: &[u8], i: &mut usize) -> Option<Option<(usize, usize)>> {
+    if b.get(*i) == Some(&b']') {
+        *i += 1;
+        return Some(None);
+    }
+    let (mut d_tags, mut room) = (0usize, None);
+    loop {
+        literal(b, i, b"[\"")?;
+        let start = *i;
+        if string(b, i)? {
+            return None;
+        }
+        let is_d = &b[start..*i - 1] == b"d";
+        let (mut elements, mut value) = (1usize, None);
+        while b.get(*i) == Some(&b',') {
+            *i += 1;
+            literal(b, i, b"\"")?;
+            let start = *i;
+            let escaped = string(b, i)?;
+            elements += 1;
+            if is_d && elements == 2 {
+                if escaped {
+                    return None;
+                }
+                value = Some((start, *i - 1));
+            }
+        }
+        literal(b, i, b"]")?;
+        if is_d {
+            d_tags += 1;
+            room = if elements == 2 { value } else { None };
+        }
+        match b.get(*i)? {
+            b',' => *i += 1,
+            b']' => {
+                *i += 1;
+                return Some(if d_tags == 1 { room } else { None });
+            }
+            _ => return None,
+        }
     }
 }
 
@@ -1103,11 +1325,105 @@ struct StoredHead<'a> {
     created_at: u64,
     kind: u16,
     #[serde(borrow)]
-    tags: Vec<Vec<Text<'a>>>,
+    tags: TagsHead<'a>,
     #[allow(dead_code)]
     content: StrCheck,
     #[allow(dead_code)]
     sig: HexCheck<128>,
+}
+
+/// An event's tags, checked as `Vec<Vec<String>>` with no empty tag, keeping
+/// only the room under `single_d_value`'s rule: the second element of the one
+/// tag named `d`, when there is exactly one and it has exactly two elements.
+struct TagsHead<'a> {
+    room: Option<Text<'a>>,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for TagsHead<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = TagsHead<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("an array of tags")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut tags: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut d_tags = 0usize;
+                let mut room = None;
+                while let Some(tag) = tags.next_element::<TagHead<'de>>()? {
+                    if let Some(value) = tag.d {
+                        d_tags += 1;
+                        room = value;
+                    }
+                }
+                Ok(TagsHead {
+                    room: if d_tags == 1 { room } else { None },
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visit)
+    }
+}
+
+/// One tag, a non-empty array of strings. `d` is `Some` when it is named `d`,
+/// holding its second element when it has exactly two.
+struct TagHead<'a> {
+    d: Option<Option<Text<'a>>>,
+}
+
+impl<'de: 'a, 'a> serde::Deserialize<'de> for TagHead<'a> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl<'de> serde::de::Visitor<'de> for Visit {
+            type Value = TagHead<'de>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a non-empty array of strings")
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut tag: A,
+            ) -> Result<Self::Value, A::Error> {
+                let Some(NameIsD(is_d)) = tag.next_element()? else {
+                    return Err(serde::de::Error::custom("an empty tag"));
+                };
+                if !is_d {
+                    while tag.next_element::<StrCheck>()?.is_some() {}
+                    return Ok(TagHead { d: None });
+                }
+                let value = tag.next_element::<Text<'de>>()?;
+                let mut more = false;
+                while tag.next_element::<StrCheck>()?.is_some() {
+                    more = true;
+                }
+                Ok(TagHead {
+                    d: Some(if more { None } else { value }),
+                })
+            }
+        }
+        deserializer.deserialize_seq(Visit)
+    }
+}
+
+/// A tag's name, checked as a string and compared with `d`, not kept.
+struct NameIsD(bool);
+
+impl<'de> serde::Deserialize<'de> for NameIsD {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visit;
+        impl serde::de::Visitor<'_> for Visit {
+            type Value = NameIsD;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a string")
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(NameIsD(v == "d"))
+            }
+        }
+        deserializer.deserialize_str(Visit)
+    }
 }
 
 /// A JSON string, borrowed when it has no escapes.
@@ -1343,8 +1659,10 @@ CREATE TABLE deleted_coordinates{s} (
 /// sort. `events_coordinate` holds only replaceable and addressable events;
 /// every statement that uses it names a `coordinate`, which implies not null.
 /// Each is built in its own transaction once an upgrade has filled the
-/// tables, and an open builds any that are missing.
-const V4_INDEXES: [(&str, &str); 6] = [
+/// tables, and an open builds any that are missing. `events_kind` came with
+/// version 5: a kinds-only filter walks one kind newest first rather than
+/// the whole partition in time order.
+const V4_INDEXES: [(&str, &str); 7] = [
     (
         "events_id",
         "CREATE UNIQUE INDEX IF NOT EXISTS events_id ON events(visibility,id)",
@@ -1356,6 +1674,10 @@ const V4_INDEXES: [(&str, &str); 6] = [
     (
         "events_author_kind",
         "CREATE INDEX IF NOT EXISTS events_author_kind ON events(visibility,author,kind,created_at,id DESC)",
+    ),
+    (
+        "events_kind",
+        "CREATE INDEX IF NOT EXISTS events_kind ON events(visibility,kind,created_at,id DESC)",
     ),
     (
         "events_coordinate",
@@ -1780,6 +2102,12 @@ PRAGMA user_version=2;"))?;
             tracing::warn!(%error, "event-store temp_store was not restored after an index build");
         }
         finished?;
+        // A version 4 store has just had `events_kind` built by `finish_v4`.
+        // It is marked only once the index is there, so a kill before this
+        // leaves it at 4 and the next open builds and marks it.
+        if version == 4 {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        }
         // Readers open last, once the schema is final and WAL is confirmed.
         let journal: String = conn.query_row("PRAGMA journal_mode", [], |r| r.get(0))?;
         let wal = journal.eq_ignore_ascii_case("wal");
@@ -2007,8 +2335,9 @@ PRAGMA user_version=3;";
 
 /// The schema this build writes, after every migration above. A store at
 /// this version is refused by every earlier core: going back is an export
-/// and an import, not a downgrade.
-pub const SCHEMA_VERSION: i64 = 4;
+/// and an import, not a downgrade. Version 5 is version 4 with
+/// `events_kind`; the open that builds the index then marks the store.
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// Events copied per transaction by the upgrade to version 4.
 const UPGRADE_CHUNK_EVENTS: i64 = 20_000;
@@ -2522,7 +2851,9 @@ pub fn export_stored(
                     supported: SCHEMA_VERSION,
                 });
             }
-            if version != SCHEMA_VERSION {
+            // Version 5 adds only an index, so a version 4 store's rows
+            // read the same.
+            if version != SCHEMA_VERSION && version != 4 {
                 return Err(EventStoreError::Schema);
             }
             // An empty BLOB sorts before every 32-byte id.
@@ -3889,6 +4220,33 @@ impl EventStore for SqliteEventStore {
         self.run_query(&sql, values, StoredEvent::from_stored)
     }
 
+    /// The same statement as [`EventStore::query_stored`], stepped row by row
+    /// under the same reader and deadline, each row handed to `f` as it is
+    /// read. The reader is held while `f` runs, so `f` must not block. Every
+    /// shape `build_query` makes orders by time descending, then id, and a
+    /// tag row is keyed by its event, name and value, so no event repeats.
+    fn query_stored_each(
+        &self,
+        visibility: Visibility,
+        filter: &Filter,
+        now: u64,
+        f: &mut dyn FnMut(StoredEvent) -> bool,
+    ) -> Result<(), EventStoreError> {
+        let Some((sql, values)) = self.query_sql(visibility, filter, now)? else {
+            return Ok(());
+        };
+        self.with_reader(|conn| {
+            let mut statement = conn.prepare_cached(&sql)?;
+            let mut rows = statement.query(params_from_iter(values))?;
+            while let Some(row) = rows.next()? {
+                if !f(StoredEvent::from_stored(row.get::<_, String>(0)?)?) {
+                    break;
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// One statement for every filter, under the same reader and two-second
     /// progress deadline as a history query.
     fn count(
@@ -4140,7 +4498,11 @@ fn build_query(
             .map(|i| Value::Integer(i.as_u16() as i64))
             .collect();
         let before = binds.0.len();
-        membership(&mut conds, &mut binds, "e.kind", items);
+        // One kind may seek `events_kind`, already newest first. Several
+        // would sort every row of those kinds before the limit applies, so
+        // the unary `+` keeps them on the time walk, which stops at it.
+        let field = if kinds.len() > 1 { "+e.kind" } else { "e.kind" };
+        membership(&mut conds, &mut binds, field, items);
         kind_marks = (before + 1..=binds.0.len())
             .map(|n| format!("?{n}"))
             .collect();
@@ -4404,8 +4766,16 @@ fn count_branch(binds: &mut Binds, vis: &str, at: &str, filter: &Filter) -> Opti
         for tag in &tags {
             conds.push_str(&probe("t", tag));
         }
+        // Ids are counted from the id index, one seek each. Left to choose
+        // with one kind named, SQLite takes `events_kind` and reads every
+        // event of that kind.
+        let by_id = if filter.ids.is_some() {
+            " INDEXED BY events_id"
+        } else {
+            ""
+        };
         return Some(format!(
-            "SELECT e.seq AS i FROM events e WHERE e.visibility={vis}{conds}"
+            "SELECT e.seq AS i FROM events e{by_id} WHERE e.visibility={vis}{conds}"
         ));
     }
     let driver = tags
@@ -4448,6 +4818,282 @@ mod tests {
     }
     fn store(tmp: &TempDir) -> SqliteEventStore {
         SqliteEventStore::open(&tmp.path().join("events.sqlite"), 10_000_000).unwrap()
+    }
+
+    /// A stored row's tags are accepted, and its room read, exactly as when
+    /// they were parsed whole as `Vec<Vec<String>>` and then checked.
+    #[test]
+    fn stored_tags_are_checked_as_a_whole_parse_would_check_them() {
+        let e = event(&Keys::generate(), 1, NOW, "x", &[]);
+        let json = serde_json::to_string(&e).unwrap();
+        assert_eq!(json.matches(r#""tags":[]"#).count(), 1);
+        let cases = [
+            r#"[]"#,
+            r#"[["d","r"]]"#,
+            r#"[["d"]]"#,
+            r#"[["d",""]]"#,
+            r#"[["d","r","x"]]"#,
+            r#"[["d","r"],["d","s"]]"#,
+            r#"[["d","r"],["d"]]"#,
+            r#"[["d"],["d","r"]]"#,
+            r#"[["t","x"],["d","r"],["p","y","z"]]"#,
+            r#"[["d","r"]]"#,
+            r#"[["d","r\"q"]]"#,
+            r#"[["d","a\\b"]]"#,
+            r#"[["D","r"]]"#,
+            r#"[["dd","r"]]"#,
+            r#"[["t"]]"#,
+            r#"[[]]"#,
+            r#"[["t","x"],[]]"#,
+            r#"[["t",1]]"#,
+            r#"[[1,"x"]]"#,
+            r#"[["d",null]]"#,
+            r#"[["d","r",2]]"#,
+            r#"["d"]"#,
+            r#"[["d","r"],"t"]"#,
+            r#"null"#,
+            r#"{}"#,
+            r#""x""#,
+        ];
+        for case in cases {
+            let row = json.replace(r#""tags":[]"#, &format!(r#""tags":{case}"#));
+            // `None` for a row refused as corrupt, else `Some(room)`.
+            let expected = match serde_json::from_str::<Vec<Vec<String>>>(case) {
+                Ok(tags) if !tags.iter().any(Vec::is_empty) => {
+                    Some(single_d_value(tags.iter().map(Vec::as_slice)).map(str::to_owned))
+                }
+                _ => None,
+            };
+            let found = match StoredEvent::from_stored(row) {
+                Ok(stored) => Some(stored.room),
+                Err(EventStoreError::Corrupt) => None,
+                Err(other) => panic!("{case}: {other}"),
+            };
+            assert_eq!(found, expected, "{case}");
+        }
+    }
+
+    /// The fast path against the serde oracle. When the fast path
+    /// reads a row, serde accepts it with the same fields; and `from_stored`
+    /// equals the oracle on every input.
+    fn agrees(row: &str) -> (bool, bool) {
+        let oracle = StoredEvent::from_stored_serde(row.to_owned()).ok();
+        if let Some(head) = fast_head(row) {
+            let accepted = oracle
+                .as_ref()
+                .unwrap_or_else(|| panic!("fast read a row serde refuses: {row:?}"));
+            assert_eq!(head.created_at, accepted.created_at, "{row:?}");
+            assert_eq!(head.kind, accepted.kind, "{row:?}");
+            assert_eq!(&row[ID_AT..ID_AT + 64], accepted.id, "{row:?}");
+            assert_eq!(
+                head.room.map(|(a, b)| &row[a..b]),
+                accepted.room.as_deref(),
+                "{row:?}"
+            );
+        }
+        let found = StoredEvent::from_stored(row.to_owned()).ok();
+        assert_eq!(found, oracle, "{row:?}");
+        (fast_head(row).is_some(), oracle.is_some())
+    }
+
+    /// Rows as the store writes them: each content against each tag set.
+    fn fast_path_rows() -> Vec<String> {
+        let keys = Keys::generate();
+        let contents = [
+            "",
+            "x",
+            "plain words, about a hundred bytes of them, the shape that most short text notes take",
+            "line one\nline two\ttabbed \"quoted\" back\\slash / slash",
+            "unicode: caf\u{e9} \u{1f980} \u{4e2d}\u{6587}",
+            "control \u{1} \u{1f} and del \u{7f}",
+            "{\"looks\":[\"like\",\"json\"]}",
+        ];
+        let tag_sets: Vec<Vec<Vec<String>>> = vec![
+            vec![],
+            vec![tag("d", "room")],
+            vec![tag("d", "")],
+            vec![vec!["d".into()]],
+            vec![vec!["d".into(), "r".into(), "x".into()]],
+            vec![tag("d", "r"), tag("d", "s")],
+            vec![
+                tag("t", "x"),
+                tag("d", "r\"q"),
+                vec!["p".into(), "y".into(), "z".into()],
+            ],
+            vec![tag("d", "a\\b")],
+            vec![
+                tag("e", "0".repeat(64)),
+                tag("p", "f".repeat(64)),
+                tag("t", "line\nbreak"),
+            ],
+            vec![tag("D", "r"), tag("dd", "s"), vec!["t".into()]],
+            vec![tag("d", "caf\u{e9}")],
+        ];
+        let mut rows = Vec::new();
+        for (n, content) in contents.iter().enumerate() {
+            for (m, tags) in tag_sets.iter().enumerate() {
+                let kind = [0u16, 1, 7, 30023, 65535][(n + m) % 5];
+                let at = [0u64, 1, NOW, 9_999_999_999][(n * 3 + m) % 4];
+                let e = event(&keys, kind, at, content, tags);
+                rows.push(serde_json::to_string(&e).unwrap());
+            }
+        }
+        rows
+    }
+
+    #[test]
+    fn fast_path_agrees_with_serde_on_written_rows() {
+        let rows = fast_path_rows();
+        let mut hits = 0;
+        for row in &rows {
+            let (fast, ok) = agrees(row);
+            assert!(ok, "{row}");
+            hits += usize::from(fast);
+        }
+        // Left to serde: a `\\u` escape anywhere, an escape in a d value.
+        let expected = rows
+            .iter()
+            .filter(|r| {
+                !r.contains("\\u")
+                    && !r.contains(r#"["d","r\"q"]"#)
+                    && !r.contains(r#"["d","a\\b"]"#)
+            })
+            .count();
+        assert_eq!(hits, expected);
+    }
+
+    #[test]
+    fn fast_path_agrees_with_serde_on_every_one_byte_edit() {
+        let rows = fast_path_rows();
+        // A spread of rows: no tags, d variants, escapes, unicode.
+        let picked: Vec<&String> = rows.iter().step_by(4).collect();
+        let (mut cases, mut fast, mut ok) = (0usize, 0usize, 0usize);
+        let mut check = |bytes: Vec<u8>| {
+            if let Ok(row) = String::from_utf8(bytes) {
+                let (f, o) = agrees(&row);
+                cases += 1;
+                fast += usize::from(f);
+                ok += usize::from(o);
+            }
+        };
+        for row in &picked {
+            let b = row.as_bytes();
+            for at in 0..b.len() {
+                for v in 0..=255u8 {
+                    if v != b[at] {
+                        let mut e = b.to_vec();
+                        e[at] = v;
+                        check(e);
+                    }
+                }
+                let mut e = b.to_vec();
+                e.remove(at);
+                check(e);
+            }
+            for at in 0..=b.len() {
+                for v in b" \n\"\\,:[]{}0129afAFgu-.e+d\x01\x7f" {
+                    let mut e = b.to_vec();
+                    e.insert(at, *v);
+                    check(e);
+                }
+            }
+        }
+        // Enough edits, some read by the fast path and some left to serde.
+        assert!(cases > 100_000, "{cases}");
+        assert!(fast > 0 && ok > fast, "fast {fast}, serde accepts {ok}");
+    }
+
+    #[test]
+    fn fast_path_agrees_with_serde_on_targeted_rows() {
+        let base = serde_json::to_string(&event(&Keys::generate(), 1, NOW, "c", &[])).unwrap();
+        let at = format!(r#""created_at":{NOW},"#);
+        let numbers = [
+            "0",
+            "00",
+            "01",
+            "18446744073709551615",
+            "18446744073709551616",
+            "-0",
+            "-1",
+            "1.0",
+            "1e3",
+            "1E3",
+            "",
+            " 1",
+            "1 ",
+        ];
+        for n in numbers {
+            agrees(&base.replace(&at, &format!(r#""created_at":{n},"#)));
+        }
+        for k in [
+            "0",
+            "65535",
+            "65536",
+            "00",
+            "-0",
+            "1.0",
+            "1e3",
+            "99999999999999999999",
+        ] {
+            agrees(&base.replace(r#""kind":1,"#, &format!(r#""kind":{k},"#)));
+        }
+        let tags = [
+            r#"[]"#,
+            r#"[[]]"#,
+            r#"[["d"]]"#,
+            r#"[["d","r"]]"#,
+            r#"[["d","r","x"]]"#,
+            r#"[["d","r"],["d","s"]]"#,
+            r#"[["\u0064","r"]]"#,
+            r#"[["d","\u0072"]]"#,
+            r#"[["d","r\nq"]]"#,
+            r#"[["t","\n"],["d","r"]]"#,
+            r#"[["d","r"],]"#,
+            r#"[,["d","r"]]"#,
+            r#"[["d",,"r"]]"#,
+            r#"[["d","r"]"#,
+            r#"[ ["d","r"]]"#,
+            r#"[["d" ,"r"]]"#,
+            r#"[["d","\x"]]"#,
+            r#"[["d","\ud800"]]"#,
+            "[[\"d\",\"a\u{1}\"]]",
+        ];
+        for t in tags {
+            agrees(&base.replace(r#""tags":[]"#, &format!(r#""tags":{t}"#)));
+        }
+        for c in [
+            r#""a\"b""#,
+            r#""a\\""#,
+            r#""\u00e9""#,
+            r#""\ud83e\udd80""#,
+            r#""\ud800""#,
+            r#""\q""#,
+            "\"a\u{1}b\"",
+            "\"a\tb\"",
+            "\"\u{7f}\"",
+            r#""a"b""#,
+            r#""a\""#,
+        ] {
+            agrees(&base.replace(r#""content":"c""#, &format!(r#""content":{c}"#)));
+        }
+        let sig_at = base.find(r#""sig":""#).unwrap() + 7;
+        let upper = format!("{}{}", &base[..sig_at], base[sig_at..].to_uppercase());
+        agrees(&upper);
+        let upper_id = format!(
+            "{}{}{}",
+            &base[..ID_AT],
+            base[ID_AT..ID_AT + 64].to_uppercase(),
+            &base[ID_AT + 64..]
+        );
+        agrees(&upper_id);
+        for tail in [" ", "\n", "x", "}", " }"] {
+            agrees(&format!("{base}{tail}"));
+        }
+        agrees(&format!(" {base}"));
+        agrees(&base.replacen('{', "{ ", 1));
+        agrees(&base[..base.len() - 1]);
+        agrees("");
+        agrees("{}");
     }
 
     #[test]
@@ -5627,19 +6273,66 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         assert_eq!(db.logical_bytes().unwrap(), 0);
     }
 
+    /// A version 4 store, today's layout without `events_kind`, opens at
+    /// version 5 with the index built and answers as it did.
+    #[test]
+    fn a_version_4_store_opens_at_version_5_with_the_kind_index() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("events.sqlite");
+        let key = Keys::generate();
+        let filter: Filter = serde_json::from_value(serde_json::json!({"kinds": [1]})).unwrap();
+        let ids = |db: &SqliteEventStore| -> Vec<String> {
+            db.query_stored(Visibility::Public, &filter, NOW)
+                .unwrap()
+                .into_iter()
+                .map(|e| e.id)
+                .collect()
+        };
+        let before = {
+            let db = SqliteEventStore::open(&path, 10_000_000).unwrap();
+            for n in 0..20u64 {
+                let kind = if n % 2 == 0 { 1 } else { 7 };
+                let e = event(&key, kind, NOW - 100 + n / 2, &format!("n{n}"), &[]);
+                db.put(Visibility::Public, &e, NOW).unwrap();
+            }
+            ids(&db)
+        };
+        assert_eq!(before.len(), 10);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP INDEX events_kind; PRAGMA user_version=4;")
+                .unwrap();
+        }
+        // The rows read the same at either version, so either exports.
+        let export = || export_stored(&path, Visibility::Public, NOW, |_| Ok(())).unwrap();
+        assert_eq!(export(), 20);
+        let db = SqliteEventStore::open(&path, 10_000_000).unwrap();
+        assert_eq!(ids(&db), before);
+        drop(db);
+        let conn = Connection::open(&path).unwrap();
+        assert!(index_exists(&conn, "events_kind").unwrap());
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        drop(conn);
+        assert_eq!(export(), 20);
+    }
+
     #[test]
     fn newer_or_unrelated_databases_are_refused_without_modification() {
         let tmp = TempDir::new().unwrap();
         let path = tmp.path().join("future.sqlite");
         {
             let db = Connection::open(&path).unwrap();
-            db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES('untouched'); PRAGMA user_version=5;").unwrap();
+            db.execute_batch("CREATE TABLE saved(value); INSERT INTO saved VALUES('untouched'); PRAGMA user_version=6;").unwrap();
         }
         let refused = SqliteEventStore::open(&path, 1000);
         assert!(matches!(
             refused,
             Err(EventStoreError::NewerSchema {
-                found: 5,
+                found: 6,
                 supported: SCHEMA_VERSION
             })
         ));
@@ -5655,7 +6348,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         assert_eq!(
             db.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))
                 .unwrap(),
-            5
+            6
         );
     }
 
@@ -9556,6 +10249,26 @@ PRAGMA user_version=2;")).unwrap();
         );
         no_sort(&plan);
         let plan = plan_of(serde_json::json!({"limit": 50}));
+        assert!(
+            plan.contains("USING INDEX events_time (visibility=?)"),
+            "{plan}"
+        );
+        no_sort(&plan);
+        // One kind walks `events_kind` newest first, with or without a time
+        // range; several keep the time walk rather than sort.
+        for filter in [
+            serde_json::json!({"kinds": [1], "limit": 50}),
+            serde_json::json!({"kinds": [1], "since": NOW - 80, "limit": 50}),
+            serde_json::json!({"kinds": [1], "until": NOW - 20}),
+        ] {
+            let plan = plan_of(filter.clone());
+            assert!(
+                plan.contains("USING INDEX events_kind (visibility=? AND kind=?"),
+                "{filter}: {plan}"
+            );
+            no_sort(&plan);
+        }
+        let plan = plan_of(serde_json::json!({"kinds": [1, 7], "limit": 50}));
         assert!(
             plan.contains("USING INDEX events_time (visibility=?)"),
             "{plan}"

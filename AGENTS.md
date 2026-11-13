@@ -34,7 +34,7 @@ crates/
                      engine and the policy traits it asks
   wok-ws/
     src/lib.rs     - Door: the WebSocket doors, their budgets, Admission
-  wok-bench/       - store-level baseline benchmark (not published)
+  wok-bench/       - store-level baselines and remote-relay comparison (not published)
   wokd/
     src/lib.rs     - Config, Members, PerAddress, run/serve, reload, remove
     src/main.rs    - the wokd command line and its SIGHUP reload

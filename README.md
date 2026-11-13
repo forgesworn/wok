@@ -55,10 +55,14 @@ operator. Whoever runs an instance operates it; see
 
 ## Storage compatibility
 
-The store is at schema version 4, the format Bothy's event store writes
-today, so an existing Bothy event database opens unchanged. An older build refuses a newer
-schema rather than downgrading it in place; going back is an export with the
-newer build and an import with the older one.
+The store is at schema version 5: version 4, the format Bothy's event store
+writes today, with one more index. A version 4 store, an existing Bothy event
+database included, opens and is upgraded at its first open with this build,
+which builds the index; the store is marked version 5 only once the index is
+there. After that, builds that know only version 4, current Bothy builds
+among them, refuse it. An older build refuses a newer schema rather than
+downgrading it in place; going back is an export with the newer build and an
+import with the older one.
 
 ## Performance
 

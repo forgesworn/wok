@@ -57,6 +57,20 @@ pub const AUTH_DEADLINE_SECS: u64 = 15;
 /// which says as much; the document lets a client know before it connects.
 pub const RELAY_INFORMATION: bool = true;
 
+/// The runtime's worker threads, unless the configuration says otherwise.
+/// tokio's own default is one per core, and every worker keeps buffers and
+/// allocator state of its own. Store work runs on the blocking pool and the
+/// store's own threads, not on the workers, and a door holds at most 32
+/// connections, so a group's relay needs few. Only the `wokd` binary applies
+/// it, when it builds its runtime; [`run`] and [`serve`] use whatever
+/// runtime calls them.
+pub const WORKERS: usize = 2;
+
+/// The writer connection's page cache, in KiB: a quarter of
+/// [`StoreOptions::server`]'s. The relay's other store settings are the
+/// server profile's.
+const WRITER_CACHE_KIB: u32 = 256;
+
 /// How often expired events are swept (NIP-40).
 const EXPIRY_INTERVAL: Duration = Duration::from_secs(60);
 
@@ -241,6 +255,7 @@ struct File {
     sockets_per_address: Option<usize>,
     auth_deadline_secs: Option<u64>,
     relay_information: Option<bool>,
+    workers: Option<usize>,
 }
 
 /// A checked configuration.
@@ -264,6 +279,8 @@ pub struct Config {
     pub auth_deadline: Duration,
     /// See [`RELAY_INFORMATION`].
     pub relay_information: bool,
+    /// See [`WORKERS`].
+    pub workers: usize,
 }
 
 /// Why a configuration was refused. No message repeats a value from the
@@ -291,6 +308,8 @@ pub enum ConfigError {
     MaxStoreBytes,
     #[error("auth_deadline_secs must be from 1 to 300")]
     AuthDeadline,
+    #[error("workers must be at least 1")]
+    Workers,
 }
 
 impl Config {
@@ -361,6 +380,10 @@ impl Config {
         if !(1..=300).contains(&auth_deadline_secs) {
             return Err(ConfigError::AuthDeadline);
         }
+        let workers = file.workers.unwrap_or(WORKERS);
+        if workers == 0 {
+            return Err(ConfigError::Workers);
+        }
         Ok(Self {
             listen,
             url,
@@ -371,6 +394,7 @@ impl Config {
             sockets_per_address,
             auth_deadline: Duration::from_secs(auth_deadline_secs),
             relay_information: file.relay_information.unwrap_or(RELAY_INFORMATION),
+            workers,
         })
     }
 }
@@ -433,6 +457,7 @@ pub fn reload(running: &Config, members: &Members, next: Config) -> Reloaded {
         "relay_information",
         running.relay_information != next.relay_information,
     );
+    differs("workers", running.workers != next.workers);
     Reloaded {
         members: members.replace(next.members),
         restart_only,
@@ -484,7 +509,10 @@ pub async fn serve(
             &path,
             max_bytes,
             min_free_bytes,
-            StoreOptions::server(),
+            StoreOptions {
+                writer_cache_kib: WRITER_CACHE_KIB,
+                ..StoreOptions::server()
+            },
         )
     })
     .await
@@ -769,6 +797,23 @@ mod tests {
         );
         assert_eq!(config.members, vec![alice.public_key()]);
         assert_eq!(config.relay_information, RELAY_INFORMATION);
+        assert_eq!(config.workers, WORKERS);
+    }
+
+    #[test]
+    fn the_worker_count_is_at_least_one() {
+        let alice = Keys::generate();
+        let members = format!("\"{}\"", npub(&alice));
+        let config = Config::from_toml(&file(&members, "workers = 4")).unwrap();
+        assert_eq!(config.workers, 4);
+        assert_eq!(
+            Config::from_toml(&file(&members, "workers = 0")).unwrap_err(),
+            ConfigError::Workers
+        );
+        assert!(matches!(
+            Config::from_toml(&file(&members, "workers = -1")).unwrap_err(),
+            ConfigError::Parse { .. }
+        ));
     }
 
     #[test]
@@ -932,7 +977,7 @@ mod tests {
         let changed = file(
             &format!("\"{}\"", npub(&bob)),
             "listen = \"127.0.0.1:7448\"\nsockets_per_address = 2\nauth_deadline_secs = 30\n\
-             relay_information = false",
+             relay_information = false\nworkers = 3",
         )
         .replace(
             "ws://relay.example:7447/events",
@@ -953,6 +998,7 @@ mod tests {
                 "sockets_per_address",
                 "auth_deadline_secs",
                 "relay_information",
+                "workers",
             ]
         );
         assert!(done.members.unchanged());

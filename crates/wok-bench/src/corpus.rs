@@ -104,8 +104,15 @@ pub fn notes_key(seed: u64) -> Result<Keys, String> {
     Keys::parse(&secret_hex(seed ^ 0x6661_6E6F_7574, 0)).map_err(|e| format!("a notes key: {e}"))
 }
 
-/// Build and sign the corpus. Signing is the slow part and is never timed.
+/// Build and sign the corpus on the fixed benchmark clock. Signing is the slow
+/// part and is never timed.
 pub fn build(cfg: &Config) -> Result<Corpus, String> {
+    build_at(cfg, NOW)
+}
+
+/// Build the same corpus with its newest timestamps near `now`, for export to
+/// relays that reject events too far in the future or too far in the past.
+pub fn build_at(cfg: &Config, now: u64) -> Result<Corpus, String> {
     let events = cfg.events;
     let author_count = cfg.authors;
     if author_count < 2 {
@@ -123,8 +130,8 @@ pub fn build(cfg: &Config) -> Result<Corpus, String> {
     let keys = author_keys(cfg)?;
     let authors: Vec<PublicKey> = keys.iter().map(Keys::public_key).collect();
     let mut rng = SplitMix(cfg.seed ^ 0x636F_7270_7573);
-    // Distinct, increasing timestamps that all precede NOW.
-    let base = NOW - 10 * events as u64 - 1_000;
+    // Distinct, increasing timestamps that all precede the chosen clock.
+    let base = now - 10 * events as u64 - 1_000;
 
     let mut items: Vec<Item> = Vec::with_capacity(events);
     let mut ids: Vec<String> = Vec::with_capacity(E_TARGETS);
