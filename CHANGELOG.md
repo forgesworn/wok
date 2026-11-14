@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `wok-bench relay write --rate` holds its writer sockets open, each
+  authenticated once, and sends on an open-loop schedule: `--rate N` writes
+  a second, or `burst` for every event due at once. It reports latency from
+  each event's due time and from the flush that carried it to its OK, so a
+  stall shows in every write queued behind it. Every socket stays inside
+  wokd's production frame limit, and writers and readers together take at
+  most 32 sockets. `--readers` adds REQs at `--read-rate`, drawn from the
+  seeded corpus (`--input`), while it writes. The default write workload, a
+  fresh connection per event, is unchanged.
+- `--wal-index` names a Wok store's `-shm` file, which the run reads
+  read-only and without a lock to report commits, log growth, restarts and
+  checkpoint runs beside the write latencies. It cannot tell a PASSIVE
+  checkpoint from a blocking FULL one. The libraries and `wokd` are
+  unchanged.
+
 ## 0.6.0 - 2026-11-13
 
 - `wok-store`: schema version 5. It is version 4 with one more index,
