@@ -30,7 +30,7 @@ mod ack_only;
 pub(crate) mod client;
 pub(crate) mod door_path;
 pub(crate) mod guest_path;
-mod server;
+pub(crate) mod server;
 
 use std::collections::HashSet;
 use std::sync::Arc;

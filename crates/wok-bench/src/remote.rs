@@ -1,7 +1,10 @@
 //! Remote-relay comparison workloads. The same signed corpus can seed Wok and
 //! another Nostr relay; the clients then drive real WebSocket connections.
-//! Fresh connections keep every workload inside wokd's production frame and
-//! connection limits. These are not steady-state write-ceiling measurements.
+//! Every workload stays inside wokd's production frame and connection limits.
+//! The query, fan-out and default write workloads open a fresh connection per
+//! request, so they are not steady-state write-ceiling measurements. `write
+//! --rate` holds its sockets instead and sends on an open-loop schedule; see
+//! the `held` module.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, BufWriter, Write};
@@ -25,6 +28,9 @@ use crate::config::Config;
 use crate::corpus::{Corpus, Item, KIND_ARTICLE, KIND_NOTE, author_keys, build_at};
 use crate::socket::client::{Frame, Socket, close_cleanly, connect_authenticated, connect_plain};
 use crate::support::{SplitMix, ms, per_second, prepare, put_chunk, summarise, verify_population};
+
+mod held;
+mod wal_index;
 
 const LIVE_KIND: u16 = 1460;
 const WAIT: Duration = Duration::from_secs(30);
@@ -102,6 +108,10 @@ impl Opts {
 
     fn path(&mut self, name: &str) -> Result<PathBuf, String> {
         self.required(name).map(PathBuf::from)
+    }
+
+    fn optional(&mut self, name: &str) -> Option<String> {
+        self.0.remove(name)
     }
 
     fn finish(self) -> Result<(), String> {
@@ -486,6 +496,16 @@ async fn one_write(
 }
 
 async fn write(mut opts: Opts) -> Result<Value, String> {
+    if let Some(rate) = opts.optional("rate") {
+        return held::write(opts, &rate).await;
+    }
+    for name in ["readers", "read-rate", "read-set", "input", "wal-index"] {
+        if opts.0.contains_key(name) {
+            return Err(format!(
+                "--{name} needs --rate: it belongs to the held-socket mode"
+            ));
+        }
+    }
     let url = opts.required("url")?;
     let events = opts.number("events", 500usize)?;
     let connections = opts.number("connections", 8usize)?;
