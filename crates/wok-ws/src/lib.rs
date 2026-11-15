@@ -1,10 +1,11 @@
 //! WebSocket transport for Wok's relay session engine ([`wok_store::relay`]).
 //!
-//! A [`Door`] holds the connection and work budgets one relay's doors share,
-//! and hands out unbound axum routers: one for the public partition and one
-//! for the sheltered partition. This crate opens no port; the application
-//! binds the listener, chooses which router goes on which listener, and
-//! supplies the identity its sheltered door admits ([`Admission`]).
+//! A [`Door`] holds the connection, work and read budgets one relay's doors
+//! share, and hands out unbound axum routers: one for the public partition
+//! and one for the sheltered partition. This crate opens no port; the
+//! application binds the listener, chooses which router goes on which
+//! listener, and supplies the identity its sheltered door admits
+//! ([`Admission`]).
 //!
 //! The public router never mounts the sheltered partition. It serves the
 //! NIP-11 relay information document; a sheltered router serves one only
@@ -41,17 +42,25 @@ pub const PATH: &str = "/events";
 const IO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Store and authority work the relay runs on the blocking pool at once,
-/// across both partitions (the public door's allowance is a subset of these).
-/// Every `spawn_blocking` the door makes for the store, an authority check or
-/// an expiry sweep holds one of them; the only other one it makes, an EVENT
-/// frame's parse and signature check, is CPU only. Size the runtime's
-/// blocking pool with this in mind.
+/// across both partitions. Every `spawn_blocking` the door makes for the
+/// store, an authority check or an expiry sweep holds one of them, except a
+/// REQ's query, which holds one of the [`READ_PERMITS`] instead; the only
+/// other one it makes, an EVENT frame's parse and signature check, is CPU
+/// only. Size the runtime's blocking pool for both budgets with this in mind.
 pub const WORK_PERMITS: usize = 2;
+
+/// REQ queries the relay runs on the blocking pool at once, across both
+/// partitions, beside the [`WORK_PERMITS`]. A REQ's query, and the authority
+/// check before it, take one of these, so REQs and EVENT intake do not queue
+/// behind each other for a permit. COUNT and negentropy stay on the work
+/// permits, and share the store's read connections with REQs.
+pub const READ_PERMITS: usize = 2;
 
 /// Connections across both doors, and the public door's share of them.
 const CONNECTIONS: usize = 32;
 const PUBLIC_CONNECTIONS: usize = 24;
-/// The public door's share of [`WORK_PERMITS`].
+/// The public door's allowance, taken before a work or read permit: no more
+/// than this many public steps run at once, REQs included.
 const PUBLIC_WORK_PERMITS: usize = 1;
 
 /// Per-connection WebSocket read buffer and write threshold, in bytes:
@@ -143,8 +152,8 @@ impl Admitted {
     }
 }
 
-/// One relay's doors: the routers, and the connection and work budgets they
-/// share. Cloning shares the budgets.
+/// One relay's doors: the routers, and the connection, work and read budgets
+/// they share. Cloning shares the budgets.
 #[derive(Clone)]
 pub struct Door {
     relay: Arc<EventRelay>,
@@ -152,6 +161,7 @@ pub struct Door {
     public_connections: Arc<Semaphore>,
     work: Arc<Semaphore>,
     public_work: Arc<Semaphore>,
+    reads: Arc<Semaphore>,
     stop: Arc<tokio::sync::watch::Sender<bool>>,
     timings: Timings,
 }
@@ -168,6 +178,7 @@ impl Door {
             public_connections: Arc::new(Semaphore::new(PUBLIC_CONNECTIONS)),
             work: Arc::new(Semaphore::new(WORK_PERMITS)),
             public_work: Arc::new(Semaphore::new(PUBLIC_WORK_PERMITS)),
+            reads: Arc::new(Semaphore::new(READ_PERMITS)),
             stop: Arc::new(tokio::sync::watch::channel(false).0),
             timings,
         }
@@ -183,8 +194,9 @@ impl Door {
     }
 
     /// Replace the work budget: `shared` blocking-pool slots across both
-    /// doors, of which public work may hold `public`. The defaults are
-    /// [`WORK_PERMITS`] and 1. Call before any router is built.
+    /// doors, and the public door's allowance of `public`, which public REQs
+    /// take too. The defaults are [`WORK_PERMITS`] and 1. Call before any
+    /// router is built.
     pub fn with_work_limits(mut self, shared: usize, public: usize) -> Self {
         self.work = Arc::new(Semaphore::new(shared));
         self.public_work = Arc::new(Semaphore::new(public));
@@ -483,13 +495,25 @@ fn now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Run `f` on the blocking pool under a work permit.
 async fn apply<T: Send + 'static>(
+    session: RelaySession,
+    state: &SocketState,
+    f: impl FnOnce(&mut RelaySession) -> T + Send + 'static,
+) -> Option<(RelaySession, T)> {
+    apply_on(&state.door.work, session, state, f).await
+}
+
+/// [`apply`] under a permit from `pool`: the work permits, or the read
+/// permits for a REQ's query.
+async fn apply_on<T: Send + 'static>(
+    pool: &Arc<Semaphore>,
     mut session: RelaySession,
     state: &SocketState,
     f: impl FnOnce(&mut RelaySession) -> T + Send + 'static,
 ) -> Option<(RelaySession, T)> {
     // Acquire the public allowance first, so queued public work cannot hold
-    // the shared permits reserved for private operations and expiry sweeps.
+    // the permits reserved for private operations and expiry sweeps.
     let permits = timeout(IO_TIMEOUT, async {
         let public = if state.visibility == Visibility::Public {
             Some(
@@ -501,7 +525,7 @@ async fn apply<T: Send + 'static>(
         } else {
             None
         };
-        let shared = Arc::clone(&state.door.work).acquire_owned().await.ok()?;
+        let shared = Arc::clone(pool).acquire_owned().await.ok()?;
         Some((public, shared))
     })
     .await
@@ -520,6 +544,7 @@ async fn apply<T: Send + 'static>(
 /// permit; an event that passes them is queued for the relay's single writer
 /// with no permit held, so waiting for its commit (which is shared with the
 /// other connections' events) occupies neither a permit nor a blocking thread.
+/// A REQ goes to [`stream_request`], under a read permit instead.
 async fn handle_prepared(
     socket: &mut WebSocket,
     session: RelaySession,
@@ -560,7 +585,8 @@ fn with_held(held: Vec<String>, replies: Vec<String>) -> Vec<String> {
 }
 
 /// A REQ whose events go to the socket as the store reads them. The session
-/// runs on the blocking pool under a work permit and sends each EVENT frame
+/// runs on the blocking pool under a read permit (one of [`READ_PERMITS`],
+/// after the public allowance on the public door) and sends each EVENT frame
 /// into an unbounded channel, so it never waits on a slow peer while holding
 /// the permit; the page is already bounded by `MAX_REQ_REPLY_BYTES`, so the
 /// channel holds no more than the reply vector did. The permit is dropped
@@ -572,9 +598,10 @@ fn with_held(held: Vec<String>, replies: Vec<String>) -> Vec<String> {
 /// [`deliver`], as for any other frame.
 ///
 /// A sheltered connection's authority is checked, as [`deliver`] checks it,
-/// before the query: on a refusal the buffered path answers, and `deliver`
-/// strips any event from its replies. The session judges its own authority
-/// before the query too, so no event is sent to a reader who fails either.
+/// before the query and under the same permit: on a refusal the buffered path
+/// answers, and `deliver` strips any event from its replies. The session
+/// judges its own authority before the query too, so no event is sent to a
+/// reader who fails either.
 async fn stream_request(
     socket: &mut WebSocket,
     session: RelaySession,
@@ -583,7 +610,7 @@ async fn stream_request(
 ) -> Result<Option<(RelaySession, (Vec<String>, bool))>, Closing> {
     let sheltered = state.visibility == Visibility::Sheltered;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let work = apply(session, state, move |s| {
+    let query = apply_on(&state.door.reads, session, state, move |s| {
         if sheltered && !s.can_read_live(now()) {
             return s.begin_prepared(prepared, now());
         }
@@ -612,7 +639,7 @@ async fn stream_request(
             other => other,
         }
     });
-    tokio::pin!(work);
+    tokio::pin!(query);
     let mut open = true;
     let outcome = loop {
         tokio::select! {
@@ -630,7 +657,7 @@ async fn stream_request(
                 }
                 send(socket, frames).await?;
             },
-            done = &mut work => break done,
+            done = &mut query => break done,
         }
     };
     // Whatever the closure sent before it returned is still queued.
@@ -3033,6 +3060,96 @@ mod tests {
             json!(["NOTICE", "rate-limited: slow down"])
         );
         assert!(closes_within(&mut reader, Duration::from_secs(5)).await);
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// A REQ's query, and the authority check before it, take a read permit:
+    /// with every work permit held, a keeper's REQ on the sheltered door is
+    /// answered, and its read permit is back before the EOSE. (The AUTH and
+    /// the EVENT take work permits, so they go first.)
+    #[tokio::test]
+    async fn a_req_is_answered_while_every_work_permit_is_held() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (url, task) = listen(&routes, Visibility::Sheltered).await;
+        let mut keeper = connect(&url, Some(&key)).await;
+        let note = event(&key, 1, now(), "stored", vec![]);
+        send_frame(&mut keeper, json!(["EVENT", note])).await;
+        assert_eq!(receive(&mut keeper).await[2], true);
+
+        let held = Arc::clone(&routes.work)
+            .acquire_many_owned(WORK_PERMITS as u32)
+            .await
+            .unwrap();
+        send_frame(&mut keeper, json!(["REQ", "q", {"kinds": [1]}])).await;
+        let reply = timeout(Duration::from_secs(2), receive(&mut keeper))
+            .await
+            .expect("the REQ waited for a work permit");
+        assert_eq!(reply[0], "EVENT");
+        assert_eq!(reply[2]["id"], note.id.to_hex());
+        assert_eq!(receive(&mut keeper).await, json!(["EOSE", "q"]));
+        assert_eq!(routes.reads.available_permits(), READ_PERMITS);
+        drop(held);
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// With every read permit held, a REQ waits for one, though every work
+    /// permit is free.
+    #[tokio::test]
+    async fn a_req_waits_for_a_read_permit_not_a_work_permit() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (url, task) = listen(&routes, Visibility::Sheltered).await;
+        let mut keeper = connect(&url, Some(&key)).await;
+
+        let held = Arc::clone(&routes.reads)
+            .acquire_many_owned(READ_PERMITS as u32)
+            .await
+            .unwrap();
+        send_frame(&mut keeper, json!(["REQ", "q", {"kinds": [1]}])).await;
+        assert!(
+            timeout(Duration::from_millis(200), keeper.next())
+                .await
+                .is_err(),
+            "no reply while every read permit is held"
+        );
+        assert_eq!(routes.work.available_permits(), WORK_PERMITS);
+        drop(held);
+        assert_eq!(receive(&mut keeper).await, json!(["EOSE", "q"]));
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// A public REQ takes the public door's allowance before its read permit,
+    /// as all public work does: with the allowance held, it waits, though
+    /// every read and work permit is free.
+    #[tokio::test]
+    async fn a_public_req_takes_the_public_allowance_before_its_read_permit() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let routes = routes(&tmp, &key);
+        let (public, task) = listen(&routes, Visibility::Public).await;
+        let mut reader = connect(&public, None).await;
+
+        let held = Arc::clone(&routes.public_work)
+            .acquire_owned()
+            .await
+            .unwrap();
+        send_frame(&mut reader, json!(["REQ", "q", {"kinds": [1]}])).await;
+        assert!(
+            timeout(Duration::from_millis(200), reader.next())
+                .await
+                .is_err(),
+            "no reply while the public allowance is held"
+        );
+        assert_eq!(routes.reads.available_permits(), READ_PERMITS);
+        assert_eq!(routes.work.available_permits(), WORK_PERMITS);
+        drop(held);
+        assert_eq!(receive(&mut reader).await, json!(["EOSE", "q"]));
         routes.shutdown();
         task.abort();
     }
