@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.1 - 2026-11-15
 
 - `wok-ws`: a REQ's query, and the authority check before it, now take one
   of `READ_PERMITS` (2) instead of one of the `WORK_PERMITS` (2) that EVENT
