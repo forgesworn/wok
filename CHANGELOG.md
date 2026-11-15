@@ -2,6 +2,18 @@
 
 ## Unreleased
 
+- `wok-ws`: a REQ's query, and the authority check before it, now take one
+  of `READ_PERMITS` (2) instead of one of the `WORK_PERMITS` (2) that EVENT
+  intake, AUTH, COUNT, negentropy, authority refreshes and expiry sweeps
+  share, so REQs no longer wait for a work permit behind EVENT intake, nor
+  EVENT intake behind REQs. A public REQ still takes the public door's
+  allowance first, so the public door still runs one step at a time, REQs
+  included. Up to 4 store and authority steps can now run on the blocking
+  pool at once, where it was 2: an application that sizes its blocking pool
+  from `WORK_PERMITS` should add `READ_PERMITS`. COUNT and negentropy, and
+  any store read an application makes under a work permit, share the
+  store's two read connections with REQs, so one of them can wait for a
+  connection, holding its work permit, while two REQs read.
 - `wok-bench relay write --rate` holds its writer sockets open, each
   authenticated once, and sends on an open-loop schedule: `--rate N` writes
   a second, or `burst` for every event due at once. It reports latency from
@@ -14,8 +26,8 @@
 - `--wal-index` names a Wok store's `-shm` file, which the run reads
   read-only and without a lock to report commits, log growth, restarts and
   checkpoint runs beside the write latencies. It cannot tell a PASSIVE
-  checkpoint from a blocking FULL one. The libraries and `wokd` are
-  unchanged.
+  checkpoint from a blocking FULL one. It changes nothing in the libraries
+  or `wokd`.
 
 ## 0.6.0 - 2026-11-13
 

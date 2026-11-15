@@ -64,8 +64,9 @@ const CLIENT_WORKERS: usize = 4;
 /// in `wok-ws`, which are private), recorded beside the raised values.
 const PRODUCTION_SHARED_CONNECTIONS: usize = 32;
 const PRODUCTION_PUBLIC_CONNECTIONS: usize = 24;
-/// The public door's own work permits (`PUBLIC_WORK_PERMITS` in `wok-ws`,
-/// which is private). The shared ones are `wok_ws::WORK_PERMITS`.
+/// The public door's allowance (`PUBLIC_WORK_PERMITS` in `wok-ws`, which is
+/// private), taken before a work or read permit. The shared ones are
+/// `wok_ws::WORK_PERMITS` and `wok_ws::READ_PERMITS`.
 const PRODUCTION_PUBLIC_WORK_PERMITS: usize = 1;
 /// A kind the public door does not take (`PUBLIC_KINDS` lacks it).
 const REFUSED_KIND: u16 = 30023;
@@ -436,7 +437,8 @@ fn allowances(widest: usize) -> Value {
         "work_limits": {
             "production_shared": wok_ws::WORK_PERMITS,
             "production_public": PRODUCTION_PUBLIC_WORK_PERMITS,
-            "note": "each variant names its own shared/public permits, passed to `Door::with_work_limits`",
+            "production_reads": wok_ws::READ_PERMITS,
+            "note": "each variant names its own shared/public permits, passed to `Door::with_work_limits`; the read permits, which only REQs take, stay at `production_reads`",
         },
         "unchanged": "signature verification, AUTH, kind and author rules, writer limits and durability are the production ones",
     })
