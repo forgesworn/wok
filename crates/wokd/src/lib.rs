@@ -1,11 +1,11 @@
 //! `wokd`: a members-only Nostr relay built on Wok.
 //!
-//! One server is one group. The operator lists the group's public keys; each
-//! connection must authenticate (NIP-42) as one of them before it may read,
-//! write, count or reconcile anything, and every member reads everything the
-//! group has stored. There is no open mode. Only the sheltered door is
-//! served, and the listener binds to loopback unless the operator says
-//! otherwise.
+//! One server is one group. The operator lists its keeper keys; each connection
+//! must authenticate (NIP-42) as a keeper or as a guest holding a signed room
+//! scope before it may read, write, count or reconcile anything. Keepers read
+//! everything; guests only their granted rooms and kinds. There is no open
+//! mode. Only the sheltered door is served, and the listener binds to loopback
+//! unless the operator says otherwise.
 //!
 //! Membership is read from the configuration at start, and again whenever
 //! [`serve`] is handed a reloaded configuration (the binary reloads on
@@ -13,6 +13,9 @@
 //! every other setting takes a restart. Several groups means one instance
 //! each.
 
+mod authority;
+
+use authority::RoomAuthority;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
@@ -30,7 +33,7 @@ use serde::Deserialize;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, mpsc, watch};
 use url::Url;
-use wok_store::relay::{EventRelay, KeeperAccess};
+use wok_store::relay::{AuthorityEvents, EventRelay, GuestAuthority, KeeperAccess};
 use wok_store::{SqliteEventStore, StoreOptions, Visibility};
 use wok_ws::{Admission, Admitted, Door, PATH, Timings};
 
@@ -412,6 +415,8 @@ pub enum RunError {
     Lock(std::io::Error),
     #[error("could not open the event store: {0}")]
     Store(String),
+    #[error("could not open the room authority: {0}")]
+    Authority(String),
     #[error("the server stopped: {0}")]
     Serve(std::io::Error),
 }
@@ -519,6 +524,14 @@ pub async fn serve(
     .map_err(|error| RunError::Store(error.to_string()))?
     .map_err(|error| RunError::Store(error.to_string()))?;
     let members = Arc::new(Members::new(config.members.iter().copied()));
+    let authority = Arc::new(
+        RoomAuthority::open(
+            &config.data_dir.join("room-authority.sqlite"),
+            config.url.to_string(),
+            Arc::clone(&members),
+        )
+        .map_err(|error| RunError::Authority(error.to_string()))?,
+    );
     let running = config.clone();
     // A non-member's refused AUTH is final, and so is one that names another
     // relay URL than `url`: a stock client would otherwise be sent a fresh
@@ -528,6 +541,8 @@ pub async fn serve(
             Arc::new(store),
             Arc::clone(&members) as Arc<dyn KeeperAccess>,
         )
+        .with_guest_authority(Arc::clone(&authority) as Arc<dyn GuestAuthority>)
+        .with_authority_events(authority as Arc<dyn AuthorityEvents>)
         .with_final_access_refusal()
         .with_final_url_refusal(),
     );
