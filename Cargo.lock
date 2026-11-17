@@ -2233,6 +2233,7 @@ dependencies = [
  "libc",
  "nostr",
  "nostr-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

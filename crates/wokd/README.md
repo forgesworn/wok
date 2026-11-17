@@ -1,17 +1,26 @@
 # wokd
 
 `wokd` is a members-only Nostr relay built on Wok. One instance serves one
-group: you list the group's public keys, and only those keys can read or
-write anything. ForgeSworn publishes the software and runs no instance of it.
-Whoever runs one operates it, and is responsible for it.
+group: you list its keeper public keys, which have full access, and those
+keepers can sign room-scoped grants for guests. ForgeSworn publishes the
+software and runs no instance of it. Whoever runs one operates it, and is
+responsible for it.
 
 ## What it does
 
 - Every read, write, count and reconciliation needs NIP-42 authentication as
-  a listed key. A key that is not listed is refused when it authenticates,
-  and gets nothing. It is not challenged again, so a client does not keep
-  signing: everything else it sends on that connection is refused as
-  `restricted:`, and a listed key can still authenticate there.
+  a listed keeper or a guest with a current grant. A key with neither is
+  refused when it authenticates, and gets nothing. It is not challenged again,
+  so a client does not keep signing: everything else it sends on that
+  connection is refused as `restricted:`, and a key with access can still
+  authenticate there.
+- A keeper's signed kind-24242 `t=event-grant` event names this relay's exact
+  `ws://` or `wss://` `/events` URL, one room, a guest persona and device, the
+  allowed kinds and an expiry. The relay installs it as authority, never as
+  room history. Ordinary rooms currently read kinds 1460, 1462 and 20461 and
+  write kinds 1460 and 20461; calls, new invitations, rekeys and protected MLS
+  are outside this guest profile. Exact retries are safe. A newer grant,
+  terminal revocation, expiry or removal of its keeper takes away the access.
 - It listens on loopback (`127.0.0.1:7447`) unless you say otherwise. Anyone
   who can reach the address can open a connection and receive the AUTH
   challenge; only members can authenticate.
@@ -49,6 +58,21 @@ client sent. Anyone who can connect can cause that warning, so it points at
 
 Several groups means one instance each.
 
+The repository root also has a production Docker image definition. It builds
+only `wokd`, runs it as uid 10001 and keeps state in `/data`; it is not the
+benchmark image and no published image is implied:
+
+```sh
+docker build -t localhost/wokd:dev .
+docker run --rm -p 127.0.0.1:7447:7447 \
+  -v "$PWD/wokd.toml:/etc/wokd/wokd.toml:ro" \
+  -v wok-data:/data localhost/wokd:dev
+```
+
+Use `data_dir = "/data"` in that configuration. The Compose deployment bundle
+adds TLS and keeps this listener private; do not expose plain `ws://` beyond
+loopback or a deliberately isolated network.
+
 ## Changing the members
 
 Edit `members` and send `wokd` SIGHUP (`kill -HUP <pid>`; under systemd,
@@ -57,8 +81,9 @@ new list without a restart:
 
 - A removed key's open subscriptions are closed with `CLOSED`
   (`restricted: sheltered authority changed`), then its connection. Nothing
-  more is read or stored for it, and it is refused if it comes back. What it
-  stored stays in the store, and what it was sent stays with its clients;
+  more is read or stored for it, and it is refused if it comes back. Grants it
+  issued stop counting too, so its guests lose their scoped access. What the
+  key stored stays in the store, and what it was sent stays with its clients;
   `wokd remove` is for the first.
 - An added key can authenticate, on a new connection or on one that had not
   yet authenticated. A client that key used before the reload was refused
@@ -79,19 +104,24 @@ SIGHUP does not stop `wokd`, so closing the terminal it runs in leaves it
 running; stop it with SIGTERM or Ctrl-C. On Windows there is no SIGHUP, and
 a change of members takes a restart.
 
-## What members and the operator can see
+## What members, guests and the operator can see
 
-- Every member reads everything the group stores.
+- Every keeper reads everything the group stores. A guest reads only the
+  rooms and kinds its current grants name, and writes only with the granted
+  device key. The relay never fans a grant out as content.
 - Events are stored as clients send them. Unless a client encrypts an event
   (a NIP-59 gift wrap, say, which still shows its outer event), its content
   can be read by you, by anyone with the data directory or its backups, and
   by every member.
-- A member can store an event signed by any key, including keys outside the
+- A keeper can store an event signed by any key, including keys outside the
   group. NIP-09 deletion is its author's alone, so nobody can delete such an
   event over the protocol; you can, with `wokd remove`.
 - On Unix-like systems, a data directory `wokd` creates is readable by its
   owner only; an existing one is used as it is, with a warning if others can
-  read it.
+  read it. `events.sqlite` holds room events and `room-authority.sqlite`
+  holds signed grants, their exact receipts and replay watermarks. Back up
+  both together. `wokd remove` removes content, not authority; revoke a grant
+  with its signed terminal or remove its keeper.
 
 ## Removing content
 

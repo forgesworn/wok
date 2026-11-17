@@ -1,0 +1,578 @@
+{
+  "schema": 1,
+  "profile": "ordinary-room-admission-v1",
+  "now": 1900000000,
+  "server": "wss://relay.example.org/events",
+  "room": "1111111111111111111111111111111111111111111111111111111111111111",
+  "otherRoom": "2222222222222222222222222222222222222222222222222222222222222222",
+  "keeper": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+  "guest": "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766",
+  "device": "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337",
+  "outsider": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+  "grantId": "ab12cd34ef56ab12cd34ef56ab12cd34",
+  "otherGrantId": "cd34ef56ab12cd34ef56ab12cd34ef56",
+  "events": {
+    "active": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000000,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "033dacd6ba0a3f8881bc37e93edf02cf2f59be371f75a61ffdb2d3439444040f",
+      "sig": "71452fdd1a2558e0c9ef19456d0a237d571b9961c9dae2e329c2052e3efcf765b75f79ac337b66bef0942ef1ba5ca6bd3ebc5ca893d2f10ea6ab1082bcd98c97"
+    },
+    "otherScope": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000005,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "cd34ef56ab12cd34ef56ab12cd34ef56"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "1305b6bad59fe97a0a797c8bf4fb982bb0a26a321a310ffe3254ab89fa5f3a26",
+      "sig": "635d043c31b5140691f3bcd72b082283565b1f85298c92560d61a44358c9c04df3a48fb4f231a4ea52eb71094192589d8106c925521d8c2315c9f68c4558c16a"
+    },
+    "renewal": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000010,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "9e4d0e9865898f8bde38844394ced83f3544f6c10a0fdef706c5a554026d8637",
+      "sig": "fbfa72aec742497794e6a09165ef035252c585013fdf0f23210980af6ba6bdc931f8f13066d53872adb59b4ae63f1a1bc3131a49a56b0d96be9d495e9f06431d"
+    },
+    "changedScope": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000015,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "2222222222222222222222222222222222222222222222222222222222222222"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "7c9b41708f4d759843a90c178a8e61d6af82f9116e037a1dbce2d8d07cd040fc",
+      "sig": "81ff80b7f74418aa98077adc0c55218f2ae5331c13e3eb6361729ea1cabaa456cbe4cc60188ee23f8769e300b1c26262d6dd464cd67dd252d38aa5f510083921"
+    },
+    "revocation": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000020,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "revoked"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "07d1b25545660ff5df549c03159a96694cfbb1f7d448b90dab66f7d4678e35cc",
+      "sig": "8505cd8d32406185ed6ee9f3850af61b923ce811065dd5c47ef8593c81d69e1b9ddffbb57c60dd402893e10aab6d00e286304de7fbe6901c6b26d7ac357be346"
+    },
+    "wrongServer": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000000,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://other.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "a3346bb72e0689b52923ecfcf017ab614ac4a330aa15f9f2ce995d9a86045f03",
+      "sig": "f3dab6d376c70bc4cbb66fdbdbb2c6260ae5811798925c558e8a9c3df5104703b8b1f74ee14ee385270bb9eefe004542e1fce3302e752bd5f800d89669bcd84f"
+    },
+    "expired": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000000,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1899999999"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "02264453e6e6c3404d3cedf113e1cd13440086aff04b61bbf81a3d6fa8532769",
+      "sig": "dab7835c23b0ceb5bc32aa74a25b06cc355183eb79cfc2a4b7ec4e481c63873f0a66fa30f6a10d4f58b0b73244eba3920659e9d5edc4b63d2a23ddd5f2455602"
+    },
+    "vmls": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000000,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "vmls",
+          "67108864"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "1b84c5567b126440995d3ed5aaba0565d71e1834604819ff9c17f5e9d5dd078f",
+      "id": "919d90dbfbeb4f4eef5c50ae2c2851b9b39254cc3c6c17858ff8af6472b34c37",
+      "sig": "2db279339c637f1a4ce0982b638cfb222973d33b3c187507983ca6a506111d53af427c5d8fc6312aaff7d82e3a1e7635ad78155f2dc8197df5c8d70e6630df54"
+    },
+    "foreign": {
+      "kind": 24242,
+      "content": "",
+      "created_at": 1900000000,
+      "tags": [
+        [
+          "t",
+          "event-grant"
+        ],
+        [
+          "server",
+          "wss://relay.example.org/events"
+        ],
+        [
+          "d",
+          "1111111111111111111111111111111111111111111111111111111111111111"
+        ],
+        [
+          "p",
+          "4d4b6cd1361032ca9bd2aeb9d900aa4d45d9ead80ac9423374c451a7254d0766"
+        ],
+        [
+          "device",
+          "531fe6068134503d2723133227c867ac8fa6c83c537e9a44c3c5bdbdcb1fe337"
+        ],
+        [
+          "grant",
+          "ab12cd34ef56ab12cd34ef56ab12cd34"
+        ],
+        [
+          "read",
+          "1460"
+        ],
+        [
+          "read",
+          "1462"
+        ],
+        [
+          "read",
+          "20461"
+        ],
+        [
+          "write",
+          "1460"
+        ],
+        [
+          "write",
+          "20461"
+        ],
+        [
+          "expiration",
+          "1902592000"
+        ],
+        [
+          "status",
+          "active"
+        ]
+      ],
+      "pubkey": "462779ad4aad39514614751a71085f2f10e1c7a593e4e030efb5b8721ce55b0b",
+      "id": "db70a08ba69035f7d80f2d19be50703a8b912e4df5a8fde9110d27c7529c4486",
+      "sig": "0e40d10658e12db13de49a104c57bd6fad75748bf895272106fc11b269f93fbe7e6a0d30e2f0c34476c154ab59739e133abb3f3f8d576583ab50521aeef9e690"
+    }
+  }
+}

@@ -60,6 +60,15 @@ async fn start(dir: &Path, members: &[&Keys]) -> Running {
     start_at(dir, members, listener, url).await
 }
 
+async fn restart(dir: &Path, members: &[&Keys], url: &str) -> Running {
+    let address = url
+        .strip_prefix("ws://")
+        .and_then(|value| value.split('/').next())
+        .expect("a local WebSocket address");
+    let listener = TcpListener::bind(address).await.unwrap();
+    start_at(dir, members, listener, url.to_owned()).await
+}
+
 /// [`start`] on `listener`, with `url` as the address clients name.
 async fn start_at(dir: &Path, members: &[&Keys], listener: TcpListener, url: String) -> Running {
     start_at_with(dir, members, listener, url, "").await
@@ -1173,4 +1182,117 @@ async fn with_relay_information_off_the_relay_serves_no_document() {
     assert!(!head.contains("access-control-allow-origin"), "{head}");
     assert!(!body.contains("supported_nips"));
     running.stop().await;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn room_grant(
+    keeper: &Keys,
+    server: &str,
+    room: &str,
+    guest: &Keys,
+    device: &Keys,
+    created_at: u64,
+    status: &str,
+    expiration: u64,
+) -> Event {
+    EventBuilder::new(Kind::from(24242), "")
+        .tags([
+            Tag::parse(["t", "event-grant"]).unwrap(),
+            Tag::parse(["server", server]).unwrap(),
+            Tag::parse(["d", room]).unwrap(),
+            Tag::parse(["p", &guest.public_key().to_hex()]).unwrap(),
+            Tag::parse(["device", &device.public_key().to_hex()]).unwrap(),
+            Tag::parse(["grant", "ab12cd34ef56ab12cd34ef56ab12cd34"]).unwrap(),
+            Tag::parse(["read", "1460"]).unwrap(),
+            Tag::parse(["read", "1462"]).unwrap(),
+            Tag::parse(["read", "20461"]).unwrap(),
+            Tag::parse(["write", "1460"]).unwrap(),
+            Tag::parse(["write", "20461"]).unwrap(),
+            Tag::parse(["expiration", &expiration.to_string()]).unwrap(),
+            Tag::parse(["status", status]).unwrap(),
+        ])
+        .custom_created_at(created_at.into())
+        .finalize(keeper)
+        .unwrap()
+}
+
+fn room_note(device: &Keys, room: &str, text: &str) -> Event {
+    EventBuilder::new(Kind::from(1460), text)
+        .tags([Tag::parse(["d", room]).unwrap()])
+        .finalize(device)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_keeper_grants_one_room_to_a_guest_and_revokes_it_across_restarts() {
+    let tmp = TempDir::new().unwrap();
+    let keeper = Keys::generate();
+    let guest = Keys::generate();
+    let device = Keys::generate();
+    let room = "11".repeat(32);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let server = start(tmp.path(), &[&keeper]).await;
+    let active = room_grant(
+        &keeper,
+        &server.url,
+        &room,
+        &guest,
+        &device,
+        now,
+        "active",
+        now + 3600,
+    );
+    let mut keeper_socket = member(&server.url, &keeper).await;
+    assert_eq!(publish(&mut keeper_socket, &active).await[2], true);
+    assert_eq!(publish(&mut keeper_socket, &active).await[2], true);
+    assert!(
+        query(&mut keeper_socket, json!({"ids": [active.id]}))
+            .await
+            .unwrap()
+            .is_empty(),
+        "authority is installed, never stored as room content"
+    );
+    drop(keeper_socket);
+    let url = server.url.clone();
+    server.stop().await;
+
+    let server = restart(tmp.path(), &[&keeper], &url).await;
+    let mut guest_socket = member(&server.url, &guest).await;
+    let note = room_note(&device, &room, "only this room");
+    assert_eq!(publish(&mut guest_socket, &note).await[2], true);
+    let read = query(&mut guest_socket, json!({"kinds": [1460], "#d": [room]}))
+        .await
+        .unwrap();
+    assert_eq!(read.len(), 1);
+    assert_eq!(read[0]["id"], note.id.to_hex());
+    let elsewhere = room_note(&device, &"22".repeat(32), "outside the grant");
+    assert_eq!(publish(&mut guest_socket, &elsewhere).await[2], false);
+    drop(guest_socket);
+
+    let revoked = room_grant(
+        &keeper,
+        &server.url,
+        &room,
+        &guest,
+        &device,
+        now + 1,
+        "revoked",
+        now + 3600,
+    );
+    let mut keeper_socket = member(&server.url, &keeper).await;
+    assert_eq!(publish(&mut keeper_socket, &revoked).await[2], true);
+    drop(keeper_socket);
+    server.stop().await;
+
+    let server = restart(tmp.path(), &[&keeper], &url).await;
+    let (mut socket, challenge) = connect(&server.url).await;
+    let refused = auth(&mut socket, &server.url, &challenge, &guest).await;
+    assert_eq!(
+        refused[2], false,
+        "the revoked grant stays revoked: {refused}"
+    );
+    server.stop().await;
 }
