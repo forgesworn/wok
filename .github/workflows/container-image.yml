@@ -1,0 +1,61 @@
+name: Container image
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Build the standalone image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: localhost/wok-standalone:ci
+          cache-from: type=gha,scope=wok-verify
+          cache-to: type=gha,scope=wok-verify,mode=max
+      - name: Check the packaged relay
+        run: |
+          test "$(docker image inspect localhost/wok-standalone:ci --format '{{.Config.User}}')" = wok
+          docker run --rm --entrypoint /usr/local/bin/wokd localhost/wok-standalone:ci --help > /dev/null
+
+  publish:
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    needs: verify
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        name: Publish amd64 and arm64 images
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ghcr.io/forgesworn/wok:${{ github.sha }}
+            ghcr.io/forgesworn/wok:latest
+          cache-from: type=gha,scope=wok-publish
+          cache-to: type=gha,scope=wok-publish,mode=max
+      - name: Record the immutable image reference
+        run: echo "ghcr.io/forgesworn/wok@${{ steps.build.outputs.digest }}"
