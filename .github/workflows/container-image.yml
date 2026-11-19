@@ -3,6 +3,7 @@ name: Container image
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
@@ -31,7 +32,7 @@ jobs:
           docker run --rm --entrypoint /usr/local/bin/wokd localhost/wok-standalone:ci --help > /dev/null
 
   publish:
-    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
     needs: verify
     runs-on: ubuntu-24.04
     permissions:
@@ -46,6 +47,29 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - id: tags
+        name: Choose the image tags
+        run: |
+          image=ghcr.io/forgesworn/wok
+          {
+            echo 'list<<EOF'
+            echo "$image:$GITHUB_SHA"
+            case "$GITHUB_REF" in
+              refs/heads/main)
+                echo "$image:latest"
+                ;;
+              refs/tags/v*)
+                version="${GITHUB_REF_NAME#v}"
+                crate=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
+                if [ "$version" != "$crate" ]; then
+                  echo "tag $GITHUB_REF_NAME does not match workspace version $crate" >&2
+                  exit 1
+                fi
+                echo "$image:$version"
+                ;;
+            esac
+            echo EOF
+          } >> "$GITHUB_OUTPUT"
       - id: build
         name: Publish amd64 and arm64 images
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
@@ -53,9 +77,7 @@ jobs:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: |
-            ghcr.io/forgesworn/wok:${{ github.sha }}
-            ghcr.io/forgesworn/wok:latest
+          tags: ${{ steps.tags.outputs.list }}
           cache-from: type=gha,scope=wok-publish
           cache-to: type=gha,scope=wok-publish,mode=max
       - name: Record the immutable image reference

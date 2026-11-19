@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.2 - 2026-11-19
+
+- The container image workflow also publishes each `v*` release tag as
+  `ghcr.io/forgesworn/wok:<version>`, beside the commit tag, and refuses a
+  tag that does not match the workspace version. `main` still publishes
+  `latest`.
+- `wokd`'s README names the published image and says that a containerised
+  `wokd` needs `listen = "0.0.0.0:7447"`: on the default loopback address
+  inside a container, the published port reached nothing.
+- No change to the libraries, `wokd` or the store schema (version 5).
+
 ## 0.6.1 - 2026-11-15
 
 - `wok-ws`: a REQ's query, and the authority check before it, now take one
