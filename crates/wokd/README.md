@@ -60,7 +60,9 @@ Several groups means one instance each.
 
 The repository root also has a production Docker image definition. It builds
 only `wokd`, runs it as uid 10001 and keeps state in `/data`; it is not the
-benchmark image and no published image is implied:
+benchmark image. CI publishes it for amd64 and arm64 as
+`ghcr.io/forgesworn/wok`: each release tag as its version (`0.6.2` for
+`v0.6.2`), and `main` as `latest`. Pin a version. Or build it yourself:
 
 ```sh
 docker build -t localhost/wokd:dev .
@@ -69,7 +71,11 @@ docker run --rm -p 127.0.0.1:7447:7447 \
   -v wok-data:/data localhost/wokd:dev
 ```
 
-Use `data_dir = "/data"` in that configuration. The Compose deployment bundle
+In that configuration, use `data_dir = "/data"` and `listen =
+"0.0.0.0:7447"`. Inside a container, loopback is the container's own, so a
+relay left on the default `127.0.0.1:7447` cannot be reached through the
+published port. The `-p 127.0.0.1:7447:7447` above still keeps it on the
+host's loopback. The Compose deployment bundle
 adds TLS and keeps this listener private; do not expose plain `ws://` beyond
 loopback or a deliberately isolated network.
 
