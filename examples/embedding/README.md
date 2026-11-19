@@ -2,8 +2,9 @@
 
 Use `wok-store` to store and query signed Nostr events in-process. Add
 `wok-ws` when the application needs to serve them over WebSockets. These
-examples use checkout paths so CI exercises proposed changes. In another
-project, pin both dependencies to the same Wok tag, as Bothy does.
+examples use checkout paths so CI exercises proposed changes and resolves
+them in a separate Cargo workspace. In another project, pin both
+dependencies to the same Wok tag, as Bothy does.
 
 ```toml
 [dependencies]
@@ -14,7 +15,7 @@ wok-ws = { git = "https://github.com/forgesworn/wok", tag = "v0.6.1" }
 ## Storage only
 
 ```sh
-cargo run --locked --manifest-path examples/embedding/Cargo.toml --example store
+cargo run --manifest-path examples/embedding/Cargo.toml --example store
 ```
 
 The [storage example](examples/store.rs) stores a signed event in a temporary
@@ -26,7 +27,7 @@ use `spawn_blocking` and bound how many calls reach the blocking pool.
 ## Sheltered WebSocket relay
 
 ```sh
-cargo run --locked --manifest-path examples/embedding/Cargo.toml \
+cargo run --manifest-path examples/embedding/Cargo.toml \
   --features websocket --example sheltered
 ```
 
