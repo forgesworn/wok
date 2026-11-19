@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+manifest=examples/embedding/Cargo.toml
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
+cargo fmt --manifest-path "$manifest" -- --check
+cargo clippy --manifest-path "$manifest" --locked --all-targets --all-features -- -D warnings
+cargo run --manifest-path "$manifest" --locked --example store
+cargo run --manifest-path "$manifest" --locked --features websocket --example sheltered

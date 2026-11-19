@@ -26,6 +26,9 @@ jobs:
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace --locked
       - run: cargo doc --workspace --no-deps
+      - name: Run the external embedding examples
+        shell: bash
+        run: bash scripts/check-embedding
 
   audit:
     name: Dependency audit

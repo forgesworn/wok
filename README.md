@@ -54,6 +54,12 @@ signed, room-scoped guests, plus a removal command for that operator. Whoever
 runs an instance operates it; see
 [`crates/wokd/README.md`](crates/wokd/README.md).
 
+## Embed Wok in a Rust application
+
+The [embedding examples](examples/embedding/README.md) show how to use the
+SQLite store on its own and how to add a sheltered relay to an existing Axum
+application. CI builds and runs both from a separate Cargo workspace.
+
 ## Storage compatibility
 
 The store is at schema version 5: version 4, the format Bothy's event store
