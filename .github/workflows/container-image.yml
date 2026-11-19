@@ -25,10 +25,15 @@ jobs:
           tags: localhost/wok-standalone:ci
           cache-from: type=gha,scope=wok-verify
           cache-to: type=gha,scope=wok-verify,mode=max
-      - name: Check the packaged relay
-        run: |
-          test "$(docker image inspect localhost/wok-standalone:ci --format '{{.Config.User}}')" = wok
-          docker run --rm --entrypoint /usr/local/bin/wokd localhost/wok-standalone:ci --help > /dev/null
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: 1.94.1
+      - name: Exercise the packaged relay and its persistent volume
+        env:
+          WOK_TEST_IMAGE: localhost/wok-standalone:ci
+        run: >-
+          cargo test --locked -p wokd --test wokd
+          container::packaged_relay_preserves_member_events -- --ignored --exact --nocapture
 
   publish:
     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
