@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- WebSocket doors reserve capacity before reading a history page. Up to
+  four replies across both doors may be in progress, with up to two from
+  the public door. Waiting for capacity leaves SQLite readers free, and
+  embedded hosts can set the limits with `Door::with_history_limits`.
+
 - SQLite serves multi-filter REQs by merging the ordered keys from each
   filter, then reading only the bodies reached by the relay's reply budget.
   The keys and bodies come from one read snapshot. Buffered replies are

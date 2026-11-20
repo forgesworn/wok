@@ -1309,10 +1309,26 @@ impl PreparedFrame {
         self.event.is_some()
     }
 
-    /// Whether the frame's first element is literally `"REQ"`: the frames
-    /// [`RelaySession::begin_prepared_streaming`] may stream.
+    /// Whether the frame starts with a REQ verb. JSON escape sequences in
+    /// that verb take the same read path and budgets as the literal form.
     pub fn is_req_frame(&self) -> bool {
-        self.event.is_none() && frame_head(&self.text).starts_with("\"REQ\"")
+        if self.event.is_some() {
+            return false;
+        }
+        let head = frame_head(&self.text);
+        if head.starts_with("\"REQ\"") {
+            return true;
+        }
+        let Some(rest) = head.strip_prefix('"') else {
+            return false;
+        };
+        // Three Unicode escapes occupy at most 18 characters. A quote in
+        // the decoded verb would rule out REQ even if it was escaped.
+        let Some(end) = rest.bytes().take(19).position(|b| b == b'"') else {
+            return false;
+        };
+        let verb = &head[..end + 2];
+        verb.contains('\\') && serde_json::from_str::<String>(verb).is_ok_and(|v| v == "REQ")
     }
 
     /// Whether the frame parsed as an EVENT whose signature failed.

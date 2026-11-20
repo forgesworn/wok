@@ -47,7 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(store),
         Arc::new(OnlyKeeper(keys.public_key())),
     ));
-    let door = Door::new(Arc::clone(&relay));
+    let door = Door::new(Arc::clone(&relay)).with_history_limits(2, 0);
 
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let url = format!("ws://{}{PATH}", listener.local_addr()?);
