@@ -225,7 +225,9 @@ impl StoreOptions {
         }
     }
 
-    /// A phone keeper with a smaller map and earlier WAL checkpoints.
+    /// A phone keeper with a smaller map and earlier size-triggered WAL
+    /// checkpoints. Wait 30 seconds without a commit before truncating the
+    /// WAL so nearby writes share a checkpoint.
     /// The 1 MiB writer and 256 KiB reader and checkpoint caches together
     /// budget 1.75 MiB across the four connections.
     pub fn phone() -> Self {
@@ -237,6 +239,7 @@ impl StoreOptions {
             },
             checkpoint_pages: 500,
             wal_ceiling_pages: 4096,
+            idle_truncate_after: Duration::from_secs(30),
             warm_max_bytes: 16 * 1024 * 1024,
             ..Self::server()
         }
@@ -8768,6 +8771,8 @@ PRAGMA user_version=2;")).unwrap();
             (1024, 256, 256)
         );
         assert!(phone.mmap_bytes <= options.mmap_bytes);
+        assert_eq!(options.idle_truncate_after, Duration::from_secs(2));
+        assert_eq!(phone.idle_truncate_after, Duration::from_secs(30));
         assert!(!options.warm && !phone.warm);
         assert_eq!(options.mmap_bytes == 0, cfg!(target_pointer_width = "32"));
         // Readers are unmapped by default in both profiles.

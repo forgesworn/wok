@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.4 - 2026-11-20
+
+- The embedded phone profile waits 30 seconds without a commit before
+  truncating the WAL, so intermittent writes can share a checkpoint.
+  It also checkpoints at the 500-page threshold and when the store closes.
+
 ## 0.6.3 - 2026-11-20
 
 - The embedded phone store profile budgets 1.75 MiB for SQLite page
