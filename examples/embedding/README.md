@@ -8,8 +8,8 @@ dependencies to the same Wok tag, as Bothy does.
 
 ```toml
 [dependencies]
-wok-store = { git = "https://github.com/forgesworn/wok", tag = "v0.6.3" }
-wok-ws = { git = "https://github.com/forgesworn/wok", tag = "v0.6.3" }
+wok-store = { git = "https://github.com/forgesworn/wok", tag = "v0.6.4" }
+wok-ws = { git = "https://github.com/forgesworn/wok", tag = "v0.6.4" }
 ```
 
 ## Storage only
@@ -21,6 +21,12 @@ cargo run --manifest-path examples/embedding/Cargo.toml --example store
 The [storage example](examples/store.rs) stores a signed event in a temporary
 database, reopens it and reads the event from the caller-selected partition.
 For a persistent store, pick an application-owned path and a storage ceiling.
+On a phone, pass `StoreOptions::phone()` to
+`SqliteEventStore::open_with_options`. The profile budgets 1.75 MiB for page
+caches per store. It groups quiet-period WAL cleanup across writes made
+within 30 seconds and checkpoints when it reaches the size threshold or
+the store closes.
+
 Call the synchronous store API on a thread that may block. Async hosts can
 use `spawn_blocking` and bound how many calls reach the blocking pool.
 
