@@ -1246,6 +1246,20 @@ impl PreparedFrame {
     /// answer exactly as before.
     pub fn parse(text: String) -> Self {
         let event = Self::parse_event(&text);
+        let text = if event.is_some() { String::new() } else { text };
+        Self { text, event }
+    }
+
+    /// Prepare a frame from transport-owned bytes. A parsed EVENT keeps
+    /// its typed event and id, so only frames needing ordinary dispatch
+    /// copy the input text.
+    pub fn parse_ref(text: &str) -> Self {
+        let event = Self::parse_event(text);
+        let text = if event.is_some() {
+            String::new()
+        } else {
+            text.to_owned()
+        };
         Self { text, event }
     }
 

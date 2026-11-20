@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+- The embedded phone store profile budgets 1.75 MiB for SQLite page
+  caches, with 1 MiB for the writer and 256 KiB each for the two readers
+  and the checkpointer.
+- WebSocket EVENT intake uses the transport's bytes directly. A verified
+  event can have its authority and store preparation checked on the same
+  worker when the work permit is immediately available.
+
 - WebSocket doors reserve capacity before reading a history page. Up to
   four replies across both doors may be in progress, with up to two from
   the public door. Waiting for capacity leaves SQLite readers free, and

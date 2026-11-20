@@ -138,13 +138,12 @@ pub struct StoreOptions {
     /// phone 1 MiB. A larger cache did not speed up a burst on its own
     /// (first touches miss at any size) and costs heap.
     pub writer_cache_kib: u32,
-    /// Page cache of each read-only connection, in KiB (heap). Server default
-    /// 256 KiB (from the cache spike; SQLite's default is 2 MiB); phone
-    /// 512 KiB. Every commit by another connection empties a reader's cache
+    /// Page cache of each read-only connection, in KiB (heap). Both profiles
+    /// use 256 KiB. Every commit by another connection empties a reader's cache
     /// anyway, so it only serves reuse between commits.
     pub reader_cache_kib: u32,
     /// Page cache of the checkpoint thread's connection, in KiB (heap).
-    /// Server default 256 KiB, the reader value; phone 1 MiB. A checkpoint
+    /// Both profiles use 256 KiB. A checkpoint
     /// copies WAL frames into the database without going through this cache,
     /// so it rarely fills.
     pub checkpoint_cache_kib: u32,
@@ -226,12 +225,11 @@ impl StoreOptions {
         }
     }
 
-    /// A phone keeper: small caches and map, a smaller WAL, no warm-up.
+    /// A phone keeper with a smaller map and earlier WAL checkpoints.
+    /// The 1 MiB writer and 256 KiB reader and checkpoint caches together
+    /// budget 1.75 MiB across the four connections.
     pub fn phone() -> Self {
         Self {
-            writer_cache_kib: 1024,
-            reader_cache_kib: 512,
-            checkpoint_cache_kib: 1024,
             mmap_bytes: if cfg!(target_pointer_width = "64") {
                 128 * 1024 * 1024
             } else {
@@ -8750,9 +8748,8 @@ PRAGMA user_version=2;")).unwrap();
             pragma(&default.lock().unwrap(), "cache_size"),
             -i64::from(options.writer_cache_kib)
         );
-        // The profiles' heap caches: the server's from the cache spike
-        // (writer 1 MiB, readers and checkpoint 256 KiB), the phone's as
-        // they were (1 MiB, 512 KiB, 1 MiB).
+        // Both profiles keep 1 MiB for the writer and 256 KiB each for the
+        // readers and checkpointer.
         let phone = StoreOptions::phone();
         assert_eq!(
             (
@@ -8768,7 +8765,7 @@ PRAGMA user_version=2;")).unwrap();
                 phone.reader_cache_kib,
                 phone.checkpoint_cache_kib
             ),
-            (1024, 512, 1024)
+            (1024, 256, 256)
         );
         assert!(phone.mmap_bytes <= options.mmap_bytes);
         assert!(!options.warm && !phone.warm);
