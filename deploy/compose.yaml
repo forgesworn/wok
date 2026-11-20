@@ -1,0 +1,45 @@
+name: wok
+
+services:
+  wokd:
+    image: ${WOK_IMAGE:?Set WOK_IMAGE to the Wok image you want to run}
+    restart: unless-stopped
+    stop_grace_period: 15s
+    volumes:
+      - type: bind
+        source: ./wokd.toml
+        target: /etc/wokd/wokd.toml
+        read_only: true
+        bind:
+          create_host_path: false
+      - wok-data:/data
+    networks: [backend]
+
+  proxy:
+    image: nginx:1.30.7-alpine@sha256:bef154735288bc38d99fac41ae63730684bcc661503673a04a0f9bc526ba8598
+    restart: unless-stopped
+    depends_on: [wokd]
+    ports:
+      - "${WOK_HTTPS_BIND:-127.0.0.1}:${WOK_HTTPS_PORT:-443}:443"
+    volumes:
+      - type: bind
+        source: ./nginx.conf
+        target: /etc/nginx/nginx.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./tls
+        target: /etc/wok/tls
+        read_only: true
+        bind:
+          create_host_path: false
+    networks: [edge, backend]
+
+networks:
+  edge: {}
+  backend:
+    internal: true
+
+volumes:
+  wok-data: {}

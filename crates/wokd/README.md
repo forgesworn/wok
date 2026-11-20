@@ -75,7 +75,7 @@ In that configuration, use `data_dir = "/data"` and `listen =
 "0.0.0.0:7447"`. Inside a container, loopback is the container's own, so a
 relay left on the default `127.0.0.1:7447` cannot be reached through the
 published port. The `-p 127.0.0.1:7447:7447` above still keeps it on the
-host's loopback. The Compose deployment bundle
+host's loopback. The [Compose deployment bundle](../../deploy/README.md)
 adds TLS and keeps this listener private; do not expose plain `ws://` beyond
 loopback or a deliberately isolated network.
 

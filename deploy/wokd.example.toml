@@ -1,0 +1,14 @@
+listen = "0.0.0.0:7447"
+# Match the address members use, including a port if it is not 443.
+url = "wss://relay.example.com/events"
+data_dir = "/data"
+max_store_bytes = 1073741824
+min_free_bytes = 268435456
+
+# All proxied sockets share the proxy's address at the daemon. The proxy
+# caps each source address at four; the daemon caps the relay at 32 total.
+sockets_per_address = 32
+
+members = [
+  # "npub1...",
+]
