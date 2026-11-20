@@ -19,7 +19,7 @@ use axum::Router;
 use axum::extract::{
     State, WebSocketUpgrade,
     ws::rejection::WebSocketUpgradeRejection,
-    ws::{CloseFrame, Message, WebSocket},
+    ws::{CloseFrame, Message, Utf8Bytes, WebSocket},
 };
 use axum::http::{Extensions, HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -928,6 +928,58 @@ impl InFlight {
     }
 }
 
+#[allow(
+    clippy::large_enum_variant,
+    reason = "the fallback stays inline to avoid allocating for each frame"
+)]
+enum PreparedTurn {
+    Frame(PreparedFrame),
+    Event(Handled),
+}
+
+/// Verify the event before taking a work permit. If a permit is ready,
+/// prepare the write on this worker. A busy door queues the verified frame
+/// for a permit on its connection task, with no blocking thread waiting.
+async fn prepare_turn(
+    mut session: RelaySession,
+    text: Utf8Bytes,
+    state: &SocketState,
+) -> Option<(RelaySession, PreparedTurn)> {
+    if !PreparedFrame::is_event_frame(text.as_str()) {
+        return Some((
+            session,
+            PreparedTurn::Frame(PreparedFrame::parse_ref(text.as_str())),
+        ));
+    }
+    let work = Arc::clone(&state.door.work);
+    let public =
+        (state.visibility == Visibility::Public).then(|| Arc::clone(&state.door.public_work));
+    tokio::task::spawn_blocking(move || {
+        let frame = PreparedFrame::parse_ref(text.as_str());
+        drop(text);
+        let turn = if let Some(replies) = session.refuse_unverified(&frame) {
+            PreparedTurn::Event(Handled::Replies(replies))
+        } else if frame.is_event()
+            && let Ok(_public) = public.as_ref().map(|pool| pool.try_acquire()).transpose()
+            && let Ok(_work) = work.try_acquire()
+        {
+            PreparedTurn::Event(session.begin_prepared(frame, now()))
+        } else {
+            PreparedTurn::Frame(frame)
+        };
+        (session, turn)
+    })
+    .await
+    .ok()
+}
+
+fn enqueue_event(in_flight: &mut InFlight, handled: Handled) -> Vec<String> {
+    match handled {
+        Handled::Replies(replies) => replies,
+        Handled::Write(write) => in_flight.begin(write),
+    }
+}
+
 /// An EVENT frame that passed the cheap checks: its authority checks and
 /// `PreparedPut` run in frame order under a permit, then the write is queued
 /// and the connection goes on reading. Its `OK` is sent when the commit lands.
@@ -939,11 +991,7 @@ async fn begin_write(
 ) -> Option<(RelaySession, (Vec<String>, bool))> {
     let (session, handled) =
         apply(session, state, move |s| s.begin_prepared(prepared, now())).await?;
-    let replies = match handled {
-        Handled::Replies(replies) => replies,
-        Handled::Write(write) => in_flight.begin(write),
-    };
-    Some((session, (replies, false)))
+    Some((session, (enqueue_event(in_flight, handled), false)))
 }
 
 /// Wait for every write this connection has in flight, sending each `OK` as
@@ -1320,30 +1368,21 @@ async fn serve_connected(
                         if !session.admit_frame(now()) {
                             Some((session, (vec!["[\"NOTICE\",\"rate-limited: slow down\"]".into()], true)))
                         } else {
-                            // Parse and verify before taking a work permit: a forged
-                            // or malformed event costs no permit and no store time,
-                            // and verification of different connections' events
-                            // runs in parallel.
-                            let text = text.as_str().to_owned();
-                            let prepared = if PreparedFrame::is_event_frame(&text) {
-                                match tokio::task::spawn_blocking(move || PreparedFrame::parse(text)).await {
-                                    Ok(prepared) => prepared,
-                                    Err(_) => return BUSY,
-                                }
-                            } else {
-                                PreparedFrame::parse(text)
+                            let Some((session, turn)) = prepare_turn(session, text, state).await else {
+                                return BUSY;
                             };
-                            match session.refuse_unverified(&prepared) {
-                                Some(replies) => Some((session, (replies, false))),
-                                // An EVENT is queued and the next frame read at once.
-                                None if prepared.is_event() => {
+                            match turn {
+                                PreparedTurn::Event(handled) => {
+                                    Some((session, (enqueue_event(in_flight, handled), false)))
+                                }
+                                // The blocking worker could not acquire the
+                                // work permit. Queue in the ordinary path.
+                                PreparedTurn::Frame(prepared) if prepared.is_event() => {
                                     begin_write(session, state, prepared, in_flight).await
                                 }
-                                // Anything else runs after this connection's own
-                                // writes have landed and been answered, so a REQ
-                                // after an EVENT sees it, as when each frame was
-                                // finished before the next was read.
-                                None => {
+                                // Other frames run after this connection's
+                                // pending writes have landed and been answered.
+                                PreparedTurn::Frame(prepared) => {
                                     let mut session = match settle(socket, state, session, in_flight).await {
                                         Ok(session) => session,
                                         Err(closing) => return closing,
