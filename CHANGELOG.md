@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.6.3 - 2026-11-20
 
 - The embedded phone store profile budgets 1.75 MiB for SQLite page
   caches, with 1 MiB for the writer and 256 KiB each for the two readers

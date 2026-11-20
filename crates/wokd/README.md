@@ -61,8 +61,8 @@ Several groups means one instance each.
 The repository root also has a production Docker image definition. It builds
 only `wokd`, runs it as uid 10001 and keeps state in `/data`; it is not the
 benchmark image. CI publishes it for amd64 and arm64 as
-`ghcr.io/forgesworn/wok`: each release tag as its version (`0.6.2` for
-`v0.6.2`), and `main` as `latest`. Pin a version. Or build it yourself:
+`ghcr.io/forgesworn/wok`: each release tag as its version (`0.6.3` for
+`v0.6.3`), and `main` as `latest`. Pin a version. Or build it yourself:
 
 ```sh
 docker build -t localhost/wokd:dev .
