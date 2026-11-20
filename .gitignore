@@ -1,1 +1,3 @@
 /target
+/examples/embedding/target
+/examples/embedding/Cargo.lock
