@@ -73,10 +73,18 @@ import with the older one.
 
 ## Performance
 
-The store has been benchmarked, including against another relay
-implementation, but only inside Bothy and with Bothy's relay on top. Those results have not yet been reproduced from
-this repository, and no performance claim is made for Wok itself until they
-are.
+The unpublished `wok-bench` tool times storage, in-process sessions and
+WebSocket relays. Use `--profile phone` in its local scenarios to exercise
+the mobile store settings.
+
+For a relay comparison, seed both stores with the signed corpus from
+`wok-bench relay export`. Run `wok-bench relay query --input corpus.jsonl
+--url <relay-url> --set overlap` on each relay. The overlapping filters
+return the same page as `--set authors_kinds`. Compare both the event
+counts and `id_set_digest` before comparing times. For write load alongside
+history, use `relay write --rate` with `--readers`, `--read-rate`,
+`--read-set overlap` and the same corpus. Record the build, authentication
+settings and transport for each run.
 
 ## Build and test
 

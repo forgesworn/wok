@@ -6,6 +6,8 @@
 //! This synchronous interface is called through `spawn_blocking` by transports.
 
 use std::cell::RefCell;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{
     AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering as AtomicOrdering,
@@ -986,6 +988,37 @@ pub trait EventStore: Send + Sync {
         });
         events.dedup_by(|a, b| a.id == b.id);
         for event in events {
+            if !f(event) {
+                break;
+            }
+        }
+        Ok(())
+    }
+    /// The newest distinct rows selected by any of `filters`, up to
+    /// [`MAX_QUERY_EVENTS`] overall. Each filter selects its own limited
+    /// page before the merge. Rows arrive newest first, then by id. Return
+    /// `false` from `f` to stop. As with [`Self::query_stored_each`], the
+    /// callback must not block or call back into this store.
+    ///
+    /// The default merges the results of [`Self::query_stored`]. Stores
+    /// that can merge on keys and read bodies on demand should override it.
+    fn query_stored_any_each(
+        &self,
+        visibility: Visibility,
+        filters: &[Filter],
+        now: u64,
+        f: &mut dyn FnMut(StoredEvent) -> bool,
+    ) -> Result<(), EventStoreError> {
+        let mut merged = BTreeMap::new();
+        for filter in filters {
+            for event in self.query_stored(visibility, filter, now)? {
+                merged.insert((Reverse(event.created_at), event.id.clone()), event);
+                if merged.len() > MAX_QUERY_EVENTS {
+                    merged.pop_last();
+                }
+            }
+        }
+        for event in merged.into_values() {
             if !f(event) {
                 break;
             }
@@ -4198,7 +4231,8 @@ impl EventStore for SqliteEventStore {
         filter: &Filter,
         now: u64,
     ) -> Result<Vec<Event>, EventStoreError> {
-        let Some((sql, values)) = self.query_sql(visibility, filter, now)? else {
+        let Some((sql, values)) = self.query_sql(visibility, filter, now, QueryColumns::Body)?
+        else {
             return Ok(vec![]);
         };
         self.run_query(&sql, values, |json| {
@@ -4214,7 +4248,8 @@ impl EventStore for SqliteEventStore {
         filter: &Filter,
         now: u64,
     ) -> Result<Vec<StoredEvent>, EventStoreError> {
-        let Some((sql, values)) = self.query_sql(visibility, filter, now)? else {
+        let Some((sql, values)) = self.query_sql(visibility, filter, now, QueryColumns::Body)?
+        else {
             return Ok(vec![]);
         };
         self.run_query(&sql, values, StoredEvent::from_stored)
@@ -4232,7 +4267,8 @@ impl EventStore for SqliteEventStore {
         now: u64,
         f: &mut dyn FnMut(StoredEvent) -> bool,
     ) -> Result<(), EventStoreError> {
-        let Some((sql, values)) = self.query_sql(visibility, filter, now)? else {
+        let Some((sql, values)) = self.query_sql(visibility, filter, now, QueryColumns::Body)?
+        else {
             return Ok(());
         };
         self.with_reader(|conn| {
@@ -4243,6 +4279,67 @@ impl EventStore for SqliteEventStore {
                     break;
                 }
             }
+            Ok(())
+        })
+    }
+
+    fn query_stored_any_each(
+        &self,
+        visibility: Visibility,
+        filters: &[Filter],
+        now: u64,
+        f: &mut dyn FnMut(StoredEvent) -> bool,
+    ) -> Result<(), EventStoreError> {
+        if let [filter] = filters {
+            return self.query_stored_each(visibility, filter, now, f);
+        }
+        let mut queries = Vec::with_capacity(filters.len());
+        for filter in filters {
+            if let Some(query) = self.query_sql(visibility, filter, now, QueryColumns::Keys)? {
+                queries.push(query);
+            }
+        }
+        if queries.is_empty() {
+            return Ok(());
+        }
+        self.with_reader(|conn| {
+            // Keys and bodies come from one snapshot. Replacement, expiry
+            // and deletion cannot move a row between the two steps.
+            let tx = conn.unchecked_transaction()?;
+            let mut keys = BTreeSet::new();
+            for (sql, values) in queries {
+                let mut statement = tx.prepare_cached(&sql)?;
+                let mut rows = statement.query(params_from_iter(values))?;
+                while let Some(row) = rows.next()? {
+                    let created_at = u64::try_from(row.get::<_, i64>(0)?)
+                        .map_err(|_| EventStoreError::Corrupt)?;
+                    let key = (
+                        Reverse(created_at),
+                        row.get::<_, [u8; 32]>(1)?,
+                        row.get::<_, i64>(2)?,
+                    );
+                    keys.insert(key);
+                    if keys.len() > MAX_QUERY_EVENTS {
+                        keys.pop_last();
+                    }
+                }
+            }
+
+            {
+                let mut body = tx
+                    .prepare_cached("SELECT json FROM events WHERE seq = ?1 AND visibility = ?2")?;
+                for (Reverse(created_at), id, seq) in keys {
+                    let json = body.query_row(params![seq, visibility.key()], |r| r.get(0))?;
+                    let event = StoredEvent::from_stored(json)?;
+                    if event.created_at != created_at || hex_key(&event.id) != Some(id) {
+                        return Err(EventStoreError::Corrupt);
+                    }
+                    if !f(event) {
+                        break;
+                    }
+                }
+            }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -4298,12 +4395,37 @@ impl SqlCache {
 /// values it binds.
 type BuiltQuery = (Arc<str>, Vec<Value>);
 
+/// What a history plan projects after applying a filter's conditions.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryColumns {
+    Body,
+    Keys,
+}
+
+impl QueryColumns {
+    fn select(self, keys: &'static str) -> &'static str {
+        match self {
+            Self::Body => "e.json",
+            Self::Keys => keys,
+        }
+    }
+
+    fn merged(self, keys: String) -> String {
+        match self {
+            Self::Body => format!(
+                "SELECT e.json FROM ({keys}) m CROSS JOIN events e ON e.seq=m.s ORDER BY m.c DESC,m.i ASC"
+            ),
+            Self::Keys => keys,
+        }
+    }
+}
+
 /// The shape of a filter: everything the SQL text [`build_query`] makes for
 /// it depends on, and none of what it binds. Which fields are present, how
 /// many values each holds, and the value count of each tag in order (which
 /// also picks the driving tag and the merge form). `None` for a filter
 /// `build_query` returns nothing for or refuses, which is never cached.
-fn query_shape(filter: &Filter, tag_driven: bool) -> Option<Vec<u32>> {
+fn query_shape(filter: &Filter, tag_driven: bool, columns: QueryColumns) -> Option<Vec<u32>> {
     if filter
         .since
         .is_some_and(|since| since.as_secs() > i64::MAX as u64)
@@ -4324,6 +4446,7 @@ fn query_shape(filter: &Filter, tag_driven: bool) -> Option<Vec<u32>> {
     let count = |n: Option<usize>| n.map_or(u32::MAX, |n| u32::try_from(n).unwrap_or(u32::MAX - 1));
     let mut shape = vec![
         u32::from(tag_driven),
+        u32::from(columns == QueryColumns::Keys),
         count(ids),
         count(authors),
         count(kinds),
@@ -4376,6 +4499,7 @@ impl SqliteEventStore {
         visibility: Visibility,
         filter: &Filter,
         now: u64,
+        columns: QueryColumns,
     ) -> Result<Option<BuiltQuery>, EventStoreError> {
         if filter.search.is_some() {
             return Err(EventStoreError::Query);
@@ -4387,8 +4511,8 @@ impl SqliteEventStore {
         if limit == 0 {
             return Ok(None);
         }
-        let Some(shape) = query_shape(filter, true) else {
-            return Ok(build_query(visibility, filter, now, limit, true)?
+        let Some(shape) = query_shape(filter, true, columns) else {
+            return Ok(build_query(visibility, filter, now, limit, true, columns)?
                 .map(|(sql, values)| (sql.into(), values)));
         };
         let cached = self
@@ -4399,7 +4523,8 @@ impl SqliteEventStore {
         if let Some(sql) = cached {
             return Ok(Some((sql, query_values(visibility, filter, now, limit))));
         }
-        let Some((sql, values)) = build_query(visibility, filter, now, limit, true)? else {
+        let Some((sql, values)) = build_query(visibility, filter, now, limit, true, columns)?
+        else {
             return Ok(None);
         };
         let sql: Arc<str> = sql.into();
@@ -4471,6 +4596,7 @@ fn build_query(
     now: u64,
     limit: usize,
     tag_driven: bool,
+    columns: QueryColumns,
 ) -> Result<Option<(String, Vec<Value>)>, EventStoreError> {
     let mut binds = Binds(Vec::new());
     let vis = binds.add(Value::Integer(visibility.key()));
@@ -4537,6 +4663,7 @@ fn build_query(
         return Err(EventStoreError::Query);
     }
     let limit = binds.add(Value::Integer(limit as i64));
+    const EVENT_KEYS: &str = "e.created_at AS c,e.id AS i,e.seq AS s";
     if !(tag_driven && filter.ids.is_none() && filter.authors.is_none() && !tags.is_empty()) {
         // Event-driven: walk events in time order and probe each tag.
         for (name, values) in &tags {
@@ -4564,15 +4691,15 @@ fn build_query(
                 .flat_map(|author| kind_marks.iter().map(move |kind| (author, kind)))
                 .map(|(author, kind)| {
                     format!(
-                        "SELECT c,i,s FROM (SELECT e.created_at AS c,e.id AS i,e.seq AS s FROM events e INDEXED BY events_author_kind WHERE e.visibility={vis} AND e.author={author} AND e.kind={kind}{others} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit})"
+                        "SELECT c,i,s FROM (SELECT {EVENT_KEYS} FROM events e INDEXED BY events_author_kind WHERE e.visibility={vis} AND e.author={author} AND e.kind={kind}{others} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit})"
                     )
                 })
                 .collect();
             return Ok(Some((
-                format!(
-                    "SELECT e.json FROM ({} ORDER BY c DESC,i ASC LIMIT {limit}) m CROSS JOIN events e ON e.seq=m.s ORDER BY m.c DESC,m.i ASC",
+                columns.merged(format!(
+                    "{} ORDER BY c DESC,i ASC LIMIT {limit}",
                     branches.join(" UNION ALL ")
-                ),
+                )),
                 binds.0,
             )));
         }
@@ -4588,7 +4715,8 @@ fn build_query(
         };
         return Ok(Some((
             format!(
-                "SELECT e.json FROM events e{by_id} WHERE e.visibility={vis}{conds} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit}"
+                "SELECT {} FROM events e{by_id} WHERE e.visibility={vis}{conds} ORDER BY e.created_at DESC,e.id ASC LIMIT {limit}",
+                columns.select(EVENT_KEYS)
             ),
             binds.0,
         )));
@@ -4626,17 +4754,11 @@ fn build_query(
     // event's id after its time, so a backward walk is already in that order
     // and stops at the limit however many events share a second.
     let newest = format!("ORDER BY t.created_at DESC,t.id ASC LIMIT {limit}");
-    // The body is read once, for the rows the merge kept, in merge order.
-    let bodies = |merged: String| {
-        format!(
-            "SELECT e.json FROM ({merged}) m CROSS JOIN events e ON e.seq=m.s ORDER BY m.c DESC,m.i ASC"
-        )
-    };
     let sql = if values.len() == 1 {
         // The walk is already in order and stops at the limit, so the body
         // is read for each hit directly; nothing is sorted or merged.
         let one = format!("t.value={}", values[0]);
-        format!("{} {newest}", branch("SELECT", "e.json", &one))
+        format!("{} {newest}", branch("SELECT", columns.select(KEYS), &one))
     } else if values.len() <= MAX_MERGED_VALUES {
         // Each value's newest rows, merged; UNION drops an event that carries
         // several of the values, as the event-driven shape returns it once:
@@ -4651,7 +4773,7 @@ fn build_query(
                 )
             })
             .collect();
-        bodies(format!(
+        columns.merged(format!(
             "{} ORDER BY c DESC,i ASC LIMIT {limit}",
             branches.join(" UNION ")
         ))
@@ -4659,7 +4781,7 @@ fn build_query(
         // Too many branches: one scan of every matching row, sorted. The
         // sorted rows are keys only.
         let any = format!("t.value IN ({})", values.join(","));
-        bodies(format!(
+        columns.merged(format!(
             "SELECT c,i,s FROM ({}) ORDER BY c DESC,i ASC LIMIT {limit}",
             branch("SELECT DISTINCT", KEYS, &any)
         ))
@@ -5193,6 +5315,79 @@ mod tests {
             .iter()
             .map(|e| e.id.to_hex())
             .collect()
+    }
+
+    #[test]
+    fn merged_history_matches_individual_pages_across_query_shapes() {
+        use serde_json::json;
+
+        let tmp = TempDir::new().unwrap();
+        let db = SqliteEventStore::open(&tmp.path().join("history.sqlite"), 100_000_000).unwrap();
+        let keys = [Keys::generate(), Keys::generate(), Keys::generate()];
+        let corpus = upgrade_corpus(&keys);
+        for (scope, event) in &corpus {
+            db.put(*scope, event, NOW).unwrap();
+        }
+
+        let mut filters = upgrade_filters(&keys, &corpus);
+        filters.push(serde_json::from_value(json!({"limit": 0})).unwrap());
+        for scope in [Visibility::Public, Visibility::Sheltered] {
+            for now in [NOW, NOW + 60] {
+                for (i, filter) in filters.iter().enumerate() {
+                    let other = &filters[(i + 1) % filters.len()];
+                    let group = [filter.clone(), other.clone(), filter.clone()];
+                    let mut expected = BTreeMap::new();
+                    for filter in &group {
+                        for e in db.query_stored(scope, filter, now).unwrap() {
+                            expected.insert((Reverse(e.created_at), e.id.clone()), e);
+                        }
+                    }
+                    let expected = expected
+                        .into_values()
+                        .take(MAX_QUERY_EVENTS)
+                        .collect::<Vec<_>>();
+                    let mut received = Vec::new();
+                    db.query_stored_any_each(scope, &group, now, &mut |event| {
+                        received.push(event);
+                        true
+                    })
+                    .unwrap();
+                    assert_eq!(received, expected, "{scope:?} {now} {group:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn merged_history_stops_fetching_bodies_when_the_reader_stops() {
+        let tmp = TempDir::new().unwrap();
+        let db = SqliteEventStore::open(&tmp.path().join("history.sqlite"), 10_000_000).unwrap();
+        let key = Keys::generate();
+        let old = event(&key, 1, NOW - 10, "old", &[]);
+        let new = event(&key, 1, NOW - 5, "new", &[]);
+        let scope = Visibility::Sheltered;
+        db.put(scope, &old, NOW).unwrap();
+        db.put(scope, &new, NOW).unwrap();
+        // A corrupt candidate beyond the page only fails when read.
+        db.lock()
+            .unwrap()
+            .execute(
+                "UPDATE events SET json = '{}' WHERE id = ?",
+                [key_blob(old.id.as_bytes())],
+            )
+            .unwrap();
+        let mut seen = Vec::new();
+        let filters = [Filter::new(), Filter::new()];
+        db.query_stored_any_each(scope, &filters, NOW, &mut |event| {
+            seen.push(event.id);
+            false
+        })
+        .unwrap();
+        assert_eq!(seen, [new.id.to_hex()]);
+        assert!(matches!(
+            db.query_stored_any_each(scope, &filters, NOW, &mut |_| true),
+            Err(EventStoreError::Corrupt)
+        ));
     }
 
     #[test]
@@ -6418,9 +6613,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         ] {
             let filter: Filter = serde_json::from_value(raw.clone()).unwrap();
             let limit = filter.limit.unwrap_or(MAX_QUERY_EVENTS);
-            let (sql, values) = build_query(Visibility::Public, &filter, NOW, limit, true)
-                .unwrap()
-                .unwrap();
+            let (sql, values) = build_query(
+                Visibility::Public,
+                &filter,
+                NOW,
+                limit,
+                true,
+                QueryColumns::Body,
+            )
+            .unwrap()
+            .unwrap();
             let plan = db
                 .with_reader(|conn| Ok(explain(conn, &sql, values)?))
                 .unwrap()
@@ -6496,10 +6698,10 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
                     .limit
                     .unwrap_or(MAX_QUERY_EVENTS)
                     .min(MAX_QUERY_EVENTS);
-                let want = build_query(scope, &filter, NOW, limit, true);
+                let want = build_query(scope, &filter, NOW, limit, true, QueryColumns::Body);
                 for pass in 0..2 {
                     let got = db
-                        .query_sql(scope, &filter, NOW)
+                        .query_sql(scope, &filter, NOW, QueryColumns::Body)
                         .map(|q| q.map(|(sql, values)| (sql.to_string(), values)));
                     match (&got, &want) {
                         (Ok(got), Ok(want)) => assert_eq!(got, want, "{raw} pass {pass}"),
@@ -6533,7 +6735,8 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             let kinds: Vec<u16> = (0..(n / 40 + 1) as u16).collect();
             let filter: Filter =
                 serde_json::from_value(serde_json::json!({"kinds": kinds, "#t": values})).unwrap();
-            db.query_sql(Visibility::Public, &filter, NOW).unwrap();
+            db.query_sql(Visibility::Public, &filter, NOW, QueryColumns::Body)
+                .unwrap();
             let cache = db.sql_cache.lock().unwrap();
             assert!(cache.entries.len() <= SQL_CACHE_SHAPES);
             assert!(cache.bytes <= SQL_CACHE_BYTES);
@@ -6550,7 +6753,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             )
             .unwrap();
             let (sql, _) = db
-                .query_sql(Visibility::Public, &filter, NOW)
+                .query_sql(Visibility::Public, &filter, NOW, QueryColumns::Body)
                 .unwrap()
                 .unwrap();
             assert!(sql.len() > SQL_CACHE_ENTRY_BYTES);
@@ -6574,7 +6777,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         if limit == 0 {
             return vec![];
         }
-        match build_query(scope, filter, now, limit, false).unwrap() {
+        match build_query(scope, filter, now, limit, false, QueryColumns::Body).unwrap() {
             None => vec![],
             Some((sql, values)) => db
                 .run_query(&sql, values, StoredEvent::from_stored)
@@ -6742,7 +6945,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             "limit": 10
         }))
         .unwrap();
-        let (sql, _) = build_query(Visibility::Public, &many, NOW, 10, true)
+        let (sql, _) = build_query(Visibility::Public, &many, NOW, 10, true, QueryColumns::Body)
             .unwrap()
             .unwrap();
         assert!(sql.contains("SELECT DISTINCT"));
@@ -6857,9 +7060,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             "limit": 10
         }))
         .unwrap();
-        let (sql, values) = build_query(Visibility::Public, &filter, NOW, 10, true)
-            .unwrap()
-            .unwrap();
+        let (sql, values) = build_query(
+            Visibility::Public,
+            &filter,
+            NOW,
+            10,
+            true,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         let plan = db
             .with_reader(|conn| Ok(explain(conn, &sql, values)?))
             .unwrap()
@@ -6881,15 +7091,22 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             "#t": ["common"]
         }))
         .unwrap();
-        let (sql, _) = build_query(Visibility::Public, &no_kind, NOW, 10, true)
-            .unwrap()
-            .unwrap();
+        let (sql, _) = build_query(
+            Visibility::Public,
+            &no_kind,
+            NOW,
+            10,
+            true,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         assert!(!sql.contains("tags_by_time") && !sql.contains("FROM tags t CROSS JOIN"));
         // And without authors the same tag is still walked from the tag index.
         let room: Filter =
             serde_json::from_value(serde_json::json!({"kinds":[1],"#t":["common"],"limit":10}))
                 .unwrap();
-        let (sql, _) = build_query(Visibility::Public, &room, NOW, 10, true)
+        let (sql, _) = build_query(Visibility::Public, &room, NOW, 10, true, QueryColumns::Body)
             .unwrap()
             .unwrap();
         assert!(sql.contains("FROM tags t CROSS JOIN events e"));
@@ -6908,9 +7125,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             serde_json::json!({"#d": rooms, "#t": (0..40).map(|n| format!("t-{n}")).chain(["a".to_owned()]).collect::<Vec<_>>(), "limit": 20}),
         ] {
             let filter: Filter = serde_json::from_value(filter).unwrap();
-            let (sql, values) = build_query(Visibility::Public, &filter, NOW, 20, true)
-                .unwrap()
-                .unwrap();
+            let (sql, values) = build_query(
+                Visibility::Public,
+                &filter,
+                NOW,
+                20,
+                true,
+                QueryColumns::Body,
+            )
+            .unwrap()
+            .unwrap();
             assert_eq!(
                 sql.matches("json").count(),
                 1,
@@ -6948,9 +7172,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         let filter: Filter =
             serde_json::from_value(serde_json::json!({"kinds":[1],"#d":["room-1"],"limit":50}))
                 .unwrap();
-        let (sql, values) = build_query(Visibility::Public, &filter, NOW, 50, true)
-            .unwrap()
-            .unwrap();
+        let (sql, values) = build_query(
+            Visibility::Public,
+            &filter,
+            NOW,
+            50,
+            true,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         let plan = db
             .with_reader(|conn| Ok(explain(conn, &sql, values)?))
             .unwrap();
@@ -6969,9 +7200,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         let rooms: Filter =
             serde_json::from_value(serde_json::json!({"#d":["room-1","room-2"],"limit":50}))
                 .unwrap();
-        let (sql, values) = build_query(Visibility::Public, &rooms, NOW, 50, true)
-            .unwrap()
-            .unwrap();
+        let (sql, values) = build_query(
+            Visibility::Public,
+            &rooms,
+            NOW,
+            50,
+            true,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         let plan = db
             .with_reader(|conn| Ok(explain(conn, &sql, values)?))
             .unwrap()
@@ -10190,9 +10428,16 @@ PRAGMA user_version=2;")).unwrap();
         let plan_of = |filter: serde_json::Value| {
             let filter: Filter = serde_json::from_value(filter).unwrap();
             let limit = filter.limit.unwrap_or(MAX_QUERY_EVENTS);
-            let (sql, values) = build_query(Visibility::Public, &filter, NOW, limit, true)
-                .unwrap()
-                .unwrap();
+            let (sql, values) = build_query(
+                Visibility::Public,
+                &filter,
+                NOW,
+                limit,
+                true,
+                QueryColumns::Body,
+            )
+            .unwrap()
+            .unwrap();
             db.with_reader(|conn| Ok(explain(conn, &sql, values)?))
                 .unwrap()
                 .join("\n")

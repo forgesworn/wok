@@ -311,11 +311,10 @@ fn fresh_events(keys: &Keys, count: usize, label: &str) -> Result<Vec<Event>, St
         .collect()
 }
 
-fn query_sets(
-    corpus: &Corpus,
-    count: usize,
-    seed: u64,
-) -> Result<Vec<(&'static str, Vec<Value>)>, String> {
+/// Named groups of REQs, each of which may hold one or several filters.
+type QuerySet = (&'static str, Vec<Vec<Value>>);
+
+fn query_sets(corpus: &Corpus, count: usize, seed: u64) -> Result<Vec<QuerySet>, String> {
     let events: Vec<&Event> = corpus.items.iter().map(|item| &item.event).collect();
     let notes: Vec<&&Event> = events
         .iter()
@@ -327,6 +326,16 @@ fn query_sets(
         .collect();
     if notes.is_empty() || articles.is_empty() {
         return Err("the corpus needs notes and addressable articles".into());
+    }
+    let mut distinct = BTreeSet::new();
+    for event in &events {
+        distinct.insert(event.id);
+        if distinct.len() == 64 {
+            break;
+        }
+    }
+    if distinct.len() < 64 {
+        return Err("the query corpus needs at least 64 distinct events".into());
     }
     let mut rng = SplitMix(seed ^ 0x7265_6D6F_7465);
     let pick = |rng: &mut SplitMix| events[rng.below(events.len())];
@@ -369,27 +378,48 @@ fn query_sets(
             .ok_or_else(|| "an article has no d tag".to_string())?;
         tag_d.push(json!({"kinds": [KIND_ARTICLE], "#d": [d], "limit": 50}));
     }
-    Ok(vec![
+    // Same history page as authors_kinds. The shorter filter makes the
+    // relay merge real overlapping results without adding traffic.
+    let overlap = authors_kinds
+        .iter()
+        .map(|wide| {
+            let mut narrow = wide.clone();
+            narrow["limit"] = json!(25);
+            vec![wide.clone(), narrow]
+        })
+        .collect();
+    let mut sets: Vec<QuerySet> = [
         ("ids", ids),
         ("ids8", ids8),
         ("ids64", ids64),
         ("authors_kinds", authors_kinds),
         ("since_until", since_until),
         ("tag_d", tag_d),
-    ])
+    ]
+    .into_iter()
+    .map(|(name, filters)| (name, filters.into_iter().map(|f| vec![f]).collect()))
+    .collect();
+    sets.push(("overlap", overlap));
+    Ok(sets)
+}
+
+/// The REQ frame shared by fresh and held sockets.
+fn req_text(subscription: &str, filters: &[Value]) -> String {
+    let mut parts = vec![json!("REQ"), json!(subscription)];
+    parts.extend_from_slice(filters);
+    Value::Array(parts).to_string()
 }
 
 async fn one_query(
     url: &str,
     keys: Option<&Keys>,
-    filter: &Value,
+    filters: &[Value],
     number: usize,
 ) -> Result<(u64, u64, Vec<String>), String> {
     let label = format!("query {number}");
     let (mut socket, setup) = open(url, keys, &label).await?;
     let subscription = format!("bench-{number}");
-    let text = serde_json::to_string(&json!(["REQ", subscription, filter]))
-        .map_err(|e| format!("serialise a REQ: {e}"))?;
+    let text = req_text(&subscription, filters);
     let started = Instant::now();
     send_text(&mut socket, text, &label).await?;
     let mut event_ids = Vec::new();
@@ -775,12 +805,26 @@ mod tests {
         };
         let corpus = crate::corpus::build(&cfg).unwrap();
         let sets = query_sets(&corpus, 10, 1).unwrap();
-        assert_eq!(sets.len(), 6);
-        for (name, filters) in sets {
-            assert_eq!(filters.len(), 10, "{name}");
-            for filter in filters {
-                assert!(filter["limit"].as_u64().unwrap() <= 128);
+        assert_eq!(sets.len(), 7);
+        for (name, requests) in &sets {
+            assert_eq!(requests.len(), 10, "{name}");
+            for filters in requests {
+                assert_eq!(filters.len(), if *name == "overlap" { 2 } else { 1 });
+                for filter in filters {
+                    assert!(filter["limit"].as_u64().unwrap() <= 128);
+                }
             }
+        }
+        let (_, single) = sets
+            .iter()
+            .find(|(name, _)| *name == "authors_kinds")
+            .unwrap();
+        let (_, overlap) = sets.iter().find(|(name, _)| *name == "overlap").unwrap();
+        for (single, overlap) in single.iter().zip(overlap) {
+            assert_eq!(single[0], overlap[0]);
+            let mut narrow = single[0].clone();
+            narrow["limit"] = json!(25);
+            assert_eq!(narrow, overlap[1]);
         }
     }
 

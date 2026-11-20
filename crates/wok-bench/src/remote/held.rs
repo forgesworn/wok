@@ -103,7 +103,7 @@ fn shown(text: &str) -> String {
 
 struct Reading {
     sets: Vec<&'static str>,
-    filters: Arc<Vec<Value>>,
+    filters: Arc<Vec<Vec<Value>>>,
     rate: f64,
 }
 
@@ -184,9 +184,12 @@ fn check_plan(
 }
 
 /// The read filters: `READ_FILTERS` from each named set, taken in turn.
-fn read_filters(corpus: &Corpus, names: &str) -> Result<(Vec<&'static str>, Vec<Value>), String> {
+fn read_filters(
+    corpus: &Corpus,
+    names: &str,
+) -> Result<(Vec<&'static str>, Vec<Vec<Value>>), String> {
     let sets = query_sets(corpus, READ_FILTERS, corpus.digest ^ 2)?;
-    let mut chosen: Vec<&(&'static str, Vec<Value>)> = Vec::new();
+    let mut chosen: Vec<&QuerySet> = Vec::new();
     for name in names.split(',').map(str::trim) {
         let set = sets
             .iter()
@@ -205,7 +208,7 @@ fn read_filters(corpus: &Corpus, names: &str) -> Result<(Vec<&'static str>, Vec<
         }
         chosen.push(set);
     }
-    let filters: Vec<Value> = (0..READ_FILTERS)
+    let filters = (0..READ_FILTERS)
         .flat_map(|k| chosen.iter().map(move |set| set.1[k].clone()))
         .collect();
     Ok((chosen.iter().map(|(name, _)| *name).collect(), filters))
@@ -506,7 +509,7 @@ async fn write_lane(
 async fn read_lane(
     (reader, readers): (usize, usize),
     mut socket: Socket,
-    filters: Arc<Vec<Value>>,
+    filters: Arc<Vec<Vec<Value>>>,
     rate: f64,
     (t0, deadline): (Instant, Instant),
     done: watch::Receiver<bool>,
@@ -537,7 +540,7 @@ async fn read_lane(
         }
         send_text(
             &mut socket,
-            json!(["REQ", SUBSCRIPTION, &filters[j % filters.len()]]).to_string(),
+            req_text(SUBSCRIPTION, &filters[j % filters.len()]),
             &label,
         )
         .await?;
@@ -768,6 +771,8 @@ mod tests {
             "1",
             "--read-rate",
             "25",
+            "--read-set",
+            "overlap",
             "--input",
             input.as_str(),
         ]);
