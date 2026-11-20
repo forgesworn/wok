@@ -1,0 +1,13 @@
+# Wok
+
+> Rust Nostr relay components and a standalone members-only relay daemon for self-hosted groups.
+
+## Documentation
+
+- [Rust components and daemon](https://github.com/forgesworn/wok/blob/main/README.md): Storage, websocket handling, installation and operator setup.
+
+## ForgeSworn ecosystem
+
+- [ForgeSworn library guide](https://forgesworn.dev/llms.txt): Find related libraries, tools and integration guides by task and runtime.
+- [ForgeSworn on GitHub](https://github.com/forgesworn): Browse the organisation’s public repositories.
+- [Project source](https://github.com/forgesworn/wok): Canonical source repository, documentation and release information.
