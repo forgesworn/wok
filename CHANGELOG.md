@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- SQLite serves multi-filter REQs by merging the ordered keys from each
+  filter, then reading only the bodies reached by the relay's reply budget.
+  The keys and bodies come from one read snapshot. Buffered replies are
+  held until the reader's authority has been checked again.
+- `wok-bench relay query --set overlap` measures a two-filter REQ that
+  returns the same page as `authors_kinds`. Use `--read-set overlap` to
+  measure it alongside held-socket writes.
+
 ## 0.6.2 - 2026-11-19
 
 - The container image workflow also publishes each `v*` release tag as

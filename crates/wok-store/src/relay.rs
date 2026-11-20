@@ -1421,23 +1421,42 @@ fn fresh_challenge(previous: Option<&str>) -> String {
     }
 }
 
-/// Whether `events` run strictly newest first and then by id, the order the
-/// merge in a `REQ` keys them by, which also means no id appears twice.
-fn newest_first(events: &[StoredEvent]) -> bool {
-    events.windows(2).all(|pair| {
-        (std::cmp::Reverse(pair[0].created_at), &pair[0].id)
-            < (std::cmp::Reverse(pair[1].created_at), &pair[1].id)
-    })
+/// The access checked before a history query. Buffered replies use only
+/// this scope, and are released once it has been checked again.
+#[derive(PartialEq, Eq)]
+enum RequestAccess {
+    AllEvents,
+    Guest(Vec<GuestScope>),
+}
+
+impl RequestAccess {
+    fn allows(&self, event: &StoredEvent) -> bool {
+        match self {
+            Self::AllEvents => true,
+            Self::Guest(scopes) => guest_readable(event.kind, event.room.as_deref(), scopes),
+        }
+    }
 }
 
 /// What a `REQ` is once its frame has been admitted and its filters parsed.
 struct ReqSetup<'a> {
     id: &'a str,
     filters: Vec<Filter>,
-    raw_filters: &'a [Value],
+    access: RequestAccess,
 }
 
 impl RelaySession {
+    fn request_access(&self, now: u64) -> Option<RequestAccess> {
+        if self.visibility == Visibility::Public || self.authorised_checked().ok()? {
+            Some(RequestAccess::AllEvents)
+        } else {
+            self.granted_scopes_checked(now)
+                .ok()
+                .flatten()
+                .map(RequestAccess::Guest)
+        }
+    }
+
     /// The steps of a `REQ` before any store work: the subscription id, the
     /// authority and bound checks, and the filters. `Err` carries the replies
     /// that refuse it.
@@ -1451,23 +1470,21 @@ impl RelaySession {
         };
         // A rejected replacement must not leave the old subscription active.
         self.subscriptions.remove(id);
-        if !self.can_read_at(now) {
+        let Some(access) = self.request_access(now) else {
             return Err(vec![closed(id, self.refusal())]);
-        }
+        };
         if self.subscriptions.len() >= MAX_SUBSCRIPTIONS || parts.len() - 2 > MAX_FILTERS {
             return Err(vec![closed(
                 id,
                 "restricted: too many subscriptions or filters",
             )]);
         }
-        let raw_filters = &parts[2..];
-        let mut filters = Vec::new();
-        let guest_scopes = self.guest_scopes(now);
-        for raw in raw_filters {
+        let mut filters = Vec::with_capacity(parts.len() - 2);
+        for raw in &parts[2..] {
             if let Some(fault) = filter_fault(raw) {
                 return Err(vec![closed(id, fault)]);
             }
-            if let Some(scopes) = &guest_scopes
+            if let RequestAccess::Guest(scopes) = &access
                 && !guest_filter_allowed(raw, scopes)
             {
                 return Err(vec![closed(
@@ -1483,103 +1500,100 @@ impl RelaySession {
         Ok(ReqSetup {
             id,
             filters,
-            raw_filters,
+            access,
         })
+    }
+
+    /// Recheck the authority after the read and before releasing a buffered
+    /// page or keeping a live subscription. A changed grant cannot authorise
+    /// frames selected under the old one.
+    fn finish_request(
+        &mut self,
+        setup: ReqSetup<'_>,
+        now: u64,
+        mut replies: Vec<String>,
+    ) -> Vec<String> {
+        let Some(access) = self.request_access(now) else {
+            return vec![closed(setup.id, self.refusal())];
+        };
+        if access != setup.access {
+            return vec![closed(
+                setup.id,
+                "restricted: authority changed during the request",
+            )];
+        }
+        self.subscriptions
+            .insert(setup.id.to_owned(), setup.filters);
+        replies.push(frame(json!(["EOSE", setup.id])));
+        replies
     }
 
     /// [`Self::request`] for a single filter, with each EVENT frame handed to
     /// `sink` as its row is read. The returned replies are what follows them.
     ///
-    /// Differences from `request`, each forced by sending rows before the
-    /// query ends:
-    /// - a guest's scopes are read before the query, not after it, and apply
-    ///   to every row;
-    /// - authority is judged after the query as well, but a loss then can only
-    ///   refuse the rest: frames already sent stay sent;
-    /// - an error part way leaves the rows before it sent, then the CLOSED.
+    /// A loss of authority or a query error ends the page with CLOSED.
+    /// Frames already handed to the sink cannot be withdrawn.
     fn request_streaming(
         &mut self,
         parts: &[Value],
         now: u64,
         sink: &mut dyn FnMut(String),
     ) -> Vec<String> {
-        let ReqSetup {
-            id,
-            filters,
-            raw_filters,
-        } = match self.request_setup(parts, now) {
+        let setup = match self.request_setup(parts, now) {
             Ok(setup) => setup,
             Err(replies) => return replies,
         };
-        debug_assert_eq!(filters.len(), 1);
-        let guest_scopes = self.guest_scopes(now);
+        let id = setup.id;
+        debug_assert_eq!(setup.filters.len(), 1);
         let escaped = escaped_subscription(id);
         let mut bytes = 0;
         let mut rows = 0;
         let mut previous: Option<(u64, String)> = None;
         let mut disordered = false;
-        let result =
-            self.relay
-                .store
-                .query_stored_each(self.visibility, &filters[0], now, &mut |event| {
-                    if rows == MAX_QUERY_EVENTS {
-                        return false;
-                    }
-                    rows += 1;
-                    // The buffered path sends a lone filter's rows only if they run
-                    // strictly newest first and then by id (`newest_first`), and
-                    // merges them otherwise. A stream cannot merge, so
-                    // `query_stored_each` promises that order, and a row that
-                    // breaks it is a store fault that ends the page.
-                    match &mut previous {
-                        Some((at, last))
-                            if (std::cmp::Reverse(*at), last.as_str())
-                                >= (std::cmp::Reverse(event.created_at), event.id.as_str()) =>
-                        {
-                            disordered = true;
-                            return false;
-                        }
-                        Some((at, last)) => {
-                            *at = event.created_at;
-                            last.clear();
-                            last.push_str(&event.id);
-                        }
-                        None => previous = Some((event.created_at, event.id.clone())),
-                    }
-                    if let Some(scopes) = &guest_scopes
-                        && !guest_readable(event.kind, event.room.as_deref(), scopes)
+        let result = self.relay.store.query_stored_each(
+            self.visibility,
+            &setup.filters[0],
+            now,
+            &mut |event| {
+                if rows == MAX_QUERY_EVENTS {
+                    return false;
+                }
+                rows += 1;
+                // A stream cannot reorder rows once sent. An order
+                // violation by the store ends the page.
+                match &mut previous {
+                    Some((at, last))
+                        if (std::cmp::Reverse(*at), last.as_str())
+                            >= (std::cmp::Reverse(event.created_at), event.id.as_str()) =>
                     {
-                        return true;
-                    }
-                    let reply = escaped_event_frame(&escaped, &event.json);
-                    if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
+                        disordered = true;
                         return false;
                     }
-                    bytes += reply.len();
-                    sink(reply);
-                    true
-                });
+                    Some((at, last)) => {
+                        *at = event.created_at;
+                        last.clear();
+                        last.push_str(&event.id);
+                    }
+                    None => previous = Some((event.created_at, event.id.clone())),
+                }
+                if !setup.access.allows(&event) {
+                    return true;
+                }
+                let reply = escaped_event_frame(&escaped, &event.json);
+                if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
+                    return false;
+                }
+                bytes += reply.len();
+                sink(reply);
+                true
+            },
+        );
         match result {
             Ok(()) if !disordered => {}
             Err(EventStoreError::Query) => return vec![closed(id, TOO_LARGE)],
             _ => return vec![closed(id, "error: stored events unavailable")],
         }
-        if !self.can_read_at(now) {
-            return vec![closed(id, self.refusal())];
-        }
-        let guest_scopes = self.guest_scopes(now);
-        if let Some(scopes) = &guest_scopes
-            && raw_filters
-                .iter()
-                .any(|raw| !guest_filter_allowed(raw, scopes))
-        {
-            return vec![closed(
-                id,
-                "restricted: authority changed during the request",
-            )];
-        }
-        self.subscriptions.insert(id.to_string(), filters);
-        vec![frame(json!(["EOSE", id]))]
+        self.finish_request(setup, now, Vec::new())
     }
 }
 
@@ -2211,81 +2225,35 @@ impl RelaySession {
     }
 
     fn request(&mut self, parts: &[Value], now: u64) -> Vec<String> {
-        let ReqSetup {
-            id,
-            filters,
-            raw_filters,
-        } = match self.request_setup(parts, now) {
+        let setup = match self.request_setup(parts, now) {
             Ok(setup) => setup,
             Err(replies) => return replies,
         };
-        // Each event as stored, newest first and then by id, as the built
-        // events were: lowercase hex orders as the id's bytes do.
-        let mut found = Vec::new();
-        let mut merged = BTreeMap::new();
-        for filter in &filters {
-            let events = match self.relay.store.query_stored(self.visibility, filter, now) {
-                Ok(events) => events,
-                Err(EventStoreError::Query) => return vec![closed(id, TOO_LARGE)],
-                Err(_) => return vec![closed(id, "error: stored events unavailable")],
-            };
-            // A lone filter's rows already in that order, each id once, are
-            // what the merge would make of them; anything else is merged.
-            if filters.len() == 1 && newest_first(&events) {
-                found = events;
-                found.truncate(MAX_QUERY_EVENTS);
-                continue;
-            }
-            for event in events {
-                merged.insert(
-                    (std::cmp::Reverse(event.created_at), event.id.clone()),
-                    event,
-                );
-                if merged.len() > MAX_QUERY_EVENTS {
-                    merged.pop_last();
-                }
-            }
-        }
-        found.extend(merged.into_values());
-        if !self.can_read_at(now) {
-            return vec![closed(id, self.refusal())];
-        }
-        // Re-evaluate the exact scope after storage work. This prevents a
-        // replacement grant, expiry, or keeper-set change from releasing a
-        // batch or retaining a subscription built under the old authority.
-        let guest_scopes = self.guest_scopes(now);
-        if let Some(scopes) = &guest_scopes
-            && raw_filters
-                .iter()
-                .any(|raw| !guest_filter_allowed(raw, scopes))
-        {
-            return vec![closed(
-                id,
-                "restricted: authority changed during the request",
-            )];
-        }
         let mut bytes = 0;
         let mut replies = Vec::new();
-        let escaped = escaped_subscription(id);
-        for event in found {
-            // The same rule as `guest_event_readable`, on the kind and room
-            // read from the stored JSON.
-            if let Some(scopes) = &guest_scopes
-                && !guest_readable(event.kind, event.room.as_deref(), scopes)
-            {
-                continue;
-            }
-            // The stored JSON, spliced as a live frame is.
-            let reply = escaped_event_frame(&escaped, &event.json);
-            if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
-                break;
-            }
-            bytes += reply.len();
-            replies.push(reply);
+        let escaped = escaped_subscription(setup.id);
+        let result = self.relay.store.query_stored_any_each(
+            self.visibility,
+            &setup.filters,
+            now,
+            &mut |event| {
+                if !setup.access.allows(&event) {
+                    return true;
+                }
+                let reply = escaped_event_frame(&escaped, &event.json);
+                if bytes + reply.len() > MAX_REQ_REPLY_BYTES {
+                    return false;
+                }
+                bytes += reply.len();
+                replies.push(reply);
+                true
+            },
+        );
+        match result {
+            Ok(()) => self.finish_request(setup, now, replies),
+            Err(EventStoreError::Query) => vec![closed(setup.id, TOO_LARGE)],
+            Err(_) => vec![closed(setup.id, "error: stored events unavailable")],
         }
-        replies.push(frame(json!(["EOSE", id])));
-        self.subscriptions.insert(id.to_string(), filters);
-        replies
     }
 
     /// NIP-45. The same filters as `REQ`, answered with one number: no
@@ -3135,7 +3103,9 @@ mod tests {
             f: &nostr::filter::Filter,
             n: u64,
         ) -> Result<Vec<Event>, EventStoreError> {
-            self.inner.query(v, f, n)
+            let events = self.inner.query(v, f, n)?;
+            self.access.0.write().unwrap().remove(&self.key);
+            Ok(events)
         }
         fn query_stored_each(
             &self,
@@ -3238,6 +3208,16 @@ mod tests {
             let (mut sent, replies) = stream(&mut keeper, frame);
             sent.extend(replies);
             assert_eq!(sent, buffered, "{filter}");
+            // Adding an overlapping filter with a shorter page preserves the
+            // full filter's REQ and must not add a second copy of any row.
+            let mut overlap = filter.clone();
+            overlap["limit"] = json!(3);
+            let multi = json!(["REQ", "q", filter, overlap]);
+            assert_eq!(
+                keeper.handle_prepared(PreparedFrame::parse(multi.to_string()), NOW),
+                buffered,
+                "{filter}"
+            );
         }
     }
 
@@ -3253,6 +3233,22 @@ mod tests {
         assert_eq!(sent.len(), events.len());
         assert_eq!(replies.len(), 1);
         assert!(replies[0].starts_with("[\"CLOSED\",\"q\","), "{replies:?}");
+        assert!(!keeper.has_subscriptions());
+    }
+
+    #[test]
+    fn a_buffered_multi_filter_req_discards_its_page_after_revocation() {
+        let events = [(1, NOW - 10, "keeper data".to_owned())];
+        let (_tmp, mut keeper) = keeper_over(
+            |inner, access, key| Revoking { inner, access, key },
+            &events,
+        );
+        let replies = send(
+            &mut keeper,
+            json!(["REQ", "q", {"kinds": [1]}, {"limit": 1}]),
+        );
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0][0], "CLOSED");
         assert!(!keeper.has_subscriptions());
     }
 
