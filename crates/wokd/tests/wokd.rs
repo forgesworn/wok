@@ -1296,3 +1296,7 @@ async fn a_keeper_grants_one_room_to_a_guest_and_revokes_it_across_restarts() {
     );
     server.stop().await;
 }
+
+#[cfg(unix)]
+#[path = "support/tls_deploy.rs"]
+mod tls_deploy;
