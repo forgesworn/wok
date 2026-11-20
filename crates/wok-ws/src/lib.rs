@@ -56,6 +56,13 @@ pub const WORK_PERMITS: usize = 2;
 /// permits, and share the store's read connections with REQs.
 pub const READ_PERMITS: usize = 2;
 
+/// History pages that can be waiting for a socket to take them, across the
+/// doors. Each reserves enough room for one full REQ reply. The public door
+/// has a smaller share, so stalled public readers leave room for sheltered
+/// requests.
+const HISTORY_PAGES: usize = 4;
+const PUBLIC_HISTORY_PAGES: usize = 2;
+
 /// Connections across both doors, and the public door's share of them.
 const CONNECTIONS: usize = 32;
 const PUBLIC_CONNECTIONS: usize = 24;
@@ -152,8 +159,8 @@ impl Admitted {
     }
 }
 
-/// One relay's doors: the routers, and the connection, work and read budgets
-/// they share. Cloning shares the budgets.
+/// One relay's doors and their shared connection, work, read and history
+/// budgets. Cloning shares the budgets.
 #[derive(Clone)]
 pub struct Door {
     relay: Arc<EventRelay>,
@@ -162,6 +169,8 @@ pub struct Door {
     work: Arc<Semaphore>,
     public_work: Arc<Semaphore>,
     reads: Arc<Semaphore>,
+    history_pages: Arc<Semaphore>,
+    public_history_pages: Arc<Semaphore>,
     stop: Arc<tokio::sync::watch::Sender<bool>>,
     timings: Timings,
 }
@@ -179,6 +188,8 @@ impl Door {
             work: Arc::new(Semaphore::new(WORK_PERMITS)),
             public_work: Arc::new(Semaphore::new(PUBLIC_WORK_PERMITS)),
             reads: Arc::new(Semaphore::new(READ_PERMITS)),
+            history_pages: Arc::new(Semaphore::new(HISTORY_PAGES)),
+            public_history_pages: Arc::new(Semaphore::new(PUBLIC_HISTORY_PAGES)),
             stop: Arc::new(tokio::sync::watch::channel(false).0),
             timings,
         }
@@ -200,6 +211,17 @@ impl Door {
     pub fn with_work_limits(mut self, shared: usize, public: usize) -> Self {
         self.work = Arc::new(Semaphore::new(shared));
         self.public_work = Arc::new(Semaphore::new(public));
+        self
+    }
+
+    /// Replace the history reply budget. Each slot allows up to
+    /// [`wok_store::relay::MAX_REQ_REPLY_BYTES`] of EVENT frames from one REQ.
+    /// The defaults are four pages across the doors and two from the public
+    /// door. Call before building routers. A smaller value lets an embedded
+    /// host trade concurrent catch-up pages for a lower memory ceiling.
+    pub fn with_history_limits(mut self, shared: usize, public: usize) -> Self {
+        self.history_pages = Arc::new(Semaphore::new(shared));
+        self.public_history_pages = Arc::new(Semaphore::new(public));
         self
     }
 
@@ -512,24 +534,7 @@ async fn apply_on<T: Send + 'static>(
     state: &SocketState,
     f: impl FnOnce(&mut RelaySession) -> T + Send + 'static,
 ) -> Option<(RelaySession, T)> {
-    // Acquire the public allowance first, so queued public work cannot hold
-    // the permits reserved for private operations and expiry sweeps.
-    let permits = timeout(IO_TIMEOUT, async {
-        let public = if state.visibility == Visibility::Public {
-            Some(
-                Arc::clone(&state.door.public_work)
-                    .acquire_owned()
-                    .await
-                    .ok()?,
-            )
-        } else {
-            None
-        };
-        let shared = Arc::clone(pool).acquire_owned().await.ok()?;
-        Some((public, shared))
-    })
-    .await
-    .ok()??;
+    let permits = turn_permits(state.visibility, pool, &state.door.public_work).await?;
     tokio::task::spawn_blocking(move || {
         let _permits = permits;
         let replies = f(&mut session);
@@ -537,6 +542,28 @@ async fn apply_on<T: Send + 'static>(
     })
     .await
     .ok()
+}
+
+type TurnPermits = (Option<OwnedSemaphorePermit>, OwnedSemaphorePermit);
+
+async fn turn_permits(
+    visibility: Visibility,
+    shared: &Arc<Semaphore>,
+    public: &Arc<Semaphore>,
+) -> Option<TurnPermits> {
+    // Acquire the public allowance first so queued public work cannot take
+    // the capacity reserved for sheltered operations.
+    timeout(IO_TIMEOUT, async {
+        let public = if visibility == Visibility::Public {
+            Some(Arc::clone(public).acquire_owned().await.ok()?)
+        } else {
+            None
+        };
+        let shared = Arc::clone(shared).acquire_owned().await.ok()?;
+        Some((public, shared))
+    })
+    .await
+    .ok()?
 }
 
 /// A prepared frame, with the event store write taken out from behind the
@@ -550,9 +577,20 @@ async fn handle_prepared(
     session: RelaySession,
     state: &SocketState,
     prepared: PreparedFrame,
+    history_page: &mut Option<Arc<TurnPermits>>,
 ) -> Result<Option<(RelaySession, (Vec<String>, bool))>, Closing> {
     if prepared.is_req_frame() {
-        return stream_request(socket, session, state, prepared).await;
+        if state.visibility == Visibility::Public || session.is_authenticated() {
+            let permits = turn_permits(
+                state.visibility,
+                &state.door.history_pages,
+                &state.door.public_history_pages,
+            )
+            .await
+            .ok_or(BUSY)?;
+            *history_page = Some(Arc::new(permits));
+        }
+        return stream_request(socket, session, state, prepared, history_page.clone()).await;
     }
     let Some((session, handled)) =
         apply(session, state, move |s| s.begin_prepared(prepared, now())).await
@@ -607,10 +645,14 @@ async fn stream_request(
     session: RelaySession,
     state: &SocketState,
     prepared: PreparedFrame,
+    history_page: Option<Arc<TurnPermits>>,
 ) -> Result<Option<(RelaySession, (Vec<String>, bool))>, Closing> {
     let sheltered = state.visibility == Visibility::Sheltered;
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<String>();
     let query = apply_on(&state.door.reads, session, state, move |s| {
+        // A disconnected peer may leave a blocking query finishing. Keep
+        // its budget until the producer drops the last of its reply.
+        let _history_page = history_page;
         if sheltered && !s.can_read_live(now()) {
             return s.begin_prepared(prepared, now());
         }
@@ -1261,6 +1303,9 @@ async fn serve_connected(
         });
         // Set when this turn found the connection's authority gone.
         let mut authority_lost = false;
+        // The socket holds this until every frame of the page has been
+        // sent, including a buffered page returned by the blocking task.
+        let mut history_page = None;
         let result = tokio::select! {
             // At the cap the socket is not read: backpressure to the peer.
             incoming=socket.recv(), if in_flight.has_room() =>{
@@ -1308,7 +1353,7 @@ async fn serve_connected(
                                     // no work permit and no blocking hop.
                                     match session.try_close(&prepared) {
                                         Some(replies) => Some((session, (replies, false))),
-                                        None => match handle_prepared(socket, session, state, prepared).await {
+                                        None => match handle_prepared(socket, session, state, prepared, &mut history_page).await {
                                             Ok(outcome) => outcome,
                                             Err(closing) => return closing,
                                         },
@@ -1445,6 +1490,7 @@ async fn serve_connected(
             Ok(session) => session,
             Err(closing) => return closing,
         };
+        drop(history_page);
         if close_after_reply {
             return POLICY;
         }
@@ -3061,6 +3107,49 @@ mod tests {
         );
         assert!(closes_within(&mut reader, Duration::from_secs(5)).await);
         routes.shutdown();
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_history_capacity_does_not_pin_a_reader_or_block_a_write() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let door = routes(&tmp, &key).with_history_limits(1, 1);
+        let (url, task) = listen(&door, Visibility::Sheltered).await;
+        let mut reader = connect(&url, Some(&key)).await;
+        let mut publisher = connect(&url, Some(&key)).await;
+        let stored = event(&key, 1, now(), "history", vec![]);
+        send_frame(&mut publisher, json!(["EVENT", stored])).await;
+        assert_eq!(receive(&mut publisher).await[2], true);
+
+        let page = door.history_pages.acquire().await.unwrap();
+        reader
+            .send(ClientMessage::Text(
+                r#"["\u0052\u0045\u0051","waiting",{"kinds":[1]},{"kinds":[1],"limit":1}]"#.into(),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            timeout(Duration::from_millis(100), reader.next())
+                .await
+                .is_err(),
+            "the reply went out before acquiring page capacity",
+        );
+        assert_eq!(door.reads.available_permits(), READ_PERMITS);
+        let note = event(&key, 7, now(), "during catch-up", vec![]);
+        send_frame(&mut publisher, json!(["EVENT", note])).await;
+        assert_eq!(receive(&mut publisher).await[2], true);
+
+        drop(page);
+        assert_eq!(
+            receive(&mut reader).await,
+            json!(["EVENT", "waiting", stored])
+        );
+        assert_eq!(receive(&mut reader).await, json!(["EOSE", "waiting"]));
+        // A second page can take the freed slot.
+        send_frame(&mut reader, json!(["REQ", "done", {"limit": 0}])).await;
+        assert_eq!(receive(&mut reader).await, json!(["EOSE", "done"]));
+        door.shutdown();
         task.abort();
     }
 

@@ -35,6 +35,8 @@ The [Axum example](examples/sheltered.rs) merges `/events` into the host's
 router, binds an ephemeral loopback port, authenticates with a throwaway
 keeper key and publishes an event. The host supplies `Admission` from trusted
 connection information and `KeeperAccess` from its own membership state.
+Use `Door::with_history_limits` to bound simultaneous catch-up replies.
+The example allows two sheltered history replies at a time.
 Every admitted socket still authenticates with NIP-42. The canonical URL
 must be the `/events` URL clients name in AUTH, including when a TLS proxy
 terminates their connection.
