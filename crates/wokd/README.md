@@ -168,6 +168,18 @@ with its store's work on threads of its own. On Linux with glibc it caps
 the allocator at 2 arenas at start-up, unless `MALLOC_ARENA_MAX` is already
 set in its environment, in which case that value stands.
 
+## Testing a container image
+
+From the repository root on macOS or Linux, run the CI smoke test against a
+local image. The test starts two containers in turn with the same volume.
+It checks keeper and guest access, then verifies that the event and grant
+revocation survive replacing the first container.
+
+```sh
+WOK_TEST_IMAGE=localhost/wokd:dev cargo test --locked -p wokd --test wokd \
+  container::packaged_relay_preserves_member_events -- --ignored --exact
+```
+
 ## Your responsibilities
 
 Running a relay can bring legal duties. They depend on who your members are

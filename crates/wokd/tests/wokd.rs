@@ -21,6 +21,10 @@ use tokio_tungstenite::tungstenite::Message;
 use wok_ws::PATH;
 use wokd::{Config, RemoveError, RunError, Target, serve};
 
+#[cfg(unix)]
+#[path = "support/container.rs"]
+mod container;
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
