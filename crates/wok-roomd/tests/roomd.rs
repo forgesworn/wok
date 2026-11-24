@@ -204,7 +204,10 @@ async fn login(node: &Node, room: &str, keys: &Keys) -> Value {
         .send(Message::Text(json!(["AUTH", event]).to_string().into()))
         .await
         .unwrap();
-    client.next().await.map_or(Value::Null, |message| {
+    let reply = tokio::time::timeout(Duration::from_secs(5), client.next())
+        .await
+        .expect("an answer to AUTH within five seconds");
+    reply.map_or(Value::Null, |message| {
         serde_json::from_str(message.unwrap().to_text().unwrap()).unwrap()
     })
 }
