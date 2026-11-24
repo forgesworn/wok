@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.0 - 2026-11-24
 
 - `wok-roomd`, a second program: a keeper-controlled room relay, moved here
   from the Bothy node where it was built. Each room has a database of its
@@ -15,6 +15,7 @@
   `room-relay` word before the flags. It is not in the container image.
 - `wok-roomd` runs on Unix-like systems only. On Windows the crate is empty
   and the binary exits with a message.
+- `url` moves to 2.5.9 for RUSTSEC-2026-0592, in the lockfile only.
 - No change to the libraries, `wokd` or the store schema (version 5).
 
 ## 0.6.4 - 2026-11-20

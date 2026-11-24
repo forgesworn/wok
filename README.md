@@ -54,8 +54,8 @@ signed, room-scoped guests, plus a removal command for that operator. Whoever
 runs an instance operates it; see
 [`crates/wokd/README.md`](crates/wokd/README.md).
 
-The `wok-roomd` crate is a second program, built on the store alone: a room
-relay for a node that hosts several rooms under a supervisor. Each room has a
+The `wok-roomd` crate, since 0.7.0, is a second program, built on the store
+alone: a room relay for a node that hosts several rooms under a supervisor. Each room has a
 database of its own. A supervisor on the same machine says, over a private
 Unix socket, which devices are admitted and when a room is purged. An ask
 door takes sealed requests for a room's inviter from keys that have not been
