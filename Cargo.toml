@@ -10,6 +10,19 @@ license = "MIT"
 authors = ["TheCryptoDonkey"]
 repository = "https://github.com/forgesworn/wok"
 
+# What the workspace's own programs (`wokd`, `wok-roomd`, `wok-bench`) are
+# built with. An application that links the libraries builds them under its
+# own profile; this one does not reach it.
+[profile.release]
+# Whole-program optimisation in one unit, for size: `wokd` is about a fifth
+# smaller (6.1 MB against 7.6 on arm64 macOS, measured on 24 November 2026)
+# and the build about twice as long. Speed is level, within 3 per cent.
+lto = "fat"
+codegen-units = 1
+# No symbol table (5.6 MB). A panic still names its file and line; a
+# backtrace then shows addresses, not names.
+strip = true
+
 [workspace.dependencies]
 # The same axum as Bothy, whose routers merge with this crate's.
 axum = { version = "0.8.9", features = ["ws"] }
