@@ -64,6 +64,9 @@ crates/
 - `wok-ws` carries no dependency only a daemon would need (configuration
   parsing, a command line), because applications link it into their own
   builds, mobile ones included.
+- The workspace's `[profile.release]` reaches the workspace's own programs
+  only (`wokd`, `wok-roomd`, `wok-bench`). An application that links the
+  libraries builds them under its own profile.
 
 ## Common Pitfalls
 
@@ -72,3 +75,14 @@ crates/
   `SCHEMA_VERSION` bump. Never lower `SCHEMA_VERSION` to open a newer store.
 - An older build must keep refusing a newer schema (`NewerSchema`); do not
   relax that to make a rollback easier.
+- A batch keeps its savepoint journals in memory only when every event in it
+  passes `PreparedPut::journal_fits_memory` and `replaces_little`. A write
+  that can change any number of pages (a deletion, an expiry sweep, a
+  removal, a purge, the replacement of a version with many tags) must keep
+  SQLite's default journal, which moves to a temporary file as it grows.
+- The store's connections plan from the statement alone (`stable_plans`), so
+  SQLite never sees a bound value when it chooses a plan: not a `LIMIT ?`,
+  not a partition key. Steer a plan with the statement's shape or
+  `INDEXED BY`. `stable_plans_are_the_plans_bound_values_chose` compares the
+  plans of the query shapes and of every statement the connections keep
+  prepared; run a new query shape through it.

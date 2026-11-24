@@ -1,5 +1,50 @@
 # Changelog
 
+## Unreleased
+
+- `wok-store`: a batch of ordinary events keeps its savepoint journals in
+  memory. SQLite's default moves a journal to a temporary file once one
+  event has changed sixteen pages and keeps it there for the rest of the
+  transaction, so every later event cost two writes for each page it
+  touched, in the system's temporary directory rather than the store's own.
+  Storing 18,000 events on Linux took 679,989 `pwrite` calls and 2,637
+  temporary files before, and 315,939 calls and no file after. On macOS
+  (medians of six rounds) 32 submitters stored 18,964 events a second where
+  they stored 10,114, and one event a commit 9,072 where it was 4,693. A
+  batch keeps SQLite's default if it carries a deletion, an event with more
+  than 64 tags, or one that replaces a stored version with more than 64 tag
+  rows; so do expiry sweeps, an operator's removal and a purge. The journal
+  held in memory is therefore one ordinary event's: 66 KiB for a short note
+  and 1.4 MiB at the most measured. Android builds already kept every
+  journal in memory. No change to the schema or the file format.
+- `wok-store`: the store's connections choose each query plan from the
+  statement alone (SQLite's query planner stability guarantee). SQLite
+  otherwise looks at some bound values as it plans and compiles a cached
+  statement again when one has changed, which was every run: about a third
+  of a history query's time. A one-row lookup takes 1.6 µs where it took
+  9.7, and a page of 20 to 50 events 17 to 32 per cent less (macOS, medians
+  of three rounds). The plans are the ones SQLite chose before: a test
+  compares them for every query shape and for every statement the store's
+  connections keep prepared. Removal and migration statements, which are
+  compiled for one use, are not in it.
+- `wokd`: a guest's scope lookup keeps one compiled statement, with the
+  same plan stability: 1.8 µs a lookup where it was 5.0.
+- `wokd` caps its runtime's blocking pool at 8 threads
+  (`BLOCKING_THREADS`), where tokio allows 512. Signature checks run there,
+  and a burst of writes from 24 connections used to leave 81 to 121 threads
+  and 8.8 to 10.4 MB of heap; it now leaves 13 threads and 6.8 to 7.4 MB,
+  with no loss of throughput.
+- `wokd`, `wok-roomd` and `wok-bench` are built with whole-program
+  optimisation in one codegen unit and without a symbol table
+  (`[profile.release]`), for size: `wokd`'s speed is level. A panic still
+  names its file and line; a backtrace shows addresses. An application that
+  links the libraries keeps its own profile.
+- The container image builds its SQLite without the extensions `wokd` never
+  uses (full-text search, R-tree, JSON, dbstat, soundex, loadable
+  extensions, deprecated interfaces, shared cache) and without memory
+  statistics. With the profile above, `wokd` in the arm64 image is 5.13 MB
+  where it was 8.47 MB.
+
 ## 0.7.0 - 2026-11-24
 
 - `wok-roomd`, a second program: a keeper-controlled room relay, moved here

@@ -122,6 +122,11 @@ impl Checkpoint for SqliteCheckpoint {
 /// caches is at most `writer_cache_kib + READ_CONNECTIONS * reader_cache_kib
 /// + checkpoint_cache_kib` (plus 1 MiB for the warm-up while it runs).
 ///
+/// Beside the caches the writer holds the savepoint journal of the one
+/// ordinary event it is applying (see `savepoint_journal`): 66 KiB for a
+/// short note and about 1.4 MiB for the largest event that qualifies,
+/// replacing another as large (measured on 24 November 2026).
+///
 /// The server cache sizes come from the 2026-10-30 cache spike (three rounds,
 /// system allocator), which compared writer/reader caches of 2 MiB/1 MiB (the
 /// slice-4 defaults) with 512 KiB/256 KiB: household live footprint 10.7 to
@@ -1592,6 +1597,9 @@ pub struct SqliteEventStore {
     /// multi-row insert, for the differential test.
     #[cfg(test)]
     pub(crate) legacy_tags: AtomicBool,
+    /// Test seam: batches whose savepoint journals were kept in memory.
+    #[cfg(test)]
+    pub(crate) memory_journals: AtomicU64,
 }
 
 /// How a test makes one event exceed its budget, so that the real
@@ -2148,6 +2156,7 @@ PRAGMA user_version=2;"))?;
         // The writer's heap cache stays small; hot pages live in the memory
         // map. Set after any migration, which runs on SQLite's defaults.
         conn.pragma_update(None, "cache_size", -i64::from(options.writer_cache_kib))?;
+        stable_plans(&conn)?;
         set_mmap(&conn, options.mmap_bytes);
         let reader_mmap = options.reader_mmap_bytes.min(options.mmap_bytes);
         let readers = if wal {
@@ -2212,6 +2221,8 @@ PRAGMA user_version=2;"))?;
             reruns: AtomicU64::new(0),
             #[cfg(test)]
             legacy_tags: AtomicBool::new(false),
+            #[cfg(test)]
+            memory_journals: AtomicU64::new(0),
         })
     }
     fn has_headroom(&self, guard: bool, extra: u64) -> Result<bool, EventStoreError> {
@@ -3031,10 +3042,31 @@ fn open_reader(
     )?;
     conn.busy_timeout(BUSY_TIMEOUT)?;
     conn.pragma_update(None, "query_only", true)?;
+    stable_plans(&conn)?;
     conn.pragma_update(None, "cache_size", -i64::from(cache_kib))?;
     set_mmap(&conn, mmap_bytes);
     conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE);
     Ok(conn)
+}
+
+/// Have the connection choose every plan from the statement alone, never
+/// from the values bound to it (SQLite's query planner stability guarantee).
+///
+/// Left to itself SQLite looks at some bound values while it plans (a
+/// `LIMIT`, a comparison with 0 or 1), marks the statement, and compiles it
+/// again on its next run whenever such a value has changed. A statement
+/// returned to the statement cache has its bindings cleared, so every reuse
+/// counted as a change: each cached query was parsed and planned again on
+/// every run, about a third of the time of a history query (measured on
+/// 24 November 2026: a one-row lookup took 9.7 µs before and 1.6 µs after).
+/// The plans themselves are unchanged, which
+/// `stable_plans_are_the_plans_bound_values_chose` holds the store to.
+fn stable_plans(conn: &Connection) -> Result<(), rusqlite::Error> {
+    conn.set_db_config(
+        rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG,
+        true,
+    )?;
+    Ok(())
 }
 
 /// `PRAGMA mmap_size`. Best effort: a build or platform that refuses the map
@@ -3108,6 +3140,44 @@ fn spawn_warmer(
                 }
             }
         })?)
+}
+
+/// Where the writer keeps the journal of a savepoint: wholly in memory
+/// (`true`), or as SQLite does by default (`false`). Returns whether the
+/// setting was applied.
+///
+/// Every event of a batch is applied inside a savepoint, and SQLite copies
+/// each page the savepoint first changes into that journal so that the event
+/// can be undone alone. By default the journal moves to a temporary file once
+/// it passes 64 KiB (sixteen 4 KiB pages), and stays there for the rest of
+/// the transaction: every later event then costs two writes for each page it
+/// touches, more than the commit itself writes, and the pages are written
+/// outside the store's directory, in the system's temporary directory.
+/// Measured on 24 November 2026, storing 18,000 events on Linux took 679,989
+/// `pwrite` calls and 2,637 temporary files with the default journal, and
+/// 315,939 calls and no file with it in memory.
+///
+/// In memory the journal is freed as each event's savepoint is released, so
+/// it holds one event's pages at a time. That is bounded by the event (its
+/// tags and its size) and by the version it replaces, which is why only
+/// batches of ordinary events that replace little use it
+/// ([`PreparedPut::journal_fits_memory`], [`replaces_little`]): a deletion,
+/// an expiry sweep, an operator's removal and a purge can each cover any
+/// number of pages, and keep the default. Android builds of the
+/// bundled SQLite keep every journal in memory whatever is asked here
+/// (`SQLITE_TEMP_STORE=3`).
+///
+/// The setting takes effect when a transaction begins, so it is changed
+/// only between transactions.
+fn savepoint_journal(conn: &Connection, in_memory: bool) -> bool {
+    let mode = if in_memory { "MEMORY" } else { "DEFAULT" };
+    match conn.pragma_update(None, "temp_store", mode) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::warn!(%error, mode, "event-store temp_store was not changed for a batch");
+            false
+        }
+    }
 }
 
 fn exec(
@@ -3413,7 +3483,52 @@ impl PreparedPut {
     pub fn is_ephemeral(&self) -> bool {
         self.ephemeral
     }
+
+    /// Whether the pages this event's own rows change are few enough to
+    /// journal in memory; see [`savepoint_journal`]. A deletion can remove
+    /// any number of events, and every indexed tag costs pages of its own.
+    /// What the event replaces is [`replaces_little`]'s to say.
+    fn journal_fits_memory(&self) -> bool {
+        !self.is_deletion() && self.event.tags.len() <= MEMORY_JOURNAL_TAGS
+    }
 }
+
+/// Whether what `put` would replace is small enough to journal in memory. A
+/// replaceable or addressable event removes the stored version at its
+/// coordinate inside its own savepoint, tag rows and all, so a two-tag event
+/// replacing one of 511 tags changes as many pages as that one did (2.6 MiB
+/// of journal, measured on 24 November 2026). Asked before the transaction
+/// begins, under the writer's lock, so nothing changes the answer before the
+/// event is applied. An answer that cannot be read is "no".
+fn replaces_little(conn: &Connection, put: &PreparedPut) -> bool {
+    let event = &put.event;
+    let Some(coordinate) = coordinate(event) else {
+        return true;
+    };
+    let bound = MEMORY_JOURNAL_TAGS as i64;
+    probe(
+        conn,
+        "SELECT count(*) FROM (SELECT 1 FROM events e INDEXED BY events_coordinate CROSS JOIN tags t ON t.seq=e.seq WHERE e.visibility=? AND e.author=? AND e.kind=? AND e.coordinate=? LIMIT ?)",
+        params![
+            put.visibility.key(),
+            event.pubkey.as_bytes(),
+            event.kind.as_u16(),
+            coordinate,
+            bound + 1
+        ],
+        |row| row.get::<_, i64>(0),
+    )
+    .ok()
+    .flatten()
+    .is_some_and(|tags| tags <= bound)
+}
+
+/// Most tags an event may carry, and most tag rows the version it replaces
+/// may hold, for its batch to journal in memory. An event of 511 indexed tags
+/// changed about 1,300 pages (5.4 MiB of journal); at this bound the most
+/// measured was 1.4 MiB, for a 250 KiB addressable event of 64 tags replacing
+/// another as large (24 November 2026).
+const MEMORY_JOURNAL_TAGS: usize = 64;
 
 /// One batch may keep starting events for at most this long. Events behind
 /// that point are not refused: they come back as [`EventStoreError::Deferred`]
@@ -4066,7 +4181,7 @@ impl SqliteEventStore {
         &self,
         batch: &[PreparedPut],
         results: &mut [Option<PutResult>],
-        mut idxs: Vec<usize>,
+        idxs: Vec<usize>,
     ) {
         let mut conn = match self.lock() {
             Ok(conn) => conn,
@@ -4077,21 +4192,45 @@ impl SqliteEventStore {
                 return;
             }
         };
+        let in_memory = idxs
+            .iter()
+            .all(|&i| batch[i].journal_fits_memory() && replaces_little(&conn, &batch[i]))
+            && savepoint_journal(&conn, true);
+        #[cfg(test)]
+        if in_memory {
+            self.memory_journals.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+        self.settle_batch(&mut conn, batch, results, idxs);
+        // Whatever the writer runs next (an expiry sweep, a removal, a
+        // batch with a deletion) starts from SQLite's default again.
+        if in_memory {
+            savepoint_journal(&conn, false);
+        }
+    }
+
+    /// [`Self::commit_batch`] once the write lock is held.
+    fn settle_batch(
+        &self,
+        conn: &mut Connection,
+        batch: &[PreparedPut],
+        results: &mut [Option<PutResult>],
+        mut idxs: Vec<usize>,
+    ) {
         // One budget for the whole call: a pass run again after an event was
         // lost does not get a fresh one, or interrupted events could stack
         // their time without end.
         let began = std::time::Instant::now();
         while !idxs.is_empty() {
-            let end = self.run_batch(&mut conn, batch, &idxs, results, began);
+            let end = self.run_batch(conn, batch, &idxs, results, began);
             // Never leave an expired timer on the connection for whatever
             // runs next, not even its BEGIN.
             self.budget.disarm();
             match end {
                 Ok(BatchEnd::Committed { reclaimed }) => {
                     if reclaimed {
-                        self.checkpoint_after_reclaim(&conn);
+                        self.checkpoint_after_reclaim(conn);
                     }
-                    self.enforce_wal_ceiling(&conn);
+                    self.enforce_wal_ceiling(conn);
                     return;
                 }
                 Ok(BatchEnd::Short { lost }) => {
@@ -4139,6 +4278,9 @@ impl SqliteEventStore {
     }
 }
 
+/// One expiry sweep: the events due by `?1`, at most `?2` of them.
+const EXPIRE_SQL: &str = "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events INDEXED BY events_expiry WHERE expires_at IS NOT NULL AND expires_at<=? ORDER BY expires_at LIMIT ?)";
+
 impl EventStore for SqliteEventStore {
     fn expire(&self, now: u64) -> Result<usize, EventStoreError> {
         let mut conn = self.lock()?;
@@ -4148,7 +4290,7 @@ impl EventStore for SqliteEventStore {
         // Immediate, as in `run_batch`: see there.
         let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let removed = tx.execute(
-            "DELETE FROM events WHERE rowid IN (SELECT rowid FROM events INDEXED BY events_expiry WHERE expires_at IS NOT NULL AND expires_at<=? ORDER BY expires_at LIMIT ?)",
+            EXPIRE_SQL,
             params![now.min(i64::MAX as u64) as i64, MAX_EXPIRE_EVENTS as i64],
         );
         // Do not interrupt commit with a timer that began before the DELETE.
@@ -10750,5 +10892,325 @@ PRAGMA user_version=2;")).unwrap();
             .unwrap();
         assert!(again.removed.is_empty());
         assert!(!again.erased, "nothing removed, nothing truncated");
+    }
+
+    /// The plan of `sql` with `values` bound. A connection that plans from
+    /// bound values compiles the statement again once they are bound, so on
+    /// such a connection this is the plan those values chose.
+    fn plan_of(conn: &Connection, sql: &str, values: &[Value]) -> Vec<String> {
+        let mut statement = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+        statement
+            .query_map(params_from_iter(values.iter()), |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap()
+    }
+
+    /// The SQL of every statement `conn` holds prepared, its statement cache
+    /// included.
+    fn prepared_sql(conn: &Connection) -> Vec<String> {
+        let mut found = Vec::new();
+        // SAFETY: the handle is `conn`'s own and outlives the walk; every
+        // statement pointer comes from SQLite's list for that handle, which
+        // nothing changes meanwhile.
+        unsafe {
+            let handle = conn.handle();
+            let mut statement = rusqlite::ffi::sqlite3_next_stmt(handle, std::ptr::null_mut());
+            while !statement.is_null() {
+                let sql = rusqlite::ffi::sqlite3_sql(statement);
+                if !sql.is_null() {
+                    found.push(std::ffi::CStr::from_ptr(sql).to_string_lossy().into_owned());
+                }
+                statement = rusqlite::ffi::sqlite3_next_stmt(handle, statement);
+            }
+        }
+        found
+    }
+
+    /// Two more connections to the store's file: one as SQLite opens it, which
+    /// plans from bound values, and one with stable plans.
+    fn planners(path: &Path) -> (Connection, Connection) {
+        let open = || {
+            Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap()
+        };
+        let (from_values, stable) = (open(), open());
+        stable_plans(&stable).unwrap();
+        (from_values, stable)
+    }
+
+    #[test]
+    fn the_store_connections_keep_stable_plans() {
+        let tmp = TempDir::new().unwrap();
+        let db = store(&tmp);
+        let stable = |conn: &Connection| {
+            conn.db_config(rusqlite::config::DbConfig::SQLITE_DBCONFIG_ENABLE_QPSG)
+                .unwrap()
+        };
+        assert!(stable(&db.lock().unwrap()));
+        assert_eq!(db.readers.len(), READ_CONNECTIONS);
+        for reader in &db.readers {
+            assert!(stable(&reader.lock().unwrap().conn));
+        }
+    }
+
+    #[test]
+    fn a_cached_statement_is_not_compiled_again_when_its_values_change() {
+        use rusqlite::StatementStatus::{RePrepare, Run};
+
+        let tmp = TempDir::new().unwrap();
+        let db = SqliteEventStore::open(&tmp.path().join("history.sqlite"), 100_000_000).unwrap();
+        let keys = [Keys::generate(), Keys::generate(), Keys::generate()];
+        for (scope, event) in &upgrade_corpus(&keys) {
+            db.put(*scope, event, NOW).unwrap();
+        }
+        // One shape, asked with several limits, partitions and times, often
+        // enough that each reader has run it more than once.
+        let filter = |limit: usize| Filter::new().kind(Kind::from(1)).limit(limit);
+        for round in 0..4 {
+            for (scope, limit) in [
+                (Visibility::Public, 3),
+                (Visibility::Sheltered, 34),
+                (Visibility::Public, 1),
+                (Visibility::Sheltered, 128),
+            ] {
+                db.query_stored(scope, &filter(limit), NOW + round).unwrap();
+            }
+        }
+        let (sql, _) = db
+            .query_sql(Visibility::Public, &filter(3), NOW, QueryColumns::Body)
+            .unwrap()
+            .unwrap();
+        for reader in &db.readers {
+            let reader = reader.lock().unwrap();
+            let statement = reader.conn.prepare_cached(&sql).unwrap();
+            assert!(statement.get_status(Run) > 1, "each reader ran it");
+            assert_eq!(statement.get_status(RePrepare), 0);
+        }
+        // The writer's own statements, after the puts above: each was run
+        // for many events, with a partition key and other values that
+        // changed between them.
+        let conn = db.lock().unwrap();
+        let held = prepared_sql(&conn);
+        let mut reused = 0;
+        for sql in &held {
+            let statement = conn.prepare_cached(sql).unwrap();
+            assert!(statement.get_status(Run) > 0, "{sql}");
+            assert_eq!(statement.get_status(RePrepare), 0, "{sql}");
+            reused += usize::from(statement.get_status(Run) > 1);
+        }
+        assert!(reused > 5, "{reused} of {held:?}");
+    }
+
+    /// Stable plans must not be different plans. For every history, merge
+    /// and count statement the query shapes make, and every statement the
+    /// writer and the readers hold after a representative workload, the plan
+    /// SQLite chooses without looking at bound values is the plan it chose
+    /// from them.
+    #[test]
+    fn stable_plans_are_the_plans_bound_values_chose() {
+        use rusqlite::StatementStatus::RePrepare;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("history.sqlite");
+        let db = SqliteEventStore::open(&path, 100_000_000).unwrap();
+        let keys = [Keys::generate(), Keys::generate(), Keys::generate()];
+        let corpus = upgrade_corpus(&keys);
+        for (scope, event) in &corpus {
+            db.put(*scope, event, NOW).unwrap();
+        }
+        db.expire(NOW).unwrap();
+        let filters = upgrade_filters(&keys, &corpus);
+        let (from_values, stable) = planners(&path);
+
+        // The comparison has teeth: the first connection does plan from the
+        // values it is given.
+        let (sql, values) = db
+            .query_sql(
+                Visibility::Public,
+                &Filter::new().limit(3),
+                NOW,
+                QueryColumns::Body,
+            )
+            .unwrap()
+            .unwrap();
+        for (conn, compiled_again) in [(&from_values, true), (&stable, false)] {
+            let mut statement = conn.prepare(&sql).unwrap();
+            statement
+                .query_map(params_from_iter(values.iter()), |_| Ok(()))
+                .unwrap()
+                .for_each(drop);
+            assert_eq!(statement.get_status(RePrepare) > 0, compiled_again);
+        }
+
+        let mut compared = 0;
+        let mut same = |sql: &str, values: &[Value]| {
+            assert_eq!(
+                plan_of(&stable, sql, values),
+                plan_of(&from_values, sql, values),
+                "{sql} {values:?}"
+            );
+            compared += 1;
+        };
+        for scope in [Visibility::Public, Visibility::Sheltered] {
+            for (i, filter) in filters.iter().enumerate() {
+                for columns in [QueryColumns::Body, QueryColumns::Keys] {
+                    if let Some((sql, values)) = db.query_sql(scope, filter, NOW, columns).unwrap()
+                    {
+                        same(&sql, &values);
+                    }
+                }
+                let pair = [filter.clone(), filters[(i + 1) % filters.len()].clone()];
+                for group in [&pair[..1], &pair[..]] {
+                    if let Some((sql, values)) = build_count(scope, group, NOW).unwrap() {
+                        same(&sql, &values);
+                    }
+                }
+                // Through the store as well, so its connections hold what
+                // these shapes prepare.
+                db.query_stored(scope, filter, NOW).unwrap();
+                db.query_stored_any_each(scope, &pair, NOW, &mut |_| true)
+                    .unwrap();
+            }
+        }
+        same(
+            EXPIRE_SQL,
+            &[
+                Value::Integer(NOW as i64),
+                Value::Integer(MAX_EXPIRE_EVENTS as i64),
+            ],
+        );
+
+        // Everything the store's own connections prepared along the way,
+        // with a small and a large number in every place: a limit of one and
+        // a full page, a partition key and a value that is not one.
+        let mut held = prepared_sql(&db.lock().unwrap());
+        for reader in &db.readers {
+            held.extend(prepared_sql(&reader.lock().unwrap().conn));
+        }
+        held.sort();
+        held.dedup();
+        assert!(held.len() > 12, "{held:?}");
+        for sql in &held {
+            let count = stable.prepare(sql).unwrap().parameter_count();
+            for number in [1, MAX_QUERY_EVENTS as i64] {
+                same(sql, &vec![Value::Integer(number); count]);
+            }
+        }
+        assert!(compared > 150, "{compared}");
+    }
+
+    #[test]
+    fn only_batches_of_ordinary_events_journal_in_memory() {
+        let tmp = TempDir::new().unwrap();
+        let db = SqliteEventStore::open(&tmp.path().join("journal.sqlite"), 100_000_000).unwrap();
+        let key = Keys::generate();
+        let in_memory = |db: &SqliteEventStore| db.memory_journals.load(AtomicOrdering::SeqCst);
+        // What the next transaction on the writer would use: 0 is SQLite's
+        // default, 2 is memory.
+        let resting = |db: &SqliteEventStore| -> i64 {
+            db.lock()
+                .unwrap()
+                .query_row("PRAGMA temp_store", [], |row| row.get(0))
+                .unwrap()
+        };
+        let stored = |results: Vec<PutResult>| {
+            results
+                .iter()
+                .all(|result| matches!(result, Ok(PutOutcome::Stored)))
+        };
+        assert_eq!(resting(&db), 0);
+
+        let ordinary = notes(&key, 3, "ordinary");
+        let batch: Vec<PreparedPut> = ordinary
+            .iter()
+            .map(|e| prepared(Visibility::Public, e))
+            .collect();
+        assert!(stored(db.put_prepared_batch(&batch)));
+        assert_eq!(in_memory(&db), 1);
+        assert_eq!(resting(&db), 0, "the setting does not outlive its batch");
+
+        // Every indexed tag costs pages of its own: up to the bound in
+        // memory, past it SQLite's default.
+        let topics = |count: usize| -> Vec<Vec<String>> {
+            (0..count).map(|n| tag("t", format!("topic-{n}"))).collect()
+        };
+        let edge = event(&key, 1, NOW - 30, "edge", &topics(MEMORY_JOURNAL_TAGS));
+        let wide = event(&key, 1, NOW - 20, "wide", &topics(MEMORY_JOURNAL_TAGS + 1));
+        db.put(Visibility::Public, &edge, NOW).unwrap();
+        assert_eq!(in_memory(&db), 2);
+        db.put(Visibility::Public, &wide, NOW).unwrap();
+        assert_eq!(in_memory(&db), 2);
+
+        // What an event replaces is removed in its own savepoint. A short
+        // event that replaces a version with many tags keeps the default;
+        // one that replaces a short version does not need to.
+        let article = |at: u64, tags: usize| {
+            let mut all = vec![tag("d", "article")];
+            all.extend(topics(tags));
+            event(&key, 30023, at, "article", &all)
+        };
+        db.put(
+            Visibility::Public,
+            &article(NOW - 19, MEMORY_JOURNAL_TAGS + 1),
+            NOW,
+        )
+        .unwrap();
+        assert_eq!(in_memory(&db), 2, "a wide event");
+        db.put(Visibility::Public, &article(NOW - 18, 1), NOW)
+            .unwrap();
+        assert_eq!(in_memory(&db), 2, "a short event replacing a wide one");
+        db.put(Visibility::Public, &article(NOW - 17, 2), NOW)
+            .unwrap();
+        assert_eq!(in_memory(&db), 3, "a short event replacing a short one");
+        // The other partition's version at that coordinate is not this
+        // event's to replace.
+        db.put(
+            Visibility::Sheltered,
+            &article(NOW - 16, MEMORY_JOURNAL_TAGS + 1),
+            NOW,
+        )
+        .unwrap();
+        db.put(Visibility::Public, &article(NOW - 15, 3), NOW)
+            .unwrap();
+        assert_eq!(in_memory(&db), 4);
+
+        // A deletion can remove any number of events, so its batch keeps the
+        // default, and so does the ordinary event beside it.
+        let beside = event(&key, 1, NOW - 10, "beside a deletion", &[]);
+        let removal = event(&key, 5, NOW - 5, "", &[tag("e", ordinary[0].id.to_hex())]);
+        let batch = [
+            prepared(Visibility::Public, &beside),
+            prepared(Visibility::Public, &removal),
+        ];
+        assert!(stored(db.put_prepared_batch(&batch)));
+        assert_eq!(in_memory(&db), 4);
+        assert_eq!(resting(&db), 0);
+
+        // An event refused part way is still undone alone from a journal
+        // held in memory.
+        let mut small = SqliteEventStore::open(&tmp.path().join("small.sqlite"), 6_000).unwrap();
+        let fits = event(&key, 1, NOW - 4, "fits", &[]);
+        let too_much = event(&key, 1, NOW - 3, &"x".repeat(4_000), &[]);
+        let also_fits = event(&key, 1, NOW - 2, "also fits", &[]);
+        let batch = [
+            prepared(Visibility::Public, &fits),
+            prepared(Visibility::Public, &too_much),
+            prepared(Visibility::Public, &also_fits),
+        ];
+        let results = small.put_prepared_batch(&batch);
+        assert_eq!(in_memory(&small), 1);
+        assert!(matches!(results[0], Ok(PutOutcome::Stored)), "{results:?}");
+        assert!(
+            matches!(results[1], Err(EventStoreError::Full)),
+            "{results:?}"
+        );
+        assert!(matches!(results[2], Ok(PutOutcome::Stored)), "{results:?}");
+        small.set_byte_ceiling(100_000_000);
+        assert_eq!(
+            ids(&small, Visibility::Public, Filter::new(), NOW),
+            vec![also_fits.id.to_hex(), fits.id.to_hex()]
+        );
     }
 }

@@ -62,7 +62,9 @@ The repository root also has a production Docker image definition. It builds
 only `wokd`, runs it as uid 10001 and keeps state in `/data`; it is not the
 benchmark image. CI publishes it for amd64 and arm64 as
 `ghcr.io/forgesworn/wok`: each release tag as its version (`0.7.0` for
-`v0.7.0`), and `main` as `latest`. Pin a version. Or build it yourself:
+`v0.7.0`), and `main` as `latest`. Pin a version. The image's SQLite is built
+without the extensions `wokd` never uses (full-text search, R-tree, JSON and
+the like); the `Dockerfile` lists them. Or build it yourself:
 
 ```sh
 docker build -t localhost/wokd:dev .
@@ -164,7 +166,9 @@ client is, and the connection budget and the AUTH deadline are what hold
 strangers back.
 
 The relay runs on 2 worker threads (`workers`) rather than one per core,
-with its store's work on threads of its own. On Linux with glibc it caps
+with its store's work on threads of its own. Signature checks and each
+connection's store steps share a pool of at most 8 more, however many frames
+are in flight. On Linux with glibc it caps
 the allocator at 2 arenas at start-up, unless `MALLOC_ARENA_MAX` is already
 set in its environment, in which case that value stands.
 

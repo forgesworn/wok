@@ -69,6 +69,21 @@ pub const RELAY_INFORMATION: bool = true;
 /// runtime calls them.
 pub const WORKERS: usize = 2;
 
+/// The most threads the runtime's blocking pool may hold. Each EVENT frame's
+/// signature check runs there, and so does every store and authority step
+/// under one of the doors' work or read permits. tokio's own limit is 512,
+/// and a burst of writes from every connection used to grow the pool towards
+/// one thread per frame in flight: a burst from 24 connections left 81 to 121
+/// threads and 8.8 to 10.4 MB of heap, against 13 threads and 6.8 to 7.4 MB
+/// with this limit, at no loss of throughput (measured on 24 November 2026).
+/// A check that finds no free thread waits its turn in the pool's queue. Like
+/// [`WORKERS`], only the `wokd` binary applies it.
+pub const BLOCKING_THREADS: usize = 8;
+
+// Every work and read permit can be in use and still leave threads for
+// signature checks.
+const _: () = assert!(BLOCKING_THREADS > wok_ws::WORK_PERMITS + wok_ws::READ_PERMITS);
+
 /// The writer connection's page cache, in KiB: a quarter of
 /// [`StoreOptions::server`]'s. The relay's other store settings are the
 /// server profile's.

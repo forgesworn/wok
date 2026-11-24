@@ -64,6 +64,7 @@ fn serve(args: &[String]) -> ExitCode {
     }
     let runtime = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(config.workers)
+        .max_blocking_threads(wokd::BLOCKING_THREADS)
         .enable_all()
         .build()
     {
