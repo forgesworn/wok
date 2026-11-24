@@ -4,9 +4,12 @@ Wok is a Nostr relay core in Rust, moved out of the Bothy node. Its library
 crates (`wok-store`, `wok-ws`) never open a port or run a daemon, and they
 hold no policy: the application around them says who may connect, who its
 keepers and guests are, and which events carry authority, and it binds the
-listeners. `wokd` is the one program: a members-only relay its operator runs
+listeners. `wokd` is the main program: a members-only relay its operator runs
 for one group, with listed keepers and their explicitly signed, room-scoped
-guests. Keep every read and write authenticated and scoped, with no open mode.
+guests. `wok-roomd` is a second, for a supervised node: a database for each
+room, an allowlist pushed over a local socket, and an ask door for keys not
+yet admitted. Keep every read and write authenticated and scoped, with no
+open mode.
 
 ## Build & Test
 
@@ -36,6 +39,10 @@ crates/
   wok-ws/
     src/lib.rs     - Door: the WebSocket doors, their budgets, Admission
   wok-bench/       - store-level baselines and remote-relay comparison (not published)
+  wok-roomd/       - Unix only; uses wok-store, not wok-ws
+    src/relay.rs   - RoomRelay: rooms, device grants, the room and ask doors, purge
+    src/host.rs    - the loopback listener, the control socket, the command line
+    README.md      - the control protocol and what an unadmitted key can do
   wokd/
     src/lib.rs     - Config, Members, PerAddress, run/serve, reload, remove
     src/authority.rs - persistent signed room grants and guest scopes
