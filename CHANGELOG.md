@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- `wok-roomd`, a second program: a keeper-controlled room relay, moved here
+  from the Bothy node where it was built. Each room has a database of its
+  own, a supervisor on the same machine pushes the allowlist over a private
+  Unix socket and renews it every 15 seconds, an ask door takes sealed
+  requests for a room's inviter from keys not yet admitted, and purging a
+  room deletes its database and leaves a 30-day tombstone. The control
+  protocol and the flags are unchanged from the Bothy build. So is the
+  layout of the data directory: the names of the room stores, which a test
+  now pins, and the store schema. No directory written by a Bothy build has
+  been opened with this one yet. The command is now `wok-roomd`, with no
+  `room-relay` word before the flags. It is not in the container image.
+- `wok-roomd` runs on Unix-like systems only. On Windows the crate is empty
+  and the binary exits with a message.
+- No change to the libraries, `wokd` or the store schema (version 5).
+
 ## 0.6.4 - 2026-11-20
 
 - The embedded phone profile waits 30 seconds without a commit before

@@ -1,0 +1,33 @@
+[package]
+name = "wok-roomd"
+description = "A keeper-controlled room relay on Wok: a database for each room, an ask door, and purge on close"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+axum = { workspace = true }
+# The data directory's lock: one process for each set of room stores.
+fs2 = { workspace = true }
+# The room salt and each connection's NIP-42 challenge.
+getrandom = "0.3"
+hex = { workspace = true }
+nostr = { workspace = true }
+rusqlite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# A room's store is named by SHA-256 of the salt and the room id.
+sha2 = "0.10"
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+url = { workspace = true }
+wok-store = { path = "../wok-store" }
+
+[dev-dependencies]
+futures-util = { workspace = true, features = ["sink"] }
+tempfile = { workspace = true }
+tokio-tungstenite = { workspace = true }
