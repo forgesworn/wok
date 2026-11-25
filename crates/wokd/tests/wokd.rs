@@ -303,9 +303,18 @@ async fn member(url: &str, keys: &Keys) -> Socket {
     socket
 }
 
+/// Send `event` and return the reply to it, passing over any live EVENT
+/// frame: a subscription that `query` opened stays open after its EOSE, and
+/// the writer answers an event before it announces it, so an event stored
+/// just before a query may still come live after it.
 async fn publish(socket: &mut Socket, event: &Event) -> Value {
     send(socket, json!(["EVENT", event])).await;
-    receive(socket).await
+    loop {
+        let frame = receive(socket).await;
+        if frame[0] != "EVENT" {
+            return frame;
+        }
+    }
 }
 
 /// The events a REQ returns before EOSE (or the CLOSED frame instead).

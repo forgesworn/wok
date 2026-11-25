@@ -1,7 +1,16 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-11-25
 
+Performance, and a smaller container image. The store schema (version 5),
+the file format and the wire protocol are unchanged from 0.7.0, and a
+volume written by the 0.7.0 image opens under this one.
+
+- Breaking for the container image: it has no shell, so nothing can be
+  `docker exec`ed in a running container. An operator's removal, which
+  needs the relay stopped as before, now runs as a container of its own
+  against the same volume and configuration; `wokd`'s README gives the
+  command. Nothing else an operator does changes.
 - `wok-store`: a batch of ordinary events keeps its savepoint journals in
   memory. SQLite's default moves a journal to a temporary file once one
   event has changed sixteen pages and keeps it there for the rest of the
