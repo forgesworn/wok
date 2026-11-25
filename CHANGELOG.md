@@ -97,6 +97,20 @@
   400 events of the kind took 657 µs and take 25 µs; asked of an author
   with only those sixteen they took 23.5 µs and take 24.6 µs. A `COUNT` is
   answered as before.
+- `wok-ws`: a subscriber's live events go out several to a write. The
+  writer announces a whole commit at once, so a connection's queue holds its
+  events together, and each used to be matched and flushed on its own. A
+  connection now takes what is queued behind the event it was woken for, up
+  to 64 events or 16 KiB of frames (the socket's write buffer), and writes
+  them together in the order they were queued. Its own events still come
+  back after their `OK`s: those are taken after the last event of the batch
+  and sent first. With one connection pipelining 24,000 events to eight
+  subscribers on Linux, client and relay in one process made 37,812 `sendto`
+  calls where they made 217,807: the 192,000 live frames went out in about
+  12,300 writes, where each had its own. With 16 connections writing to 32
+  subscribers the door acknowledged 23,850 writes a second where it
+  acknowledged 17,660 (medians of 52 cells each, in a Docker VM on a busy
+  host). One writer showed no difference.
 - `wok-bench`: `--socket-subscribers N` attaches connections that hold an
   open `REQ` and read every event of a socket cell live. A subscriber that
   lags or misses an event fails the run. The default is none, so earlier
