@@ -64,7 +64,9 @@ benchmark image. CI publishes it for amd64 and arm64 as
 `ghcr.io/forgesworn/wok`: each release tag as its version (`0.7.0` for
 `v0.7.0`), and `main` as `latest`. Pin a version. The image's SQLite is built
 without the extensions `wokd` never uses (full-text search, R-tree, JSON and
-the like); the `Dockerfile` lists them. Or build it yourself:
+the like); the `Dockerfile` lists them. Its base is distroless: `wokd` is the
+only program in it, so there is no shell to `docker exec` into, and anything
+you run in it is a `wokd` command. Or build it yourself:
 
 ```sh
 docker build -t localhost/wokd:dev .
@@ -140,6 +142,14 @@ wokd remove --config wokd.toml --id <event id> [--id <event id> ...]
 wokd remove --config wokd.toml --author <npub>
 ```
 
+With the container image, run the removal as its own container on the
+stopped relay's configuration and volume:
+
+```sh
+docker run --rm -v "$PWD/wokd.toml:/etc/wokd/wokd.toml:ro" -v wok-data:/data \
+  localhost/wokd:dev remove --config /etc/wokd/wokd.toml --id <event id>
+```
+
 - A removal is refused while the relay is running on that data directory.
 - Each removed event is barred from being stored again: a client that
   re-publishes it is refused. The bar is per event, so a re-signed copy is a
@@ -170,19 +180,27 @@ with its store's work on threads of its own. Signature checks and each
 connection's store steps share a pool of at most 8 more, however many frames
 are in flight. On Linux with glibc it caps
 the allocator at 2 arenas at start-up, unless `MALLOC_ARENA_MAX` is already
-set in its environment, in which case that value stands.
+set in its environment, in which case that value stands. There it also hands
+the allocator's free memory back to the kernel every 30 seconds, so what a
+burst of writes used does not stay resident.
 
 ## Testing a container image
 
-From the repository root on macOS or Linux, run the CI smoke test against a
-local image. The test starts two containers in turn with the same volume.
+From the repository root on macOS or Linux, run the CI smoke tests against a
+local image. The first starts two containers in turn with the same volume.
 It checks keeper and guest access, then verifies that the event and grant
-revocation survive replacing the first container.
+revocation survive replacing the first container. The second stores an event
+with 500 tags and a deletion of 40 events, the writes that need a temporary
+file, then runs `wokd remove` in the image on the stopped relay's volume.
 
 ```sh
-WOK_TEST_IMAGE=localhost/wokd:dev cargo test --locked -p wokd --test wokd \
-  container::packaged_relay_preserves_member_events -- --ignored --exact
+WOK_TEST_IMAGE=localhost/wokd:dev cargo test --locked -p wokd --test wokd -- \
+  --ignored --exact container::packaged_relay_preserves_member_events \
+  container::packaged_relay_takes_wide_writes_and_an_operators_removal
 ```
+
+To check an upgrade, set `WOK_TEST_PREVIOUS_IMAGE` as well: the first test
+then writes with that image and reads the same volume with `WOK_TEST_IMAGE`.
 
 ## Your responsibilities
 

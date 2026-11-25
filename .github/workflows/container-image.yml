@@ -29,12 +29,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
         with:
           toolchain: 1.94.1
-      - name: Exercise the packaged relay and its persistent volume
+      - name: Exercise the packaged relay, its persistent volume and its wide writes
         env:
           WOK_TEST_IMAGE: localhost/wok-standalone:ci
         run: >-
-          cargo test --locked -p wokd --test wokd
-          container::packaged_relay_preserves_member_events -- --ignored --exact --nocapture
+          cargo test --locked -p wokd --test wokd -- --ignored --exact --nocapture
+          container::packaged_relay_preserves_member_events
+          container::packaged_relay_takes_wide_writes_and_an_operators_removal
 
   publish:
     if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))

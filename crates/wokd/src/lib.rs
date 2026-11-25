@@ -807,6 +807,24 @@ mod tests {
         keys.public_key().to_bech32().unwrap()
     }
 
+    /// `wokd`'s manifest names `secp256k1` only to turn on its small tables.
+    /// That reaches the signature checks while the build holds one copy of
+    /// the crate. If `nostr` moves to another version, the feature lands on
+    /// a copy nothing links and the tables are full-size again, silently.
+    #[test]
+    fn the_small_tables_are_asked_of_the_only_secp256k1_in_the_build() {
+        // By line: a Windows checkout may end each line with a carriage
+        // return, which `lines` drops.
+        let lock = include_str!("../../../Cargo.lock");
+        assert_eq!(
+            lock.lines()
+                .filter(|line| *line == "name = \"secp256k1\"")
+                .count(),
+            1,
+            "one secp256k1: move the version in wokd's manifest with nostr's"
+        );
+    }
+
     fn file(members: &str, extra: &str) -> String {
         format!(
             "url = \"ws://relay.example:7447/events\"\ndata_dir = \"/tmp/wokd\"\n\

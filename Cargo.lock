@@ -2274,6 +2274,7 @@ dependencies = [
  "nostr-sdk",
  "rusqlite",
  "rustls",
+ "secp256k1",
  "serde",
  "serde_json",
  "tempfile",

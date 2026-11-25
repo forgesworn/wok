@@ -67,6 +67,11 @@ crates/
 - The workspace's `[profile.release]` reaches the workspace's own programs
   only (`wokd`, `wok-roomd`, `wok-bench`). An application that links the
   libraries builds them under its own profile.
+- `wokd`'s manifest turns on secp256k1's `lowmemory` (small tables, slower
+  signature checks). Cargo unifies features across one build, so a build
+  that includes `wokd` (`--workspace`, `-p wokd -p wok-bench`) gives the
+  small tables to every package in it. Build `wok-bench` on its own when its
+  signature or ingest figures are to be compared.
 
 ## Common Pitfalls
 
@@ -86,3 +91,9 @@ crates/
   `INDEXED BY`. `stable_plans_are_the_plans_bound_values_chose` compares the
   plans of the query shapes and of every statement the connections keep
   prepared; run a new query shape through it.
+- The production image is distroless: no shell, so nothing can be `RUN` in
+  its final stage or `docker exec`ed in a container. What that stage needs
+  is made under `/runtime` in the build stage and laid over the base in one
+  `COPY`, which keeps each entry's owner and mode; a `COPY --chown` of
+  `/data` alone loses its 0700. Wide writes still need a temporary
+  directory the `wok` user can write to (`/var/tmp`, which the base has).
