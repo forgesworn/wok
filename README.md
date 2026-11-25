@@ -31,9 +31,10 @@ The `wok-ws` crate, since 0.4.0, carries those frames over WebSockets.
   out unbound axum routers: a public one, which also serves the NIP-11 relay
   information document, and a sheltered one, which serves that document only
   if asked to and then says every read and write needs NIP-42. Each
-  connection's writes are
-  pipelined to the writer and answered in order, live events follow their
-  own `OK`, and a closing connection answers every frame it has read.
+  connection's writes are pipelined to the writer and answered as they
+  land, usually in the order sent, which is not promised. A connection's
+  own events come back live only after their `OK`, and a closing connection
+  answers every frame it has read.
 - **Admission.** The sheltered router is built only with an `Admission`,
   which decides from the request's extensions (an authenticated peer, a
   connecting address) whether a connection may open, and holds what it
