@@ -44,6 +44,28 @@
   extensions, deprecated interfaces, shared cache) and without memory
   statistics. With the profile above, `wokd` in the arm64 image is 5.13 MB
   where it was 8.47 MB.
+- `wok-ws`: a connection takes every `OK` that has landed as one batch and
+  puts them on the socket in one write. The writer answers a whole commit
+  at once, and each of its `OK`s used to be flushed on its own. Nothing
+  waits to make a batch, and the order of the `OK`s is as it was: usually
+  the order sent, never promised. With one connection pipelining 24,000
+  events on Linux, client and relay in one process made 25,555 `sendto`
+  calls where they made 48,032; 24,000 of each are the client's own frames,
+  so the relay's writes fell from about 24,000 to about 1,550.
+- The container image is built on a distroless base
+  (`gcr.io/distroless/cc-debian13`): glibc, libgcc and `wokd`, with no shell
+  and no package manager. Compressed, the arm64 image is 13.1 MB where it
+  was 33.4 MB. The `wok` user, its uid 10001 and `/data` with its mode are as
+  they were, and a volume written by the 0.7.0 image opens under this one.
+  Nothing can be `docker exec`ed in it: an operator's removal runs as its
+  own container, as `wokd`'s README shows. CI now also stores an event with
+  500 tags and a deletion of 40 events in the image, the writes that need a
+  temporary file, and runs a removal there.
+- `wokd` hands the allocator's free memory back to the kernel every 30
+  seconds on Linux with glibc. After two bursts of writes from 24
+  connections its heap stood at 6.5 to 6.6 MB, and at 4.1 to 4.3 MB once a
+  trim had run; the relay before these changes settled at 7.2 to 7.4 MB. A
+  trim takes 0.2 to 0.3 ms as a rule and runs off the worker threads.
 
 ## 0.7.0 - 2026-11-24
 

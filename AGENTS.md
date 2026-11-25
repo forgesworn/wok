@@ -86,3 +86,9 @@ crates/
   `INDEXED BY`. `stable_plans_are_the_plans_bound_values_chose` compares the
   plans of the query shapes and of every statement the connections keep
   prepared; run a new query shape through it.
+- The production image is distroless: no shell, so nothing can be `RUN` in
+  its final stage or `docker exec`ed in a container. What that stage needs
+  is made under `/runtime` in the build stage and laid over the base in one
+  `COPY`, which keeps each entry's owner and mode; a `COPY --chown` of
+  `/data` alone loses its 0700. Wide writes still need a temporary
+  directory the `wok` user can write to (`/var/tmp`, which the base has).

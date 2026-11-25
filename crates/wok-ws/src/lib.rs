@@ -884,6 +884,29 @@ impl InFlight {
         }
     }
 
+    /// The replies of every write that has already landed, without waiting
+    /// for one that has not, in the order this connection learns of them:
+    /// usually the order sent, which nothing here promises. No more than the
+    /// connection has in flight, so the batch is bounded by the cap.
+    fn landed(&mut self) -> Vec<String> {
+        let mut replies = Vec::new();
+        while let Some(Some(more)) = self.next().now_or_never() {
+            replies.extend(more);
+        }
+        replies
+    }
+
+    /// [`Self::next`], and with it every write that has landed by then. A
+    /// commit answers its whole batch at once, so a connection that pipelined
+    /// several events into it gets their `OK`s in one write to the socket
+    /// rather than one each. Nothing is held back to make a batch: the wait
+    /// is for the first reply only.
+    async fn next_batch(&mut self) -> Option<Vec<String>> {
+        let mut replies = self.next().await?;
+        replies.extend(self.landed());
+        Some(replies)
+    }
+
     /// Take back every write that no batch has yet, because this connection's
     /// authority has gone. Each is answered as cancelled, through the usual
     /// wait; one already in a batch commits, and the writer re-checks its
@@ -994,32 +1017,30 @@ async fn begin_write(
     Some((session, (enqueue_event(in_flight, handled), false)))
 }
 
-/// Wait for every write this connection has in flight, sending each `OK` as
-/// it lands.
+/// Wait for every write this connection has in flight, sending the `OK`s as
+/// they land: those that land together go out together.
 async fn settle(
     socket: &mut WebSocket,
     state: &SocketState,
     mut session: RelaySession,
     in_flight: &mut InFlight,
 ) -> Result<RelaySession, Closing> {
-    while let Some(replies) = in_flight.next().await {
+    while let Some(replies) = in_flight.next_batch().await {
         session = deliver(socket, state, session, replies).await?;
     }
     Ok(session)
 }
 
-/// Send the `OK` of every write that has already landed, without waiting for
-/// one that has not.
+/// Send the `OK` of every write that has already landed, in one batch,
+/// without waiting for one that has not.
 async fn drain_landed(
     socket: &mut WebSocket,
     state: &SocketState,
-    mut session: RelaySession,
+    session: RelaySession,
     in_flight: &mut InFlight,
 ) -> Result<RelaySession, Closing> {
-    while let Some(Some(replies)) = in_flight.next().now_or_never() {
-        session = deliver(socket, state, session, replies).await?;
-    }
-    Ok(session)
+    let replies = in_flight.landed();
+    deliver(socket, state, session, replies).await
 }
 
 /// Put replies on the wire. A sheltered connection's authority is checked
@@ -1244,7 +1265,7 @@ async fn close_connection(socket: &mut WebSocket, closing: Closing, in_flight: &
     let _ = timeout(CLOSE_GRACE, async {
         let deadline = tokio::time::Instant::now() + CLOSE_PENDING_WAIT;
         while !in_flight.is_empty() {
-            match tokio::time::timeout_at(deadline, in_flight.next()).await {
+            match tokio::time::timeout_at(deadline, in_flight.next_batch()).await {
                 Ok(Some(replies)) => {
                     if send(socket, replies).await.is_err() {
                         return;
@@ -1458,7 +1479,7 @@ async fn serve_connected(
                     Err(LiveRecvError::Closed)=>return NORMAL,
                 }
             },
-            landed = in_flight.next(), if in_flight.waiting() => {
+            landed = in_flight.next_batch(), if in_flight.waiting() => {
                 Some((session, (landed.unwrap_or_default(), false)))
             },
             _ = authority_changes.changed(), if state.visibility == Visibility::Sheltered => {
@@ -3403,6 +3424,64 @@ mod tests {
         assert!(PEAK_IN_FLIGHT.load(std::sync::atomic::Ordering::SeqCst) <= MAX_INFLIGHT_WRITES);
         routes.shutdown();
         task.abort();
+    }
+
+    /// The writer answers a whole batch at once. A connection takes every
+    /// `OK` that has landed as one batch, so they reach the socket in one
+    /// write, where each used to be taken and flushed on its own. Their
+    /// order is not promised, with or without the batch: a write the
+    /// connection had not yet polled comes out ahead of an older one.
+    #[tokio::test]
+    async fn oks_that_landed_together_are_taken_as_one_batch() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let store = held_store(&tmp, true);
+        let relay = Arc::new(EventRelay::new(
+            Arc::clone(&store) as Arc<dyn EventStore>,
+            Arc::new(Owner(key.public_key())),
+        ));
+        let _release_on_drop = ReleaseOnDrop(&store);
+        let mut session = keeper_session(&relay, &key);
+        let mut in_flight = InFlight::new();
+        let events: Vec<Event> = (0..12u64)
+            .map(|n| event(&key, 1, now() - 1_000 + n, &format!("batched {n}"), vec![]))
+            .collect();
+        for e in &events {
+            let write = pending_write(&mut session, e);
+            assert!(in_flight.start(write).await.is_empty());
+        }
+        // The store holds the first commit, so nothing has landed: there is
+        // no batch to take, and taking none leaves every write in flight.
+        entered(&store).await;
+        assert!(in_flight.landed().is_empty());
+        assert_eq!(in_flight.open.len(), events.len());
+
+        release(&store);
+        // Committed and answered, every one, before the connection looks.
+        relay.flush();
+        let batch = timeout(Duration::from_secs(5), in_flight.next_batch())
+            .await
+            .expect("the writes landed")
+            .expect("a batch");
+        let mut answered: Vec<(String, bool)> = batch
+            .iter()
+            .map(|reply| {
+                let frame: Value = serde_json::from_str(reply).unwrap();
+                assert_eq!(frame[0], "OK", "{frame}");
+                (
+                    frame[1].as_str().unwrap().to_owned(),
+                    frame[2].as_bool().unwrap(),
+                )
+            })
+            .collect();
+        answered.sort();
+        let mut sent: Vec<(String, bool)> = events.iter().map(|e| (e.id.to_hex(), true)).collect();
+        sent.sort();
+        assert_eq!(answered, sent, "one batch holds every OK, once each");
+        assert!(in_flight.is_empty());
+        assert_eq!(in_flight.weight, 0);
+        assert!(in_flight.landed().is_empty());
+        assert!(in_flight.next_batch().await.is_none(), "nothing in flight");
     }
 
     #[tokio::test]
