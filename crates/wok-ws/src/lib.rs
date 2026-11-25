@@ -3243,6 +3243,10 @@ mod tests {
         let stored = event(&key, 1, now(), "history", vec![]);
         send_frame(&mut publisher, json!(["EVENT", stored])).await;
         assert_eq!(receive(&mut publisher).await[2], true);
+        // The writer answers before it announces. Until the announcement,
+        // a REQ that attaches would queue the stored event live as well, and
+        // send it again after the EOSE.
+        door.relay.flush();
 
         let page = door.history_pages.acquire().await.unwrap();
         reader
