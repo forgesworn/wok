@@ -171,6 +171,46 @@ fn unexpected(label: &str, text: &str) -> String {
     format!("{label}: {what}: {shown}")
 }
 
+/// The subscription a subscriber holds: every note a cell writes matches it,
+/// and it asks for none of what is stored.
+const LIVE_SUBSCRIPTION: &str = "live";
+
+/// Open [`LIVE_SUBSCRIPTION`] and wait for its EOSE, after which every note
+/// written reaches this connection live.
+pub(crate) async fn subscribe(label: &str, socket: &mut Socket, kind: u16) -> Result<(), String> {
+    let request = json!(["REQ", LIVE_SUBSCRIPTION, {"kinds": [kind], "limit": 0}]).to_string();
+    socket
+        .send(Message::Text(request.into()))
+        .await
+        .map_err(|e| format!("{label}: send the REQ: {e}"))?;
+    // The frame as text: a `Value` would compare as a JSON string.
+    let eose = json!(["EOSE", LIVE_SUBSCRIPTION]).to_string();
+    let reply = next_text(label, socket, SETUP_WAIT).await?;
+    if reply != eose {
+        return Err(unexpected(label, &reply));
+    }
+    Ok(())
+}
+
+/// Read live EVENT frames until `expected` have come, then close. Any other
+/// frame fails the lane: a NOTICE is how a reader that fell behind is told.
+pub(crate) async fn read_live(
+    label: String,
+    mut socket: Socket,
+    expected: usize,
+) -> Result<(), String> {
+    let prefix = format!("[\"EVENT\",\"{LIVE_SUBSCRIPTION}\",");
+    for seen in 0..expected {
+        let text = next_text(&label, &mut socket, STALL)
+            .await
+            .map_err(|e| format!("{e}, after {seen} of {expected} live events"))?;
+        if !text.starts_with(&prefix) {
+            return Err(unexpected(&label, &text));
+        }
+    }
+    close_cleanly(&label, &mut socket).await
+}
+
 /// The client's end of a connection: send a Close frame and require the
 /// connection to end. A Close in reply, the stream ending or a reset all count
 /// as the end; a frame of text does not.

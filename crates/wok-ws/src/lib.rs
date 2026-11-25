@@ -32,8 +32,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 use url::Url;
 use wok_store::relay::{
-    EventRelay, Handled, LiveReceiver, LiveRecvError, MAX_RELAY_FRAME_BYTES, PendingWrite,
-    PreparedFrame, RelaySession, WriteCancel, WriteTicket, frame_may_subscribe,
+    EventRelay, Handled, LiveEvent, LiveReceiver, LiveRecvError, MAX_RELAY_FRAME_BYTES,
+    PendingWrite, PreparedFrame, RelaySession, WriteCancel, WriteTicket, frame_may_subscribe,
 };
 use wok_store::{MAX_EXPIRE_EVENTS, Visibility};
 
@@ -1043,6 +1043,49 @@ async fn drain_landed(
     deliver(socket, state, session, replies).await
 }
 
+/// The most live events one write to a subscriber carries. An event that
+/// matches none of the connection's subscriptions adds no bytes, so this is
+/// what ends a turn spent on a queue of them.
+const LIVE_BATCH_EVENTS: usize = 64;
+
+/// The frame bytes past which a live batch takes no further event: what the
+/// socket's write buffer holds before it is written out. A batch is then one
+/// write as a rule, holds at most this and one event's frames, and asks no
+/// more of a slow peer within one deadline than a page of history does.
+const LIVE_BATCH_BYTES: usize = WS_WRITE_BUFFER_BYTES;
+
+/// The frames of the live events one write carries. The writer announces a
+/// whole commit at once, so a subscriber's queue holds several events
+/// together; each used to be taken, matched and flushed on its own. Eight
+/// subscribers to 24,000 pipelined events took about 12,300 writes between
+/// them where they took 192,000 (Linux arm64, 25 November 2026).
+#[derive(Default)]
+struct LiveBatch {
+    events: usize,
+    bytes: usize,
+    replies: Vec<String>,
+}
+
+impl LiveBatch {
+    /// Add the frames one event made, which may be none.
+    fn push(&mut self, replies: Vec<String>) {
+        self.events += 1;
+        self.bytes += replies.iter().map(String::len).sum::<usize>();
+        self.replies.extend(replies);
+    }
+
+    /// The event queued next, if the batch has room for one and one is
+    /// queued. Nothing is taken that the batch will not carry. A queue that
+    /// has lagged or closed yields none either: the next `recv` says which,
+    /// once what was taken has been sent.
+    fn next(&self, live: &mut LiveReceiver) -> Option<LiveEvent> {
+        if self.events >= LIVE_BATCH_EVENTS || self.bytes >= LIVE_BATCH_BYTES {
+            return None;
+        }
+        live.try_recv().ok()
+    }
+}
+
 /// Put replies on the wire. A sheltered connection's authority is checked
 /// again first, after store work and before a private batch is sent; the
 /// verdict is cached per session and stamped with the authority generations,
@@ -1455,23 +1498,42 @@ async fn serve_connected(
                         live = None;
                         continue;
                     },
-                    // On this task, with no permit: a filter match and a splice,
-                    // unless a guest's verdict has to be refreshed first.
+                    // On this task, with no permit: a filter match and a splice
+                    // for each event, unless a guest's verdict has to be
+                    // refreshed first. The events queued behind this one go out
+                    // in the same write, in the order they were queued.
                     Ok(event)=>{
+                        let mut batch = LiveBatch::default();
+                        let mut next = Some(event);
+                        while let Some(event) = next.take() {
+                            let replies = match session.try_on_live(&event, now()) {
+                                Some(replies) => replies,
+                                None => {
+                                    let Some((refreshed, replies)) =
+                                        apply(session, state, move |s| s.on_live(&event, now())).await
+                                    else {
+                                        return BUSY;
+                                    };
+                                    session = refreshed;
+                                    replies
+                                }
+                            };
+                            batch.push(replies);
+                            next = live.as_mut().and_then(|live| batch.next(live));
+                        }
                         // The writer answers a batch before it announces it, so
-                        // an OK for this connection's own event has landed by now:
-                        // send it first, and the connection never sees its own
-                        // event live ahead of its OK.
+                        // the OK for any of this connection's own events taken
+                        // above had landed before the event was queued. The OKs
+                        // are taken only now, after the last event, and sent
+                        // first: the connection never sees its own event live
+                        // ahead of its OK.
                         if !in_flight.is_empty() {
                             session = match drain_landed(socket, state, session, in_flight).await {
                                 Ok(session) => session,
                                 Err(closing) => return closing,
                             };
                         }
-                        match session.try_on_live(&event, now()) {
-                            Some(replies) => Some((session, (replies, false))),
-                            None => apply(session, state, move |s| (s.on_live(&event, now()), false)).await,
-                        }
+                        Some((session, (batch.replies, false)))
                     },
                     Err(LiveRecvError::Lagged)=>{
                         return send(socket,vec!["[\"NOTICE\",\"rate-limited: reader fell behind; reconnect and query again\"]".into()]).await.err().unwrap_or(LAGGED);
@@ -4041,6 +4103,223 @@ mod tests {
                     .unwrap()
             };
             assert!(at("ok") < at("event"), "{id}: its OK comes first");
+        }
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// The same through a long burst, sent while its replies are read. The
+    /// writer commits it in many batches, and the connection takes its own
+    /// events live several at a time, with an `OK` or two landing while it
+    /// does. Each event's `OK` has still been sent by the time the event
+    /// comes back.
+    #[tokio::test]
+    async fn a_long_burst_of_its_own_events_never_comes_back_ahead_of_an_ok() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let store = held_store(&tmp, false);
+        let routes = relay_over(Arc::clone(&store) as Arc<dyn EventStore>, &key, 100_000);
+        let (public, task) = listen(&routes, Visibility::Public).await;
+        let mut socket = connect(&public, Some(&key)).await;
+        send_frame(
+            &mut socket,
+            json!(["REQ", "mine", {"kinds": [1], "limit": 0}]),
+        )
+        .await;
+        assert_eq!(receive(&mut socket).await, json!(["EOSE", "mine"]));
+        let total = OWN_BURST;
+        let frames: Vec<String> = (0..total as u64)
+            .map(|n| event(&key, 1, now() - 10_000 + n, &format!("own {n}"), vec![]))
+            .map(|e| json!(["EVENT", e]).to_string())
+            .collect();
+        let (mut sink, mut stream) = socket.split();
+        let sender = tokio::spawn(async move {
+            for frame in frames {
+                sink.send(ClientMessage::Text(frame.into())).await.unwrap();
+            }
+            sink
+        });
+        let mut answered = std::collections::HashSet::new();
+        let mut came_back = 0;
+        while answered.len() < total || came_back < total {
+            let message = timeout(Duration::from_secs(10), stream.next())
+                .await
+                .expect("a frame in time")
+                .expect("the socket is open")
+                .unwrap();
+            let ClientMessage::Text(text) = message else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            match frame[0].as_str().unwrap() {
+                "OK" => {
+                    assert_eq!(frame[2], true, "{frame}");
+                    assert!(answered.insert(frame[1].as_str().unwrap().to_owned()));
+                }
+                "EVENT" => {
+                    let id = frame[2]["id"].as_str().unwrap();
+                    assert!(answered.contains(id), "{id} came back ahead of its OK");
+                    came_back += 1;
+                }
+                other => panic!("unexpected {other}"),
+            }
+        }
+        drop(sender.await.unwrap());
+        routes.shutdown();
+        task.abort();
+    }
+
+    /// Events in the burst above: enough that taking the `OK`s before the
+    /// rest of a live batch, rather than after, was caught in every one of
+    /// 30 runs.
+    const OWN_BURST: usize = 2_000;
+
+    /// The events queued for one connection, and their JSON in the order
+    /// they were published.
+    fn queued(fanout: &Arc<wok_store::live::LiveFanout>, count: u64, text: &str) -> Vec<String> {
+        let key = Keys::generate();
+        (0..count)
+            .map(|n| {
+                let event = event(&key, 1, now() - 1_000 + n, &format!("{text} {n}"), vec![]);
+                let live = LiveEvent::try_new(Visibility::Public, Arc::new(event)).unwrap();
+                fanout.publish(&live);
+                live.json().to_owned()
+            })
+            .collect()
+    }
+
+    /// One batch as the connection takes it: the first event, then whatever
+    /// the batch has room for, each making `frame` bytes of frames.
+    fn take_batch(live: &mut LiveReceiver, frame: usize) -> Vec<String> {
+        let mut batch = LiveBatch::default();
+        let mut taken = Vec::new();
+        let mut next = live.try_recv().ok();
+        while let Some(event) = next.take() {
+            taken.push(event.json().to_owned());
+            batch.push(if frame == 0 {
+                vec![]
+            } else {
+                vec!["x".repeat(frame)]
+            });
+            next = batch.next(live);
+        }
+        taken
+    }
+
+    /// A live batch takes the events queued behind the first, in the order
+    /// they were queued, up to its bounds. It takes nothing it will not
+    /// carry: what is left is still queued, and leads the next batch.
+    #[tokio::test]
+    async fn a_live_batch_takes_what_is_queued_up_to_its_bounds() {
+        use wok_store::live::{LIVE_QUEUE_BYTES, LIVE_TOTAL_BYTES, LiveFanout};
+        let fanout = LiveFanout::new(LIVE_QUEUE_BYTES, LIVE_TOTAL_BYTES);
+        let mut live = fanout.attach(Some(Visibility::Public));
+        assert!(take_batch(&mut live, 100).is_empty(), "nothing is queued");
+
+        // A commit of a few events is one batch.
+        let few = queued(&fanout, 5, "few");
+        assert_eq!(take_batch(&mut live, 100), few);
+        assert!(live.try_recv().is_err(), "all of it was taken");
+
+        // Events that match no subscription make no frames, so their number
+        // is what ends the batch.
+        let many = queued(&fanout, LIVE_BATCH_EVENTS as u64 * 2 + 3, "many");
+        let (first, rest) = many.split_at(LIVE_BATCH_EVENTS);
+        assert_eq!(take_batch(&mut live, 0), first);
+        let (second, last) = rest.split_at(LIVE_BATCH_EVENTS);
+        assert_eq!(take_batch(&mut live, 0), second);
+        assert_eq!(take_batch(&mut live, 0), last);
+
+        // Frames that fill the write buffer end it sooner: two halves of it,
+        // and the third event waits for the next batch.
+        let wide = queued(&fanout, 5, "wide");
+        let half = LIVE_BATCH_BYTES / 2;
+        assert_eq!(take_batch(&mut live, half), wide[..2]);
+        assert_eq!(take_batch(&mut live, half), wide[2..4]);
+        // One frame past the bound is a batch of its own.
+        assert_eq!(take_batch(&mut live, LIVE_BATCH_BYTES + 1), wide[4..]);
+        assert_eq!(live.queued_bytes(), 0);
+    }
+
+    /// A queue that lags part way through a batch ends the batch there. The
+    /// lag is reported by the next `recv`, as it is with no batch.
+    #[tokio::test]
+    async fn a_live_batch_stops_at_a_lagging_queue() {
+        use wok_store::live::{LIVE_TOTAL_BYTES, LiveFanout};
+        let fanout = LiveFanout::new(4_000, LIVE_TOTAL_BYTES);
+        let mut live = fanout.attach(Some(Visibility::Public));
+        let held = queued(&fanout, 2, "held");
+        let first = live.try_recv().expect("the first event is queued");
+        assert_eq!(first.json(), held[0]);
+        // Past the queue's byte budget: the publisher drops the queue.
+        queued(&fanout, 40, "too much");
+        let mut batch = LiveBatch::default();
+        batch.push(vec![first.frame_for("sub")]);
+        assert!(batch.next(&mut live).is_none());
+        assert_eq!(batch.replies.len(), 1, "what was taken is still sent");
+        assert!(matches!(live.recv().await, Err(LiveRecvError::Lagged)));
+    }
+
+    /// A burst reaches a subscriber whole: every event once on each of its
+    /// subscriptions, in the order committed, however the burst falls into
+    /// batches. The burst is longer than one batch may be.
+    #[tokio::test]
+    async fn a_burst_reaches_a_subscriber_whole_and_in_order() {
+        let tmp = TempDir::new().unwrap();
+        let key = Keys::generate();
+        let store = held_store(&tmp, false);
+        let routes = relay_over(Arc::clone(&store) as Arc<dyn EventStore>, &key, 100_000);
+        let (public, task) = listen(&routes, Visibility::Public).await;
+        let mut reader = connect(&public, Some(&key)).await;
+        for id in ["notes", "everything"] {
+            let filter = if id == "notes" {
+                json!({"kinds": [1], "limit": 0})
+            } else {
+                json!({"limit": 0})
+            };
+            send_frame(&mut reader, json!(["REQ", id, filter])).await;
+            assert_eq!(receive(&mut reader).await, json!(["EOSE", id]));
+        }
+        let mut writer = connect(&public, Some(&key)).await;
+        let total = LIVE_BATCH_EVENTS * 5;
+        // Every third event is a reaction, which one subscription leaves out.
+        let events: Vec<Event> = (0..total as u64)
+            .map(|n| {
+                let kind = if n % 3 == 0 { 7 } else { 1 };
+                event(
+                    &key,
+                    kind,
+                    now() - 10_000 + n,
+                    &format!("burst {n}"),
+                    vec![],
+                )
+            })
+            .collect();
+        for e in &events {
+            send_frame(&mut writer, json!(["EVENT", e])).await;
+        }
+        let ids_of = |kinds: &[u16]| -> Vec<String> {
+            events
+                .iter()
+                .filter(|e| kinds.contains(&e.kind.as_u16()))
+                .map(|e| e.id.to_hex())
+                .collect()
+        };
+        let (notes, everything) = (ids_of(&[1]), ids_of(&[1, 7]));
+        let mut seen: HashMap<String, Vec<String>> = HashMap::new();
+        for _ in 0..notes.len() + everything.len() {
+            let frame = receive(&mut reader).await;
+            assert_eq!(frame[0], "EVENT", "{frame}");
+            seen.entry(frame[1].as_str().unwrap().to_owned())
+                .or_default()
+                .push(frame[2]["id"].as_str().unwrap().to_owned());
+        }
+        assert_eq!(seen["notes"], notes);
+        assert_eq!(seen["everything"], everything);
+        for _ in 0..total {
+            let reply = receive(&mut writer).await;
+            assert_eq!(reply[0], "OK");
+            assert_eq!(reply[2], true, "{reply}");
         }
         routes.shutdown();
         task.abort();
