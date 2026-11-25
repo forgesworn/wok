@@ -54,7 +54,7 @@ use crate::engine::{
     Clock, FRAME_LIMIT, Keepers, PRODUCTION_FRAME_LIMIT, runtime, tag, wall_seconds,
 };
 use crate::support::{SplitMix, partition_name};
-use client::{Frame, connect_all, exchange, write_lane};
+use client::{Frame, connect_all, exchange, read_live, subscribe, write_lane};
 use server::Server;
 
 /// Worker threads of the client runtime, fixed and recorded so that the load
@@ -195,9 +195,35 @@ fn socket_cell(
         visibility,
         variant,
         spec.events,
-        shared.widest,
+        shared.widest + shared.cfg.socket_subscribers,
     )
     .map_err(|e| format!("{label}: {e}"))?;
+    // Subscribed before any write, so each reads every event of the cell.
+    let subscribers = shared.cfg.socket_subscribers;
+    let reading = format!("{label}, subscriber");
+    let readers = shared.client.block_on(async {
+        let mut sockets = connect_all(
+            &reading,
+            &server.url,
+            shared.keys,
+            subscribers,
+            shared.cfg.socket_client_nodelay,
+        )
+        .await?;
+        for socket in &mut sockets {
+            subscribe(&reading, socket, KIND_NOTE).await?;
+        }
+        Ok::<_, String>(sockets)
+    })?;
+    let readers: Vec<_> = readers
+        .into_iter()
+        .enumerate()
+        .map(|(lane, socket)| {
+            shared
+                .client
+                .spawn(read_live(format!("{reading} {lane}"), socket, spec.events))
+        })
+        .collect();
     let sockets = shared.client.block_on(connect_all(
         &label,
         &server.url,
@@ -219,6 +245,13 @@ fn socket_cell(
         )));
     }
     let mut merged = drive(shared.client, tasks, &start).map_err(|e| format!("{label}: {e}"))?;
+    // Every subscriber has read every event before the door is shut.
+    for reader in readers {
+        shared
+            .client
+            .block_on(reader)
+            .map_err(|_| format!("{label}: a subscriber's task panicked"))??;
+    }
     server.relay.flush();
     let stats = server.relay.writer_stats();
     let commits = server.store.commits();
@@ -232,6 +265,8 @@ fn socket_cell(
     let mut out = cell_json(&mut merged, spec.events, spec.window);
     out["variant"] = json!(variant.label());
     out["connections"] = json!(spec.connections);
+    out["subscribers"] = json!(subscribers);
+    out["live_events_read"] = json!(subscribers * spec.events);
     out["writer"] = writer_json(stats, commits);
     out["checkpoints"] = checkpoints;
     Ok(out)
@@ -525,6 +560,8 @@ pub fn run(cfg: &Config) -> Result<Value, String> {
             "window": cfg.socket_window,
             "events": cfg.socket_events,
             "serial_events": cfg.socket_serial_events,
+            "subscribers": cfg.socket_subscribers,
+            "subscribers_note": "each holds one open REQ that every note matches and reads every event of a cell live; the cell's figures time the acknowledged writes, with that delivery going on beside them",
             "variants": cfg.socket_variants.iter().map(Variant::label).collect::<Vec<_>>(),
             "variant_syntax": "workers:blocking:shared/public:nodelay",
             "client_nodelay": cfg.socket_client_nodelay,
@@ -571,6 +608,7 @@ mod tests {
             socket_window: 4,
             socket_events: 24,
             socket_serial_events: 6,
+            socket_subscribers: 2,
             socket_variants: vec![
                 "2:8:2/1:off".parse().unwrap(),
                 "2:8:1/1:on".parse().unwrap(),
@@ -609,6 +647,10 @@ mod tests {
                         assert_eq!(run["events"], events);
                         assert_eq!(run["ok_latency"]["count"], events);
                         assert_eq!(run["writer"]["events"], events);
+                        // Both subscribers read every event live, or the
+                        // cell would have failed.
+                        assert_eq!(run["subscribers"], 2);
+                        assert_eq!(run["live_events_read"], 2 * events);
                         assert!(run["acknowledged_per_s"].as_f64().unwrap() > 0.0);
                     }
                     // Both variants share a worker count: one direct run.

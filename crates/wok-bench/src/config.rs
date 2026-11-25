@@ -94,6 +94,10 @@ SOCKET (--content-bytes and --seed apply; no corpus is built)
     --socket-serial-events N  events for the one strictly serial cell, one
                             connection with a window of 1; 0 skips it
                             (default 2000)
+    --socket-subscribers N  connections that hold an open REQ every note
+                            matches while a cell writes, and read each event
+                            live; a subscriber that lags or misses one fails
+                            the run. 0 attaches none (default 0)
     --socket-variants L     comma-separated server settings, each
                             WORKERS:BLOCKING:SHARED/PUBLIC:NODELAY, for example
                             2:8:2/1:off. WORKERS and BLOCKING size the server's
@@ -296,6 +300,7 @@ pub struct Config {
     pub socket_window: usize,
     pub socket_events: usize,
     pub socket_serial_events: usize,
+    pub socket_subscribers: usize,
     pub socket_variants: Vec<Variant>,
     pub socket_client_nodelay: bool,
     pub socket_rounds: usize,
@@ -347,6 +352,7 @@ impl Default for Config {
             socket_window: 32,
             socket_events: 20_000,
             socket_serial_events: 2000,
+            socket_subscribers: 0,
             socket_variants: vec![Variant {
                 workers: 2,
                 blocking: 8,
@@ -498,6 +504,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Option<Config>, S
             }
             "socket-events" => cfg.socket_events = at_least_one(name, number(name, &value)?)?,
             "socket-serial-events" => cfg.socket_serial_events = number(name, &value)?,
+            "socket-subscribers" => cfg.socket_subscribers = number(name, &value)?,
             "socket-variants" => cfg.socket_variants = variants(&value)?,
             "socket-client-nodelay" => {
                 cfg.socket_client_nodelay = switch(&format!("--{name}"), &value)?
@@ -599,6 +606,7 @@ mod tests {
         assert_eq!(cfg.socket_variants.len(), 1);
         assert_eq!(cfg.socket_variants[0].label(), "2:8:2/1:off");
         assert!(cfg.socket_client_nodelay);
+        assert_eq!(cfg.socket_subscribers, 0, "no subscriber unless asked for");
         assert_eq!(cfg.socket_rounds, 1);
         assert_eq!(cfg.ingest_threads, vec![1, 4]);
         assert_eq!(cfg.engine_connections, vec![1, 4, 16, 64]);
@@ -660,6 +668,7 @@ mod tests {
             "--socket-events",
             "1_000",
             "--socket-serial-events=0",
+            "--socket-subscribers=3",
             "--socket-variants",
             "2:8:2/1:off, 4:16:8/8:on",
             "--socket-client-nodelay",
@@ -682,6 +691,7 @@ mod tests {
         assert_eq!(labels, ["2:8:2/1:off", "4:16:8/8:on"]);
         assert!(cfg.socket_variants[1].nodelay);
         assert!(!cfg.socket_client_nodelay);
+        assert_eq!(cfg.socket_subscribers, 3);
         assert_eq!(cfg.socket_rounds, 3);
     }
 

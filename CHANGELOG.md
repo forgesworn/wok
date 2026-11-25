@@ -97,6 +97,10 @@
   400 events of the kind took 657 µs and take 25 µs; asked of an author
   with only those sixteen they took 23.5 µs and take 24.6 µs. A `COUNT` is
   answered as before.
+- `wok-bench`: `--socket-subscribers N` attaches connections that hold an
+  open `REQ` and read every event of a socket cell live. A subscriber that
+  lags or misses an event fails the run. The default is none, so earlier
+  figures still compare.
 
 ## 0.7.0 - 2026-11-24
 

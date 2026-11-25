@@ -345,6 +345,7 @@ pub fn header(cfg: &Config) -> Value {
     params["socket_window"] = json!(cfg.socket_window);
     params["socket_events"] = json!(cfg.socket_events);
     params["socket_serial_events"] = json!(cfg.socket_serial_events);
+    params["socket_subscribers"] = json!(cfg.socket_subscribers);
     params["socket_variants"] = json!(
         cfg.socket_variants
             .iter()
