@@ -67,6 +67,11 @@ crates/
 - The workspace's `[profile.release]` reaches the workspace's own programs
   only (`wokd`, `wok-roomd`, `wok-bench`). An application that links the
   libraries builds them under its own profile.
+- `wokd`'s manifest turns on secp256k1's `lowmemory` (small tables, slower
+  signature checks). Cargo unifies features across one build, so a build
+  that includes `wokd` (`--workspace`, `-p wokd -p wok-bench`) gives the
+  small tables to every package in it. Build `wok-bench` on its own when its
+  signature or ingest figures are to be compared.
 
 ## Common Pitfalls
 

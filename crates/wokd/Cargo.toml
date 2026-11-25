@@ -15,6 +15,14 @@ axum = { workspace = true }
 fs2 = { workspace = true }
 nostr = { workspace = true }
 rusqlite = { workspace = true }
+# Named only for its feature: the curve's precomputed tables at their small
+# size. `wokd` is 1.1 MB smaller for it and checks a signature more slowly;
+# its frame budget admits a few dozen events a second at most, so the check
+# is not where its time goes. Cargo unifies features across one build, so a
+# build that includes `wokd` gives every package in it the small tables.
+# The version has to be the one `nostr` resolves: a second copy of the crate
+# would take the feature and link nothing, which a test in `lib.rs` catches.
+secp256k1 = { version = "0.30", default-features = false, features = ["lowmemory"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

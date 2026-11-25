@@ -66,6 +66,16 @@
   connections its heap stood at 6.5 to 6.6 MB, and at 4.1 to 4.3 MB once a
   trim had run; the relay before these changes settled at 7.2 to 7.4 MB. A
   trim takes 0.2 to 0.3 ms as a rule and runs off the worker threads.
+- `wokd` links secp256k1's small precomputed tables (`lowmemory`): 1.1 MB
+  less binary (with the trim above, 4.08 MB in the arm64 image where it was
+  5.13 MB) and about 1 MB less resident memory once a signature has been
+  checked. A signature check takes 23.9 µs where it took 19.7 (Linux arm64,
+  parse included); the relay's frame budget admits 64 events a second over
+  time, so that is a quarter of a millisecond in each second at worst.
+  Cargo unifies features across one build, so a build that includes `wokd`
+  gives the small tables to every package in it; `wok-bench` and `wok-roomd`
+  built on their own keep the full ones, and the benchmark image now builds
+  the two separately.
 
 ## 0.7.0 - 2026-11-24
 
