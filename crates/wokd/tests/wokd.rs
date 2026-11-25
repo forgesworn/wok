@@ -1199,6 +1199,32 @@ fn room_grant(
     status: &str,
     expiration: u64,
 ) -> Event {
+    room_grant_named(
+        "ab12cd34ef56ab12cd34ef56ab12cd34",
+        keeper,
+        server,
+        room,
+        guest,
+        device,
+        created_at,
+        status,
+        expiration,
+    )
+}
+
+/// [`room_grant`] under a grant id of the caller's, for a second grant.
+#[allow(clippy::too_many_arguments)]
+fn room_grant_named(
+    grant: &str,
+    keeper: &Keys,
+    server: &str,
+    room: &str,
+    guest: &Keys,
+    device: &Keys,
+    created_at: u64,
+    status: &str,
+    expiration: u64,
+) -> Event {
     EventBuilder::new(Kind::from(24242), "")
         .tags([
             Tag::parse(["t", "event-grant"]).unwrap(),
@@ -1206,7 +1232,7 @@ fn room_grant(
             Tag::parse(["d", room]).unwrap(),
             Tag::parse(["p", &guest.public_key().to_hex()]).unwrap(),
             Tag::parse(["device", &device.public_key().to_hex()]).unwrap(),
-            Tag::parse(["grant", "ab12cd34ef56ab12cd34ef56ab12cd34"]).unwrap(),
+            Tag::parse(["grant", grant]).unwrap(),
             Tag::parse(["read", "1460"]).unwrap(),
             Tag::parse(["read", "1462"]).unwrap(),
             Tag::parse(["read", "20461"]).unwrap(),
@@ -1298,6 +1324,93 @@ async fn a_keeper_grants_one_room_to_a_guest_and_revokes_it_across_restarts() {
         refused[2], false,
         "the revoked grant stays revoked: {refused}"
     );
+    server.stop().await;
+}
+
+/// A guest's right to read is checked against the grants again whenever
+/// they change. Here they change while a burst is on its way to a guest:
+/// another guest is granted another room in the middle of it. The guest's
+/// verdict has to be refreshed, on the blocking pool, before its next event
+/// goes out, and it still gets every event of its own room, once each and
+/// in the order committed. In eight runs that logged it, the refresh came
+/// once a run, at the first event of a batch of live events.
+#[tokio::test]
+async fn a_guest_reads_a_burst_live_while_the_grants_change() {
+    // Under the door's frame budget for one connection, with the keeper's
+    // AUTH and two grants beside it.
+    const BURST: usize = 100;
+    let tmp = TempDir::new().unwrap();
+    let keeper = Keys::generate();
+    let (guest, device) = (Keys::generate(), Keys::generate());
+    let (other, other_device) = (Keys::generate(), Keys::generate());
+    let (room, other_room) = ("11".repeat(32), "22".repeat(32));
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let server = start(tmp.path(), &[&keeper]).await;
+    let mut keeper_socket = member(&server.url, &keeper).await;
+    let granted = room_grant(
+        &keeper,
+        &server.url,
+        &room,
+        &guest,
+        &device,
+        now,
+        "active",
+        now + 3600,
+    );
+    assert_eq!(publish(&mut keeper_socket, &granted).await[2], true);
+
+    let mut guest_socket = member(&server.url, &guest).await;
+    send(
+        &mut guest_socket,
+        json!(["REQ", "room", {"kinds": [1460], "#d": [room], "limit": 0}]),
+    )
+    .await;
+    assert_eq!(receive(&mut guest_socket).await, json!(["EOSE", "room"]));
+
+    let notes: Vec<Event> = (0..BURST)
+        .map(|n| room_note(&keeper, &room, &format!("burst {n}")))
+        .collect();
+    let change = room_grant_named(
+        "cd34ef56ab12cd34ef56ab12cd34ef56",
+        &keeper,
+        &server.url,
+        &other_room,
+        &other,
+        &other_device,
+        now,
+        "active",
+        now + 3600,
+    );
+    // All of it sent before any reply is read, the grant in the middle.
+    for (n, note) in notes.iter().enumerate() {
+        if n == BURST / 2 {
+            send(&mut keeper_socket, json!(["EVENT", change])).await;
+        }
+        send(&mut keeper_socket, json!(["EVENT", note])).await;
+    }
+
+    let mut seen = Vec::with_capacity(BURST);
+    while seen.len() < BURST {
+        let frame = receive(&mut guest_socket).await;
+        assert_eq!(frame[0], "EVENT", "{frame}");
+        assert_eq!(frame[1], "room");
+        seen.push(frame[2]["id"].as_str().unwrap().to_owned());
+    }
+    let sent: Vec<String> = notes.iter().map(|note| note.id.to_hex()).collect();
+    assert_eq!(seen, sent);
+    assert_eq!(
+        next_within(&mut guest_socket, Duration::from_millis(200)).await,
+        None,
+        "nothing else: no second copy, and no word of the other grant"
+    );
+    for _ in 0..=BURST {
+        let answer = receive(&mut keeper_socket).await;
+        assert_eq!(answer[0], "OK", "{answer}");
+        assert_eq!(answer[2], true, "{answer}");
+    }
     server.stop().await;
 }
 
