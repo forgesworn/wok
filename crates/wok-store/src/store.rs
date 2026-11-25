@@ -53,6 +53,46 @@ const STATEMENT_CACHE: usize = 64;
 /// Up to this many values of the driving tag are merged branch by branch,
 /// each walking the tag index newest-first; more fall back to one sorted scan.
 const MAX_MERGED_VALUES: usize = 32;
+/// The most rows of the tag index the driving tag's values may hold between
+/// them for a filter that names `authors` to be driven from that index all
+/// the same. A tag with more values than this is not counted. See
+/// [`build_query`] and [`SqliteEventStore::drive`].
+///
+/// The count is one statement: 1.1 to 1.5 µs for one value, 2.9 µs for four
+/// and 5.9 µs for sixteen. A filter whose tag is common pays that and no
+/// more. At this bound the count and the tag index answer one value in
+/// 4.8 µs, which is what the author's events take when the author has this
+/// many of the kind; with fewer rows the tag index takes less (2.7 µs for
+/// one), and with more events the author's index takes 0.2 µs for each,
+/// without bound: 55 µs for 256 of them. An author with a single event of
+/// the kind is the case that loses: 1.7 µs before, and up to the 4.8 µs
+/// (release build, arm64 macOS, 25 November 2026).
+const RARE_TAG_ROWS: usize = 16;
+/// A rare tag with more values than this is read in one scan and its rows
+/// sorted; with this many or fewer each value is a branch of a merge, as for
+/// a tag with no author named. The two forms take the same 8.6 µs for six
+/// values. For two the merge takes 3.1 µs and the scan 5.1; for sixteen the
+/// merge takes 27 µs and the scan 18. Sixteen `d` values asked of an author
+/// with 400 events of the kind took 657 µs from the author's events and
+/// take 25 µs, the count included; asked of an author with only those
+/// sixteen they took 23.5 µs and take 24.6 (as above).
+const RARE_MERGED_VALUES: usize = 6;
+/// The rows 1 to [`RARE_TAG_ROWS`] values of one tag hold between them in
+/// the tag index, counted no further than the last parameter: one statement
+/// for each number of values, so that a filter with several costs one count
+/// rather than one for each.
+static RARE_TAG_SQL: std::sync::LazyLock<Vec<String>> = std::sync::LazyLock::new(|| {
+    (1..=RARE_TAG_ROWS)
+        .map(|values| {
+            let marks: Vec<String> = (3..values + 3).map(|n| format!("?{n}")).collect();
+            format!(
+                "SELECT count(*) FROM (SELECT 1 FROM tags INDEXED BY tags_by_time WHERE visibility=?1 AND name=?2 AND value IN ({}) LIMIT ?{})",
+                marks.join(","),
+                values + 3
+            )
+        })
+        .collect()
+});
 /// Filter shapes whose built SQL is kept; the cache starts again when full.
 const SQL_CACHE_SHAPES: usize = 256;
 /// Bytes of built SQL the cache may hold; it starts again when a new entry
@@ -4563,12 +4603,37 @@ impl QueryColumns {
     }
 }
 
+/// Which table a history query walks. See the driver rule on [`build_query`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drive {
+    /// The events, in time order, each tag probed: the shape every filter
+    /// can take, which the tests use as an oracle.
+    Events,
+    /// The driver rule: the tag index unless the filter names `ids` or
+    /// `authors`.
+    Rule,
+    /// The driver rule, and the driving tag's values were counted and are
+    /// rare ([`SqliteEventStore::drive`]): the tag index, `authors` or not.
+    RareTag,
+}
+
+/// The tag a tag-driven statement walks, by its place among the filter's
+/// tags: the one with the fewest values, and the first of those on a tie.
+/// `lens` is each tag's value count, in the filter's order.
+fn driving_tag(lens: impl Iterator<Item = usize>) -> usize {
+    lens.enumerate()
+        .min_by_key(|(_, len)| *len)
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
 /// The shape of a filter: everything the SQL text [`build_query`] makes for
 /// it depends on, and none of what it binds. Which fields are present, how
-/// many values each holds, and the value count of each tag in order (which
-/// also picks the driving tag and the merge form). `None` for a filter
-/// `build_query` returns nothing for or refuses, which is never cached.
-fn query_shape(filter: &Filter, tag_driven: bool, columns: QueryColumns) -> Option<Vec<u32>> {
+/// many values each holds, the value count of each tag in order (which also
+/// picks the driving tag and the merge form), and which table drives. `None`
+/// for a filter `build_query` returns nothing for or refuses, which is never
+/// cached.
+fn query_shape(filter: &Filter, drive: Drive, columns: QueryColumns) -> Option<Vec<u32>> {
     if filter
         .since
         .is_some_and(|since| since.as_secs() > i64::MAX as u64)
@@ -4588,7 +4653,7 @@ fn query_shape(filter: &Filter, tag_driven: bool, columns: QueryColumns) -> Opti
         + usize::from(filter.until.is_some());
     let count = |n: Option<usize>| n.map_or(u32::MAX, |n| u32::try_from(n).unwrap_or(u32::MAX - 1));
     let mut shape = vec![
-        u32::from(tag_driven),
+        drive as u32,
         u32::from(columns == QueryColumns::Keys),
         count(ids),
         count(authors),
@@ -4634,6 +4699,49 @@ fn query_values(visibility: Visibility, filter: &Filter, now: u64, limit: usize)
 }
 
 impl SqliteEventStore {
+    /// Which table drives `filter`'s history query. A filter that names
+    /// `authors` and a tag is the one case the filter cannot settle: its
+    /// driving tag's values are counted here, in the tag index, in one
+    /// statement and no further than [`RARE_TAG_ROWS`] between them. At that or fewer the tag index
+    /// drives, which reads at most those rows; past it the author's events
+    /// do, as the driver rule has it. Both shapes select the same events, so
+    /// the count only chooses what the answer costs, and a row committed
+    /// between the count and the query cannot change the answer.
+    ///
+    /// It borrows a reader for itself, so call it outside
+    /// [`Self::with_reader`]: with no reader pool that is the writer's lock.
+    fn drive(&self, visibility: Visibility, filter: &Filter) -> Result<Drive, EventStoreError> {
+        let named = filter.authors.as_ref().is_some_and(|a| !a.is_empty());
+        if !named || filter.ids.is_some() || filter.generic_tags.is_empty() {
+            return Ok(Drive::Rule);
+        }
+        let driver = driving_tag(filter.generic_tags.values().map(|values| values.len()));
+        let Some((name, values)) = filter.generic_tags.iter().nth(driver) else {
+            return Ok(Drive::Rule);
+        };
+        // No value matches nothing, and more values than rows allowed are
+        // not each counted to learn that most of them are unused.
+        if values.is_empty() || values.len() > RARE_TAG_ROWS {
+            return Ok(Drive::Rule);
+        }
+        let (partition, name) = (visibility.key(), name.to_string());
+        let past = RARE_TAG_ROWS as i64 + 1;
+        let mut bound: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(values.len() + 3);
+        bound.push(&partition);
+        bound.push(&name);
+        bound.extend(values.iter().map(|value| value as &dyn rusqlite::ToSql));
+        bound.push(&past);
+        let rows: i64 = self.with_reader(|conn| {
+            let mut count = conn.prepare_cached(&RARE_TAG_SQL[values.len() - 1])?;
+            Ok(count.query_row(bound.as_slice(), |r| r.get(0))?)
+        })?;
+        Ok(if rows < past {
+            Drive::RareTag
+        } else {
+            Drive::Rule
+        })
+    }
+
     /// The SQL and bound values for one history query, or `None` when it
     /// returns nothing. SQL already built for the filter's shape is reused,
     /// so a repeated page formats no SQL; only its values are collected.
@@ -4654,8 +4762,9 @@ impl SqliteEventStore {
         if limit == 0 {
             return Ok(None);
         }
-        let Some(shape) = query_shape(filter, true, columns) else {
-            return Ok(build_query(visibility, filter, now, limit, true, columns)?
+        let drive = self.drive(visibility, filter)?;
+        let Some(shape) = query_shape(filter, drive, columns) else {
+            return Ok(build_query(visibility, filter, now, limit, drive, columns)?
                 .map(|(sql, values)| (sql.into(), values)));
         };
         let cached = self
@@ -4666,7 +4775,7 @@ impl SqliteEventStore {
         if let Some(sql) = cached {
             return Ok(Some((sql, query_values(visibility, filter, now, limit))));
         }
-        let Some((sql, values)) = build_query(visibility, filter, now, limit, true, columns)?
+        let Some((sql, values)) = build_query(visibility, filter, now, limit, drive, columns)?
         else {
             return Ok(None);
         };
@@ -4721,14 +4830,23 @@ fn membership(sql: &mut String, binds: &mut Binds, field: &str, items: Vec<Value
 /// A filter with 2 to [`MAX_MERGED_VALUES`] (author, kind) pairs and no
 /// `ids` seeks each pair in `events_author_kind` and merges them.
 ///
-/// Driver rule: `authors` wins. Its index (`events_author_kind`) is the only
-/// one that bounds the walk by something the filter names, and a tag value
-/// that is common (`#t`, `#p`) would otherwise be walked row by row until
-/// `limit` hits turn up among an author's older events. So a filter with
-/// `authors` stays event-driven and probes its tags with `EXISTS`. Room
-/// queries (`kinds` + `#d`) have no authors, and a `d` value is selective,
-/// so they stay tag-driven. `tag_driven = false` forces the event-driven
-/// shape, which the tests use as an oracle.
+/// Driver rule ([`Drive::Rule`]): `authors` wins. Its index
+/// (`events_author_kind`) is the only one that bounds the walk by something
+/// the filter names, and a tag value that is common (`#t`, `#p`) would
+/// otherwise be walked row by row until `limit` hits turn up among an
+/// author's older events. So a filter with `authors` stays event-driven and
+/// probes its tags with `EXISTS`. Room queries (`kinds` + `#d`) have no
+/// authors, and a `d` value is selective, so they stay tag-driven.
+///
+/// The rule cannot see how common a value is, and it is wrong for a rare
+/// one: an addressable event asked for by its author, kind and `d` tag was
+/// found by probing every event of that kind the author has. So for a filter
+/// that names `authors` and a tag, [`SqliteEventStore::drive`] counts the
+/// driving tag's rows first, and when they are few [`Drive::RareTag`] drives
+/// it from the tag index as if it named no author; the author and kind are
+/// then checked on each event the tag rows lead to. [`Drive::Events`] forces
+/// the event-driven shape, which the tests use as an oracle. A count
+/// ([`build_count`]) follows the rule alone.
 ///
 /// The tag-driven merges carry `(created_at, id)` only; the JSON of the
 /// at most `limit` survivors is read once, after the merge, so no temporary
@@ -4738,7 +4856,7 @@ fn build_query(
     filter: &Filter,
     now: u64,
     limit: usize,
-    tag_driven: bool,
+    drive: Drive,
     columns: QueryColumns,
 ) -> Result<Option<(String, Vec<Value>)>, EventStoreError> {
     let mut binds = Binds(Vec::new());
@@ -4807,7 +4925,13 @@ fn build_query(
     }
     let limit = binds.add(Value::Integer(limit as i64));
     const EVENT_KEYS: &str = "e.created_at AS c,e.id AS i,e.seq AS s";
-    if !(tag_driven && filter.ids.is_none() && filter.authors.is_none() && !tags.is_empty()) {
+    let from_tags = match drive {
+        Drive::Events => false,
+        Drive::Rule => filter.authors.is_none(),
+        Drive::RareTag => true,
+    } && filter.ids.is_none()
+        && !tags.is_empty();
+    if !from_tags {
         // Event-driven: walk events in time order and probe each tag.
         for (name, values) in &tags {
             let probe = if values.is_empty() {
@@ -4828,7 +4952,10 @@ fn build_query(
         // first, and the pairs are merged by key as the tag values are. An
         // event has one author and one kind, so no event is in two pairs.
         let pairs = author_marks.len() * kind_marks.len();
-        if tag_driven && filter.ids.is_none() && (2..=MAX_MERGED_VALUES).contains(&pairs) {
+        if drive != Drive::Events
+            && filter.ids.is_none()
+            && (2..=MAX_MERGED_VALUES).contains(&pairs)
+        {
             let branches: Vec<String> = author_marks
                 .iter()
                 .flat_map(|author| kind_marks.iter().map(move |kind| (author, kind)))
@@ -4867,12 +4994,7 @@ fn build_query(
     if tags.iter().any(|(_, values)| values.is_empty()) {
         return Ok(None);
     }
-    let driver = tags
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, (_, values))| values.len())
-        .map(|(index, _)| index)
-        .unwrap_or(0);
+    let driver = driving_tag(tags.iter().map(|(_, values)| values.len()));
     for (index, (name, values)) in tags.iter().enumerate() {
         if index != driver {
             conds.push_str(&format!(
@@ -4902,7 +5024,9 @@ fn build_query(
         // is read for each hit directly; nothing is sorted or merged.
         let one = format!("t.value={}", values[0]);
         format!("{} {newest}", branch("SELECT", columns.select(KEYS), &one))
-    } else if values.len() <= MAX_MERGED_VALUES {
+    } else if values.len() <= MAX_MERGED_VALUES
+        && (drive != Drive::RareTag || values.len() <= RARE_MERGED_VALUES)
+    {
         // Each value's newest rows, merged; UNION drops an event that carries
         // several of the values, as the event-driven shape returns it once:
         // its `(created_at, id, seq)` is the same in every branch.
@@ -4921,8 +5045,9 @@ fn build_query(
             branches.join(" UNION ")
         ))
     } else {
-        // Too many branches: one scan of every matching row, sorted. The
-        // sorted rows are keys only.
+        // Too many branches, or more than `RARE_MERGED_VALUES` values that
+        // were counted and hold few rows between them: one scan of every
+        // matching row, sorted. The sorted rows are keys only.
         let any = format!("t.value IN ({})", values.join(","));
         columns.merged(format!(
             "SELECT c,i,s FROM ({}) ORDER BY c DESC,i ASC LIMIT {limit}",
@@ -5043,12 +5168,7 @@ fn count_branch(binds: &mut Binds, vis: &str, at: &str, filter: &Filter) -> Opti
             "SELECT e.seq AS i FROM events e{by_id} WHERE e.visibility={vis}{conds}"
         ));
     }
-    let driver = tags
-        .iter()
-        .enumerate()
-        .min_by_key(|(_, (_, values))| values.len())
-        .map(|(index, _)| index)
-        .unwrap_or(0);
+    let driver = driving_tag(tags.iter().map(|(_, values)| values.len()));
     for (index, tag) in tags.iter().enumerate() {
         if index != driver {
             conds.push_str(&probe("t2", tag));
@@ -6761,7 +6881,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
                 &filter,
                 NOW,
                 limit,
-                true,
+                Drive::Rule,
                 QueryColumns::Body,
             )
             .unwrap()
@@ -6810,11 +6930,19 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             }
             seeded.push(e);
         }
+        // One value with more rows than a rare tag may hold.
+        for i in 0..=RARE_TAG_ROWS as u64 {
+            let e = event(&ka, 1, NOW - 80 + i, "common", &[tag("t", "common")]);
+            for scope in [Visibility::Public, Visibility::Sheltered] {
+                db.put(scope, &e, NOW).unwrap();
+            }
+        }
         let id = seeded[2].id.to_hex();
         let many: Vec<String> = (0..MAX_MERGED_VALUES + 3)
             .map(|i| format!("v{i}"))
             .collect();
         let too_many: Vec<String> = (0..MAX_QUERY_VALUES).map(|i| format!("w{i}")).collect();
+        let mut drives = std::collections::BTreeSet::new();
         let filters = [
             serde_json::json!({}),
             serde_json::json!({"limit": 5}),
@@ -6828,6 +6956,13 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             serde_json::json!({"#t": ["a", "b"], "#d": ["r"], "since": NOW - 100}),
             serde_json::json!({"#d": ["r"], "#t": ["a", "b"]}),
             serde_json::json!({"authors": [a], "#d": ["r"]}),
+            // The same shape with another value: one rare, one common, so
+            // the shape alone must not pick the SQL.
+            serde_json::json!({"authors": [a], "#t": ["v7"]}),
+            serde_json::json!({"authors": [a], "#t": ["common"]}),
+            serde_json::json!({"authors": [a, b], "kinds": [1, 1460], "#d": ["r", "r1"], "limit": 2}),
+            serde_json::json!({"authors": [b], "#d": ["r"], "#t": ["common", "b"], "until": NOW}),
+            serde_json::json!({"authors": [a, b], "#t": (0..=RARE_MERGED_VALUES).map(|i| format!("v{i}")).collect::<Vec<_>>()}),
             serde_json::json!({"since": NOW - 10, "until": NOW}),
             serde_json::json!({"#d": []}),
             serde_json::json!({"#t": too_many}),
@@ -6841,7 +6976,10 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
                     .limit
                     .unwrap_or(MAX_QUERY_EVENTS)
                     .min(MAX_QUERY_EVENTS);
-                let want = build_query(scope, &filter, NOW, limit, true, QueryColumns::Body);
+                // The table the store's own count chooses for it.
+                let drive = db.drive(scope, &filter).unwrap();
+                drives.insert(format!("{drive:?}"));
+                let want = build_query(scope, &filter, NOW, limit, drive, QueryColumns::Body);
                 for pass in 0..2 {
                     let got = db
                         .query_sql(scope, &filter, NOW, QueryColumns::Body)
@@ -6872,6 +7010,11 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
                 }
             }
         }
+        assert_eq!(
+            drives.into_iter().collect::<Vec<_>>(),
+            ["RareTag", "Rule"],
+            "both routes were cached and compared"
+        );
         // Bounded: many distinct shapes never hold more than the cap.
         for n in 1..=(SQL_CACHE_SHAPES + 40) {
             let values: Vec<String> = (0..n % 40 + 1).map(|i| format!("x{i}")).collect();
@@ -6920,7 +7063,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         if limit == 0 {
             return vec![];
         }
-        match build_query(scope, filter, now, limit, false, QueryColumns::Body).unwrap() {
+        match build_query(scope, filter, now, limit, Drive::Events, QueryColumns::Body).unwrap() {
             None => vec![],
             Some((sql, values)) => db
                 .run_query(&sql, values, StoredEvent::from_stored)
@@ -7088,9 +7231,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             "limit": 10
         }))
         .unwrap();
-        let (sql, _) = build_query(Visibility::Public, &many, NOW, 10, true, QueryColumns::Body)
-            .unwrap()
-            .unwrap();
+        let (sql, _) = build_query(
+            Visibility::Public,
+            &many,
+            NOW,
+            10,
+            Drive::Rule,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.contains("SELECT DISTINCT"));
         let got = ids(&db, Visibility::Public, many.clone(), NOW);
         assert_eq!(got.len(), 10);
@@ -7104,6 +7254,330 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             db.query(Visibility::Public, &too_many, NOW),
             Err(EventStoreError::Query)
         ));
+    }
+
+    /// A filter that names `authors` and a tag is driven from the tag index
+    /// when its driving tag's values are rare, and from the author's events
+    /// when they are not. Either way it selects what the event-driven shape
+    /// selects, and what NIP-01 says.
+    #[test]
+    fn a_rare_tag_drives_a_query_that_names_authors() {
+        use serde_json::json;
+        let tmp = TempDir::new().unwrap();
+        let db = store(&tmp);
+        let keys = [Keys::generate(), Keys::generate(), Keys::generate()];
+        let hex = |i: usize| keys[i].public_key().to_hex();
+        let rare = RARE_TAG_ROWS as u64;
+        // The first author's share of a value every author carries in turn.
+        let share = |rows: u64| rows.div_ceil(3) as usize;
+        let (edge, past) = (share(rare), share(rare + 1));
+        let target = event(&keys[2], 1, NOW - 900, "target", &[]);
+        let replied = target.id.to_hex();
+        let mut corpus: Vec<(Visibility, Event)> = Vec::new();
+        for scope in [Visibility::Public, Visibility::Sheltered] {
+            let mut add = |e: Event| corpus.push((scope, e));
+            add(target.clone());
+            // Forty articles by one author, a `d` value each: asked for one
+            // of them, the event-driven shape probes all forty.
+            for i in 0..40u64 {
+                let mut tags = vec![tag("d", format!("page-{i}")), tag("t", "common")];
+                if i == 3 {
+                    tags.push(tag("d", "second"));
+                }
+                if i == 5 {
+                    tags.push(tag("expiration", NOW + 1));
+                }
+                add(event(&keys[0], 30023, NOW - 800 + i, "page", &tags));
+            }
+            // An addressable event with no `d` tag, and one whose `d` is the
+            // empty string: both stand at the coordinate "".
+            add(event(&keys[0], 30024, NOW - 700, "no d", &[]));
+            add(event(
+                &keys[1],
+                30024,
+                NOW - 699,
+                "empty d",
+                &[tag("d", "")],
+            ));
+            for i in 0..3u64 {
+                let tags = [tag("e", &replied), tag("p", hex(2))];
+                add(event(
+                    &keys[(i % 2) as usize],
+                    1,
+                    NOW - 600 + i,
+                    "reply",
+                    &tags,
+                ));
+            }
+            // A value with exactly as many rows as a rare tag may hold, one
+            // with a row more, and one with a single row.
+            for i in 0..rare {
+                let author = &keys[(i % 3) as usize];
+                add(event(author, 1, NOW - 500 + i, "edge", &[tag("t", "edge")]));
+            }
+            for i in 0..=rare {
+                let author = &keys[(i % 3) as usize];
+                add(event(author, 1, NOW - 400 + i, "past", &[tag("t", "past")]));
+            }
+            add(event(&keys[0], 1, NOW - 300, "solo", &[tag("t", "solo")]));
+            // Common in the public partition, rare in the sheltered one.
+            let split = if scope == Visibility::Public {
+                rare + 1
+            } else {
+                2
+            };
+            for i in 0..split {
+                add(event(
+                    &keys[0],
+                    1,
+                    NOW - 200 + i,
+                    "split",
+                    &[tag("t", "split")],
+                ));
+            }
+        }
+        for (scope, event) in &corpus {
+            assert!(matches!(db.put(*scope, event, NOW), Ok(PutOutcome::Stored)));
+        }
+        let unused: Vec<String> = (0..=rare).map(|n| format!("unused-{n}")).collect();
+        // More values than are merged branch by branch, read in one scan.
+        let pages: Vec<String> = (1..=RARE_MERGED_VALUES as u64 + 2)
+            .map(|n| format!("page-{n}"))
+            .chain(["second".to_owned()])
+            .collect();
+        // `page-3` and `second` are one event's two `d` tags.
+        let paged = pages.len() - 1;
+        let both = [Drive::RareTag, Drive::RareTag];
+        let neither = [Drive::Rule, Drive::Rule];
+        // The filter, the table that drives it in each partition, and how
+        // many events it finds in each before any has expired.
+        let cases = [
+            (
+                json!({"authors": [hex(0)], "kinds": [30023], "#d": ["page-7"]}),
+                both,
+                [1, 1],
+            ),
+            // Matched on its second `d` tag, which is not its coordinate.
+            (
+                json!({"authors": [hex(0)], "kinds": [30023], "#d": ["second"]}),
+                both,
+                [1, 1],
+            ),
+            // No `d` tag is not the empty `d` tag.
+            (
+                json!({"authors": [hex(0)], "kinds": [30024], "#d": [""]}),
+                both,
+                [0, 0],
+            ),
+            (
+                json!({"authors": [hex(1)], "kinds": [30024], "#d": [""]}),
+                both,
+                [1, 1],
+            ),
+            (
+                json!({"authors": [hex(0), hex(1)], "kinds": [1, 30023], "#d": ["page-1", "page-2", "second"], "limit": 2}),
+                both,
+                [2, 2],
+            ),
+            (json!({"authors": [hex(0)], "#d": ["page-5"]}), both, [1, 1]),
+            (json!({"authors": [hex(0)], "#e": [replied]}), both, [2, 2]),
+            (
+                json!({"authors": [hex(1)], "#p": [hex(2)], "since": NOW - 600, "until": NOW - 599}),
+                both,
+                [1, 1],
+            ),
+            (json!({"authors": [hex(2)], "#d": ["page-7"]}), both, [0, 0]),
+            (
+                json!({"authors": [hex(0)], "#d": ["nowhere"]}),
+                both,
+                [0, 0],
+            ),
+            (
+                json!({"authors": [hex(0)], "#t": ["common"], "limit": 5}),
+                neither,
+                [5, 5],
+            ),
+            // At the bound, and a row past it.
+            (
+                json!({"authors": [hex(0)], "#t": ["edge"]}),
+                both,
+                [edge, edge],
+            ),
+            (
+                json!({"authors": [hex(0)], "#t": ["past"]}),
+                neither,
+                [past, past],
+            ),
+            // The values' rows are counted together.
+            (
+                json!({"authors": [hex(0)], "#t": ["edge", "unused-0"]}),
+                both,
+                [edge, edge],
+            ),
+            (
+                json!({"authors": [hex(0)], "#t": ["edge", "solo"]}),
+                neither,
+                [edge + 1, edge + 1],
+            ),
+            // The driving tag is counted: `e`, with as many values as `t`
+            // and ahead of it.
+            (
+                json!({"authors": [hex(0)], "#e": [replied], "#t": ["common"]}),
+                both,
+                [0, 0],
+            ),
+            (
+                json!({"authors": [hex(0)], "#d": ["page-7"], "#t": ["common", "past"]}),
+                both,
+                [1, 1],
+            ),
+            // More values than rows allowed are not counted at all.
+            (json!({"authors": [hex(0)], "#d": unused}), neither, [0, 0]),
+            (
+                json!({"authors": [hex(0)], "kinds": [30023], "#d": pages}),
+                both,
+                [paged, paged],
+            ),
+            (
+                json!({"authors": [hex(0), hex(1)], "kinds": [1, 30023], "#d": pages, "limit": 3}),
+                both,
+                [3, 3],
+            ),
+            (
+                json!({"authors": [hex(1)], "#d": pages, "since": NOW - 800}),
+                both,
+                [0, 0],
+            ),
+            // Each partition's own rows.
+            (
+                json!({"authors": [hex(0)], "#t": ["split"]}),
+                [Drive::Rule, Drive::RareTag],
+                [rare as usize + 1, 2],
+            ),
+            // Nothing to count: no author named, none at all, or ids.
+            (json!({"#d": ["page-7"]}), neither, [1, 1]),
+            (json!({"authors": [], "#d": ["page-7"]}), neither, [0, 0]),
+            (
+                json!({"ids": [replied], "authors": [hex(2)], "#d": ["page-7"]}),
+                neither,
+                [0, 0],
+            ),
+        ];
+        let mut found = 0;
+        for (raw, drives, counts) in &cases {
+            let filter: Filter = serde_json::from_value(raw.clone()).unwrap();
+            for (at, scope) in [Visibility::Public, Visibility::Sheltered]
+                .into_iter()
+                .enumerate()
+            {
+                assert_eq!(
+                    db.drive(scope, &filter).unwrap(),
+                    drives[at],
+                    "{raw} {scope:?}"
+                );
+                let all: Vec<Event> = corpus
+                    .iter()
+                    .filter(|(partition, _)| *partition == scope)
+                    .map(|(_, event)| event.clone())
+                    .collect();
+                // NOW + 1 expires the article that carries an expiration tag.
+                for now in [NOW, NOW + 1] {
+                    let got = ids(&db, scope, filter.clone(), now);
+                    assert_eq!(
+                        got,
+                        oracle(&db, scope, &filter, now),
+                        "{raw} {scope:?} {now}"
+                    );
+                    // The store reads an empty list as matching nothing,
+                    // in every shape; the model reads it as no condition.
+                    if filter.authors.as_ref().is_none_or(|a| !a.is_empty()) {
+                        assert_eq!(got, model(&all, &filter, now), "{raw} {scope:?} {now}");
+                    }
+                    found += got.len();
+                }
+                let got = ids(&db, scope, filter.clone(), NOW);
+                assert_eq!(got.len(), counts[at], "{raw} {scope:?}");
+            }
+        }
+        assert!(found > 80, "{found}");
+        let expiring: Filter =
+            serde_json::from_value(json!({"authors": [hex(0)], "#d": ["page-5"]})).unwrap();
+        assert!(ids(&db, Visibility::Public, expiring, NOW + 1).is_empty());
+
+        // The rare tag's rows are read from the tag index, and each event
+        // they lead to by its row number: not one of the author's other
+        // events is touched.
+        let sql_of = |raw: serde_json::Value| {
+            let filter: Filter = serde_json::from_value(raw).unwrap();
+            db.query_sql(Visibility::Public, &filter, NOW, QueryColumns::Body)
+                .unwrap()
+                .unwrap()
+        };
+        let (sql, values) =
+            sql_of(json!({"authors": [hex(0)], "kinds": [30023], "#d": ["page-7"]}));
+        assert!(sql.contains("FROM tags t CROSS JOIN events e"), "{sql}");
+        let plan = db
+            .with_reader(|conn| Ok(explain(conn, &sql, values)?))
+            .unwrap()
+            .join("\n");
+        assert!(plan.contains("tags_by_time"), "{plan}");
+        assert!(plan.contains("INTEGER PRIMARY KEY (rowid=?)"), "{plan}");
+        assert!(!plan.contains("events_author_kind"), "{plan}");
+        assert!(!plan.contains("events_time"), "{plan}");
+        // The same of the wider shapes: several authors, kinds and values,
+        // merged branch by branch up to `RARE_MERGED_VALUES` values and
+        // read in one scan past it.
+        for (raw, merged) in [
+            (
+                json!({"authors": [hex(0), hex(1)], "kinds": [1, 30023], "#d": ["page-1", "page-2", "second"], "limit": 2}),
+                true,
+            ),
+            (
+                json!({"authors": [hex(0), hex(1)], "kinds": [1, 30023], "#d": pages, "limit": 3}),
+                false,
+            ),
+        ] {
+            let (sql, values) = sql_of(raw.clone());
+            assert_eq!(sql.contains(" UNION "), merged, "{raw}: {sql}");
+            assert_eq!(sql.contains("SELECT DISTINCT"), !merged, "{raw}: {sql}");
+            let plan = db
+                .with_reader(|conn| Ok(explain(conn, &sql, values)?))
+                .unwrap()
+                .join("\n");
+            assert!(plan.contains("tags_by_time"), "{raw}: {plan}");
+            assert!(
+                plan.contains("INTEGER PRIMARY KEY (rowid=?)"),
+                "{raw}: {plan}"
+            );
+            assert!(!plan.contains("events_author_kind"), "{raw}: {plan}");
+            assert!(!plan.contains("events_time"), "{raw}: {plan}");
+            // Neither table is read but by those two seeks.
+            for line in plan.lines() {
+                let table = line.split(' ').nth(1).unwrap_or_default();
+                if table == "t" {
+                    assert!(
+                        line.starts_with("SEARCH t USING COVERING INDEX tags_by_time"),
+                        "{raw}: {plan}"
+                    );
+                }
+                if table == "e" {
+                    assert_eq!(
+                        line, "SEARCH e USING INTEGER PRIMARY KEY (rowid=?)",
+                        "{raw}: {plan}"
+                    );
+                }
+            }
+        }
+
+        // Two filters of one shape, one value rare and one common: each
+        // keeps its own SQL, whichever was asked first.
+        for _ in 0..2 {
+            let (rare, _) = sql_of(json!({"authors": [hex(0)], "#t": ["edge"]}));
+            let (common, _) = sql_of(json!({"authors": [hex(0)], "#t": ["past"]}));
+            assert!(rare.contains("FROM tags t CROSS JOIN events e"), "{rare}");
+            assert!(!common.contains("CROSS JOIN"), "{common}");
+            assert!(common.contains("EXISTS(SELECT 1 FROM tags t"), "{common}");
+        }
     }
 
     /// What NIP-01 says the filter selects, computed in Rust from every live
@@ -7208,7 +7682,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             &filter,
             NOW,
             10,
-            true,
+            Drive::Rule,
             QueryColumns::Body,
         )
         .unwrap()
@@ -7239,7 +7713,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             &no_kind,
             NOW,
             10,
-            true,
+            Drive::Rule,
             QueryColumns::Body,
         )
         .unwrap()
@@ -7249,9 +7723,16 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
         let room: Filter =
             serde_json::from_value(serde_json::json!({"kinds":[1],"#t":["common"],"limit":10}))
                 .unwrap();
-        let (sql, _) = build_query(Visibility::Public, &room, NOW, 10, true, QueryColumns::Body)
-            .unwrap()
-            .unwrap();
+        let (sql, _) = build_query(
+            Visibility::Public,
+            &room,
+            NOW,
+            10,
+            Drive::Rule,
+            QueryColumns::Body,
+        )
+        .unwrap()
+        .unwrap();
         assert!(sql.contains("FROM tags t CROSS JOIN events e"));
     }
 
@@ -7273,7 +7754,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
                 &filter,
                 NOW,
                 20,
-                true,
+                Drive::Rule,
                 QueryColumns::Body,
             )
             .unwrap()
@@ -7320,7 +7801,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             &filter,
             NOW,
             50,
-            true,
+            Drive::Rule,
             QueryColumns::Body,
         )
         .unwrap()
@@ -7348,7 +7829,7 @@ CREATE TRIGGER {table}_charge_update AFTER UPDATE ON {table} BEGIN UPDATE usage 
             &rooms,
             NOW,
             50,
-            true,
+            Drive::Rule,
             QueryColumns::Body,
         )
         .unwrap()
@@ -9614,6 +10095,9 @@ PRAGMA user_version=2;")).unwrap();
             serde_json::json!({"#p": [hex(&keys[2])], "#t": ["t-0", "t-2"]}),
             serde_json::json!({"#p": [hex(&keys[1])]}),
             serde_json::json!({"authors": [hex(&keys[0])], "#t": ["t-1", "both"]}),
+            serde_json::json!({"authors": [hex(&keys[0])], "kinds": [30023], "#d": ["post"]}),
+            serde_json::json!({"authors": [hex(&keys[1]), hex(&keys[2])], "#d": ["tied", "gone"], "limit": 2}),
+            serde_json::json!({"authors": [hex(&keys[0])], "#t": (0..=RARE_MERGED_VALUES).map(|n| format!("t-{n}")).collect::<Vec<_>>()}),
             serde_json::json!({"#t": ["long"], "kinds": [30023]}),
             serde_json::json!({"#x": ["nothing"]}),
         ]
@@ -10577,7 +11061,7 @@ PRAGMA user_version=2;")).unwrap();
                 &filter,
                 NOW,
                 limit,
-                true,
+                Drive::Rule,
                 QueryColumns::Body,
             )
             .unwrap()
@@ -11061,6 +11545,18 @@ PRAGMA user_version=2;")).unwrap();
                         same(&sql, &values);
                     }
                 }
+                // Driven each way the store's count of a tag's rows may
+                // choose, whichever it chose above for this corpus.
+                let limit = filter.limit.unwrap_or(MAX_QUERY_EVENTS).clamp(1, 128);
+                for drive in [Drive::Rule, Drive::RareTag] {
+                    for columns in [QueryColumns::Body, QueryColumns::Keys] {
+                        if let Some((sql, values)) =
+                            build_query(scope, filter, NOW, limit, drive, columns).unwrap()
+                        {
+                            same(&sql, &values);
+                        }
+                    }
+                }
                 let pair = [filter.clone(), filters[(i + 1) % filters.len()].clone()];
                 for group in [&pair[..1], &pair[..]] {
                     if let Some((sql, values)) = build_count(scope, group, NOW).unwrap() {
@@ -11092,6 +11588,17 @@ PRAGMA user_version=2;")).unwrap();
         held.sort();
         held.dedup();
         assert!(held.len() > 12, "{held:?}");
+        assert!(
+            held.iter().any(|sql| *sql == RARE_TAG_SQL[0]),
+            "a reader counted a tag's rows"
+        );
+        // The count for every number of values, held or not.
+        for (index, sql) in RARE_TAG_SQL.iter().enumerate() {
+            let mut values = vec![Value::Integer(0), Value::Text("t".into())];
+            values.extend((0..=index).map(|n| Value::Text(format!("t-{n}"))));
+            values.push(Value::Integer(RARE_TAG_ROWS as i64 + 1));
+            same(sql, &values);
+        }
         for sql in &held {
             let count = stable.prepare(sql).unwrap().parameter_count();
             for number in [1, MAX_QUERY_EVENTS as i64] {

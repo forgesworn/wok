@@ -91,6 +91,13 @@ crates/
   `INDEXED BY`. `stable_plans_are_the_plans_bound_values_chose` compares the
   plans of the query shapes and of every statement the connections keep
   prepared; run a new query shape through it.
+- One query's shape is chosen from stored data: for a filter that names
+  `authors` and a tag, `SqliteEventStore::drive` counts the driving tag's
+  rows and picks the table that drives. That choice is part of the SQL
+  cache's key (`query_shape`). Anything else that changes the SQL for one
+  filter shape must go into the key too, or the first query of a shape
+  fixes the SQL for every later one; and every route must select what
+  `Drive::Events` selects, which the oracle tests compare.
 - The production image is distroless: no shell, so nothing can be `RUN` in
   its final stage or `docker exec`ed in a container. What that stage needs
   is made under `/runtime` in the build stage and laid over the base in one

@@ -76,6 +76,27 @@
   gives the small tables to every package in it; `wok-bench` and `wok-roomd`
   built on their own keep the full ones, and the benchmark image now builds
   the two separately.
+- `wok-store`: an addressable event asked for by its author, kind and `d`
+  tag is found from the tag index. A filter that names `authors` was always
+  answered from the author's events, each one's tags probed, so the lookup
+  cost a probe for every event of that kind the author had. With about 78
+  of them (100,000 events from 64 authors, release build) it took 137 to
+  177 µs at the median on arm64 macOS and 130 to 148 µs on Linux, and it
+  takes 3.2 to 3.7 µs and 2.8 to 2.9 µs now. Before a query that names
+  `authors` and a tag, the store counts the rows the driving tag's values
+  hold between them, in one statement and to no more than 17; at 16 or
+  fewer the tag index drives, and the author and kind are checked on each
+  event its rows lead to. Both shapes select the same events, so the count
+  only chooses what the answer costs. A tag with more than 16 values is not
+  counted. The count takes 1.1 to 1.5 µs for one value and 5.9 µs for
+  sixteen (arm64 macOS, as are the figures that follow). A query that names
+  an author and a common tag pays it and gains nothing: 1.5 µs beside a
+  statement that took 10.7 µs. An author with a single event of the kind is
+  the case that loses: 1.7 µs before, 2.7 µs when the value has one row and
+  4.8 µs when it has sixteen. Sixteen `d` values asked of an author with
+  400 events of the kind took 657 µs and take 25 µs; asked of an author
+  with only those sixteen they took 23.5 µs and take 24.6 µs. A `COUNT` is
+  answered as before.
 
 ## 0.7.0 - 2026-11-24
 
