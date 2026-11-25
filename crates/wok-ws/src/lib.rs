@@ -2918,6 +2918,9 @@ mod tests {
             send_frame(&mut keeper, json!(["EVENT", e])).await;
             assert_eq!(receive(&mut keeper).await[2], true);
         }
+        // The writer answers before it announces: until the last event is
+        // announced, the REQ below would also get it live after its EOSE.
+        routes.relay.flush();
         send_frame(&mut keeper, json!(["REQ", "page", {"kinds": [1]}])).await;
         let mut times = Vec::new();
         loop {
