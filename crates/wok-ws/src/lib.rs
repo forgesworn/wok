@@ -3810,18 +3810,21 @@ mod tests {
         let routes = routes_with_timings(
             &tmp,
             &key,
+            // A heartbeat and an idle deadline long enough that a runner
+            // under load, slow to wake either end, does not miss them: at
+            // 25 and 80 ms a Ping once came more than 100 ms late.
             Timings::new(
                 Duration::from_secs(30),
-                Duration::from_millis(25),
-                Duration::from_millis(80),
+                Duration::from_millis(100),
+                Duration::from_millis(400),
             ),
         );
         let (url, task) = listen(&routes, Visibility::Public).await;
         let (mut quiet, _) = connect_async(&url).await.unwrap();
         // Read nothing, so no Pong is sent back.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
         assert!(
-            closes_within(&mut quiet, Duration::from_millis(200)).await,
+            closes_within(&mut quiet, Duration::from_secs(2)).await,
             "a public socket that never answers is dropped"
         );
 
@@ -3834,9 +3837,9 @@ mod tests {
         .await
         .unwrap();
         // Answer each Ping for well past the idle deadline.
-        let until = tokio::time::Instant::now() + Duration::from_millis(250);
+        let until = tokio::time::Instant::now() + Duration::from_millis(1_000);
         while tokio::time::Instant::now() < until {
-            match timeout(Duration::from_millis(100), live.next()).await {
+            match timeout(Duration::from_secs(2), live.next()).await {
                 Ok(Some(Ok(ClientMessage::Ping(payload)))) => {
                     live.send(ClientMessage::Pong(payload)).await.unwrap()
                 }
