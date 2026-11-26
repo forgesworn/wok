@@ -209,12 +209,70 @@ async fn work<T: Send + 'static>(
 }
 
 async fn send(socket: &mut WebSocket, value: Value) -> bool {
+    send_text(socket, value.to_string()).await
+}
+
+async fn send_text(socket: &mut WebSocket, text: String) -> bool {
     tokio::time::timeout(
         Duration::from_secs(5),
-        socket.send(Message::Text(value.to_string().into())),
+        socket.send(Message::Text(text.into())),
     )
     .await
     .is_ok_and(|r| r.is_ok())
+}
+
+/// The most live events one connection takes from the queue in one go.
+const LIVE_BATCH_EVENTS: usize = 64;
+/// The most serialised event bytes it takes in one go, past which it stops;
+/// one event larger than this still goes alone.
+const LIVE_BATCH_BYTES: usize = 64 * 1024;
+/// How long a connection writes live frames on one access check before it
+/// checks again; any change to the allowlist checks again at once.
+const LIVE_RECHECK: Duration = Duration::from_millis(250);
+
+/// The live event a connection woke for and whatever else has queued behind
+/// it, up to the batch bounds, each with its JSON, and whether the queue
+/// lagged: dropped events this connection had not read. What was taken
+/// before a lag is still sent.
+fn live_batch(
+    first: Result<Live, broadcast::error::RecvError>,
+    live: &mut broadcast::Receiver<Live>,
+) -> (Vec<Live>, Vec<String>, bool) {
+    let mut batch = Vec::new();
+    let mut json = Vec::new();
+    let mut bytes = 0;
+    let mut next = first.map_err(|_| ());
+    loop {
+        match next {
+            Ok(delivered) => {
+                let text = delivered.event.as_json();
+                bytes += text.len();
+                json.push(text);
+                batch.push(delivered);
+            }
+            Err(()) => return (batch, json, true),
+        }
+        if batch.len() >= LIVE_BATCH_EVENTS || bytes >= LIVE_BATCH_BYTES {
+            return (batch, json, false);
+        }
+        next = match live.try_recv() {
+            Ok(delivered) => Ok(delivered),
+            Err(broadcast::error::TryRecvError::Empty) => return (batch, json, false),
+            Err(_) => Err(()),
+        };
+    }
+}
+
+/// `["EVENT",<id>,<event>]` from an event already serialised.
+fn event_frame(subscription: &str, event: &str) -> String {
+    let id = Value::from(subscription).to_string();
+    let mut frame = String::with_capacity(event.len() + id.len() + 12);
+    frame.push_str("[\"EVENT\",");
+    frame.push_str(&id);
+    frame.push(',');
+    frame.push_str(event);
+    frame.push(']');
+    frame
 }
 
 /// The address a connection is counted against: the peer's, or behind a
@@ -348,8 +406,80 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
     let mut tick = tokio::time::interval(Duration::from_millis(250));
     let mut window = Instant::now();
     let mut frames = 0u32;
-    loop {
+    'session: loop {
+        // In this order. An ended access is noticed before anything else.
+        // What is queued live is sent before the next frame is read, so a
+        // connection that publishes keeps up with the burst it adds to.
         tokio::select! {
+            biased;
+            result = changed.changed() => {
+                if result.is_err() || !authorised(&host, &access).await {
+                    let _ = send(&mut socket, json!(["NOTICE", "access removed"])).await;
+                    break;
+                }
+            },
+            // The lease can run out with no frame and no new snapshot.
+            _ = tick.tick() => {
+                if !authorised(&host, &access).await {
+                    let _ = send(&mut socket, json!(["NOTICE", "node access ended"])).await;
+                    break;
+                }
+            }
+            received = live.recv() => {
+                let (batch, json, lagged) = live_batch(received, &mut live);
+                // One trip under the lock matches the whole batch, with the
+                // access check `delivers` makes for each event, and returns
+                // the subscriptions each event goes to.
+                if !batch.is_empty() && !subscriptions.is_empty() {
+                    let who = access.clone();
+                    let filters = subscriptions.clone();
+                    let matched = work(&host, move |relay| {
+                        let now = now();
+                        Ok(batch
+                            .iter()
+                            .map(|delivered| {
+                                filters
+                                    .iter()
+                                    .filter(|(_, filters)| {
+                                        filters.iter().any(|f| {
+                                            relay.delivers(&who, delivered, f.clone(), now)
+                                        })
+                                    })
+                                    .map(|(id, _)| id.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                            .collect::<Vec<_>>())
+                    })
+                    .await
+                    .unwrap_or_default();
+                    // The frames go out after the lock is let go. Access is
+                    // checked again before the next one whenever the
+                    // allowlist has changed or the last check is old.
+                    let mut checked = Instant::now();
+                    for (text, ids) in json.iter().zip(matched) {
+                        for id in ids {
+                            if changed.has_changed().unwrap_or(true)
+                                || checked.elapsed() >= LIVE_RECHECK
+                            {
+                                if !authorised(&host, &access).await {
+                                    let notice = json!(["NOTICE", "access removed"]);
+                                    let _ = send(&mut socket, notice).await;
+                                    break 'session;
+                                }
+                                checked = Instant::now();
+                            }
+                            if !send_text(&mut socket, event_frame(&id, text)).await {
+                                return;
+                            }
+                        }
+                    }
+                }
+                if lagged {
+                    let notice = json!(["NOTICE", "live stream interrupted; reconnect"]);
+                    let _ = send(&mut socket, notice).await;
+                    break;
+                }
+            },
             incoming = socket.recv() => {
                 let Some(Ok(message)) = incoming else {
                     break;
@@ -471,52 +601,6 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
                             break;
                         }
                     }
-                }
-            },
-            received = live.recv() => {
-                let delivered = match received {
-                    Ok(delivered) => delivered,
-                    Err(_) => {
-                        let notice = json!(["NOTICE", "live stream interrupted; reconnect"]);
-                        let _ = send(&mut socket, notice).await;
-                        break;
-                    }
-                };
-                let who = access.clone();
-                let filters = subscriptions.clone();
-                let candidate = delivered.clone();
-                let recipients = work(&host, move |relay| {
-                    Ok(filters
-                        .into_iter()
-                        .filter_map(|(id, filters)| {
-                            filters
-                                .into_iter()
-                                .any(|f| relay.delivers(&who, &candidate, f, now()))
-                                .then_some(id)
-                        })
-                        .collect::<Vec<_>>())
-                })
-                .await
-                .unwrap_or_default();
-                for id in recipients {
-                    if !authorised(&host, &access).await
-                        || !send(&mut socket, json!(["EVENT", id, delivered.event])).await
-                    {
-                        return;
-                    }
-                }
-            },
-            result = changed.changed() => {
-                if result.is_err() || !authorised(&host, &access).await {
-                    let _ = send(&mut socket, json!(["NOTICE", "access removed"])).await;
-                    break;
-                }
-            },
-            // The lease can run out with no frame and no new snapshot.
-            _ = tick.tick() => {
-                if !authorised(&host, &access).await {
-                    let _ = send(&mut socket, json!(["NOTICE", "node access ended"])).await;
-                    break;
                 }
             }
         }
@@ -891,8 +975,11 @@ mod tests {
         }
     }
     async fn fixture() -> Fixture {
+        fixture_holding(1_000_000).await
+    }
+    async fn fixture_holding(max_bytes: u64) -> Fixture {
         let temp = TempDir::new().unwrap();
-        let relay = RoomRelay::open(temp.path(), 1_000_000, 0, 4).unwrap();
+        let relay = RoomRelay::open(temp.path(), max_bytes, 0, 4).unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let host = Host::new(relay, format!("ws://{address}/events").into());
@@ -1048,5 +1135,221 @@ mod tests {
         assert!(!allowed);
         let status = command(&f, json!({"op":"status","v":1})).await;
         assert_eq!(status["result"]["usedBytes"], 0);
+    }
+
+    /// A live event published after a `sync` that removes a device's grant
+    /// has returned never reaches that device's open connection: it is told
+    /// and closed. (The change notice usually closes it before the event
+    /// arrives; `delivers` refusing the event is tested in `relay`.)
+    #[tokio::test]
+    async fn an_event_after_a_removing_sync_never_reaches_the_removed_device() {
+        let f = fixture().await;
+        let room = "03".repeat(32);
+        let inviter = Keys::generate();
+        let removed = Keys::generate();
+        let kept = Keys::generate();
+        let grant = |keys: &Keys| json!({"room":room,"device":keys.public_key().to_hex(),"expires":now()+3600,"read":true,"write":true});
+        let rooms = json!([{"room":room,"inviter":inviter.public_key().to_hex(),"ends":null}]);
+        let both = json!([grant(&removed), grant(&kept)]);
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":both})).await["ok"],
+            true
+        );
+        let mut clients = Vec::new();
+        for keys in [&removed, &kept] {
+            let (mut client, allowed) = login(&f, &room, keys, "room").await;
+            assert!(allowed);
+            client
+                .send(ClientMessage::Text(
+                    json!(["REQ", "live", {}]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(receive(&mut client).await[0], "EOSE");
+            clients.push(client);
+        }
+        let mut kept_client = clients.pop().unwrap();
+        let mut removed_client = clients.pop().unwrap();
+        let only_kept = json!([grant(&kept)]);
+        assert_eq!(
+            command(
+                &f,
+                json!({"op":"sync","v":1,"rooms":rooms,"grants":only_kept})
+            )
+            .await["ok"],
+            true
+        );
+        let late: Vec<Event> = (0..3)
+            .map(|i| {
+                signed(
+                    &kept,
+                    1464,
+                    &format!("late {i}"),
+                    vec![vec!["expiration".into(), (now() + 600).to_string()]],
+                )
+            })
+            .collect();
+        for event in &late {
+            kept_client
+                .send(ClientMessage::Text(
+                    json!(["EVENT", event]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+        }
+        let mut seen = 0;
+        while seen < late.len() * 2 {
+            let message = receive(&mut kept_client).await;
+            assert!(message[0] == "OK" || message[0] == "EVENT", "{message}");
+            seen += 1;
+        }
+        let first = receive(&mut removed_client).await;
+        assert_eq!(first[0], "NOTICE", "{first}");
+        while let Ok(Some(Ok(message))) =
+            tokio::time::timeout(Duration::from_secs(3), removed_client.next()).await
+        {
+            assert!(!message.is_text(), "{message:?}");
+        }
+    }
+
+    /// Every frame a connection reads until it has `events` live events
+    /// and `oks` OKs, or the first frame that is neither.
+    async fn read_burst(
+        client: &mut futures_util::stream::SplitStream<Client>,
+        events: usize,
+        oks: usize,
+    ) -> Result<Vec<String>, String> {
+        let mut ids = Vec::new();
+        let mut answered = 0;
+        while ids.len() < events || answered < oks {
+            let message = match tokio::time::timeout(Duration::from_secs(5), client.next()).await {
+                Ok(Some(Ok(message))) => message,
+                other => {
+                    return Err(format!(
+                        "after {} events, {answered} OKs: {other:?}",
+                        ids.len()
+                    ));
+                }
+            };
+            let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            match value[0].as_str() {
+                Some("EVENT") if value[1] == "live" => {
+                    ids.push(value[2]["id"].as_str().unwrap().to_owned());
+                }
+                Some("OK") if value[2] == true => answered += 1,
+                _ => {
+                    return Err(format!(
+                        "after {} events, {answered} OKs: {value}",
+                        ids.len()
+                    ));
+                }
+            }
+        }
+        Ok(ids)
+    }
+
+    /// More events than the live channel holds, sent at once by several
+    /// devices that also read, reach every subscriber that reads promptly
+    /// whole and in one order, on a connection that stays open.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_burst_from_several_devices_reaches_every_prompt_reader_whole() {
+        const READERS: usize = 8;
+        const PUBLISHERS: usize = 4;
+        // 110 events and the REQ: under 120 frames a minute.
+        const EACH: usize = 110;
+        const TOTAL: usize = PUBLISHERS * EACH;
+        let f = fixture_holding(16_000_000).await;
+        let room = "02".repeat(32);
+        let inviter = Keys::generate();
+        let devices: Vec<Keys> = (0..READERS + PUBLISHERS)
+            .map(|_| Keys::generate())
+            .collect();
+        let rooms = json!([{"room":room,"inviter":inviter.public_key().to_hex(),"ends":null}]);
+        let grants: Vec<Value> = devices
+            .iter()
+            .map(|d| json!({"room":room,"device":d.public_key().to_hex(),"expires":now()+3600,"read":true,"write":true}))
+            .collect();
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        let mut clients = Vec::new();
+        for (n, keys) in devices.iter().enumerate() {
+            let (mut client, allowed) = login(&f, &room, keys, "room").await;
+            assert!(allowed);
+            client
+                .send(ClientMessage::Text(
+                    json!(["REQ", "live", {}]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(receive(&mut client).await[0], "EOSE");
+            // Signed before the burst, so signing does not pace it.
+            let events: Vec<Event> = if n < READERS {
+                Vec::new()
+            } else {
+                (0..EACH)
+                    .map(|i| {
+                        signed(
+                            keys,
+                            1464,
+                            &format!("burst {i}"),
+                            vec![vec!["expiration".into(), (now() + 600).to_string()]],
+                        )
+                    })
+                    .collect()
+            };
+            clients.push((client, events));
+        }
+        // A fresh lease, so the node's 15 seconds cover only the burst.
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        let mut sent = HashSet::new();
+        for (_, events) in &clients {
+            sent.extend(events.iter().map(|e| e.id.to_hex()));
+        }
+        let tasks: Vec<_> = clients
+            .into_iter()
+            .map(|(client, events)| {
+                tokio::spawn(async move {
+                    let (mut sink, mut stream) = client.split();
+                    let oks = events.len();
+                    let writer = tokio::spawn(async move {
+                        for event in &events {
+                            sink.send(ClientMessage::Text(
+                                json!(["EVENT", event]).to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        sink
+                    });
+                    let read = read_burst(&mut stream, TOTAL, oks).await;
+                    let _ = writer.await;
+                    read
+                })
+            })
+            .collect();
+        let mut outcomes = Vec::new();
+        for (n, task) in tasks.into_iter().enumerate() {
+            let role = if n < READERS { "reader" } else { "publisher" };
+            outcomes.push((role, task.await.unwrap()));
+        }
+        let failures: Vec<_> = outcomes
+            .iter()
+            .filter_map(|(role, outcome)| outcome.as_ref().err().map(|e| format!("{role}: {e}")))
+            .collect();
+        assert!(failures.is_empty(), "{failures:#?}");
+        let mut first: Option<&Vec<String>> = None;
+        for (_, outcome) in &outcomes {
+            let ids = outcome.as_ref().unwrap();
+            assert_eq!(ids.iter().cloned().collect::<HashSet<_>>(), sent);
+            match first {
+                Some(order) => assert_eq!(ids, order),
+                None => first = Some(ids),
+            }
+        }
     }
 }
