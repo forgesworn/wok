@@ -226,9 +226,10 @@ const LIVE_BATCH_EVENTS: usize = 64;
 /// The most serialised event bytes it takes in one go, past which it stops;
 /// one event larger than this still goes alone.
 const LIVE_BATCH_BYTES: usize = 64 * 1024;
-/// How long a connection writes live frames on one access check before it
-/// checks again; any change to the allowlist checks again at once.
-const LIVE_RECHECK: Duration = Duration::from_millis(250);
+/// How long a connection writes event frames, live or history, on one
+/// access check before it checks again; any change to the allowlist checks
+/// again at once.
+const RECHECK: Duration = Duration::from_millis(250);
 
 /// The live event a connection woke for and whatever else has queued behind
 /// it, up to the batch bounds, each with its JSON, and whether the queue
@@ -351,6 +352,29 @@ async fn authorised(host: &Host, access: &Access) -> bool {
     .unwrap_or(false)
 }
 
+/// Whether a connection's access still holds before its next event frame.
+/// It is checked again, under the lock, only when the allowlist has changed
+/// or the last check is older than `RECHECK`, so a run of frames does not
+/// queue behind every other connection's work once per frame. A change is
+/// marked seen before the check, which reads the state the control socket
+/// stored before it announced the change; every `sync`, a lease renewal
+/// included, is one.
+async fn still_holds(
+    host: &Host,
+    access: &Access,
+    changed: &mut watch::Receiver<u64>,
+    checked: &mut Instant,
+) -> bool {
+    if changed.has_changed().unwrap_or(true) || checked.elapsed() >= RECHECK {
+        changed.borrow_and_update();
+        if !authorised(host, access).await {
+            return false;
+        }
+        *checked = Instant::now();
+    }
+    true
+}
+
 /// One connection: a challenge, one AUTH that picks the room and the door,
 /// then EVENT, REQ and CLOSE until the access behind it ends.
 async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermit) {
@@ -452,21 +476,14 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
                     })
                     .await
                     .unwrap_or_default();
-                    // The frames go out after the lock is let go. Access is
-                    // checked again before the next one whenever the
-                    // allowlist has changed or the last check is old.
+                    // The frames go out after the lock is let go.
                     let mut checked = Instant::now();
                     for (text, ids) in json.iter().zip(matched) {
                         for id in ids {
-                            if changed.has_changed().unwrap_or(true)
-                                || checked.elapsed() >= LIVE_RECHECK
-                            {
-                                if !authorised(&host, &access).await {
-                                    let notice = json!(["NOTICE", "access removed"]);
-                                    let _ = send(&mut socket, notice).await;
-                                    break 'session;
-                                }
-                                checked = Instant::now();
+                            if !still_holds(&host, &access, &mut changed, &mut checked).await {
+                                let notice = json!(["NOTICE", "access removed"]);
+                                let _ = send(&mut socket, notice).await;
+                                break 'session;
                             }
                             if !send_text(&mut socket, event_frame(&id, text)).await {
                                 return;
@@ -550,7 +567,8 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
                         let query = filters.clone();
                         let who = access.clone();
                         // One page of history: 128 events or 2 MiB, whichever
-                        // comes first, across all of the request's filters.
+                        // comes first, across all of the request's filters,
+                        // each serialised once.
                         let history = work(&host, move |relay| {
                             let mut events = Vec::new();
                             let mut ids = HashSet::new();
@@ -558,11 +576,12 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
                             for filter in query {
                                 for event in relay.query(&who, filter, now())? {
                                     if ids.insert(event.id) {
-                                        bytes += event.as_json().len();
+                                        let text = event.as_json();
+                                        bytes += text.len();
                                         if bytes > 2 * 1024 * 1024 || events.len() >= 128 {
                                             return Ok(events);
                                         }
-                                        events.push(event);
+                                        events.push(text);
                                     }
                                 }
                             }
@@ -572,10 +591,18 @@ async fn session(host: Host, mut socket: WebSocket, _permit: OwnedSemaphorePermi
                         match history {
                             Ok(events) => {
                                 subscriptions.insert(id.clone(), filters);
-                                for event in events {
-                                    if !authorised(&host, &access).await
-                                        || !send(&mut socket, json!(["EVENT", id, event])).await
-                                    {
+                                // The query checked access under the lock. The
+                                // page goes out as live frames do, checked again
+                                // on a change or once the check is old, so live
+                                // events queued meanwhile are read in time.
+                                let mut checked = Instant::now();
+                                for text in &events {
+                                    if !still_holds(&host, &access, &mut changed, &mut checked).await {
+                                        let notice = json!(["NOTICE", "access removed"]);
+                                        let _ = send(&mut socket, notice).await;
+                                        break 'session;
+                                    }
+                                    if !send_text(&mut socket, event_frame(&id, text)).await {
                                         return;
                                     }
                                 }
@@ -1351,5 +1378,224 @@ mod tests {
                 None => first = Some(ids),
             }
         }
+    }
+
+    /// Before an event frame, access is checked again under the lock when
+    /// the allowlist has changed or the last check is older than `RECHECK`,
+    /// and otherwise trusted: the window a removal can take to bite.
+    #[tokio::test]
+    async fn access_is_checked_again_before_a_frame_on_a_change_or_once_old() {
+        let f = fixture().await;
+        let room = "05".repeat(32);
+        let inviter = Keys::generate();
+        let device = Keys::generate();
+        let rooms = json!([{"room":room,"inviter":inviter.public_key().to_hex(),"ends":null}]);
+        let grants = json!([{"room":room,"device":device.public_key().to_hex(),"expires":now()+3600,"read":true,"write":true}]);
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        let challenge = "ab".repeat(32);
+        let url = f.host.url.to_string();
+        let event = signed(
+            &device,
+            22242,
+            "",
+            vec![
+                vec!["challenge".into(), challenge.clone()],
+                vec!["relay".into(), url.clone()],
+                vec!["room".into(), room.clone()],
+                vec!["mode".into(), "room".into()],
+            ],
+        );
+        let access = work(&f.host, move |relay| {
+            relay.authenticate(&event, &challenge, &url, now())
+        })
+        .await
+        .unwrap();
+        let mut changed = f.host.changes.subscribe();
+        let mut checked = Instant::now();
+        assert!(still_holds(&f.host, &access, &mut changed, &mut checked).await);
+        // A renewal that keeps the grant is a change too: checked once and
+        // marked seen, so the frames after it do not each check again.
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        assert!(still_holds(&f.host, &access, &mut changed, &mut checked).await);
+        assert!(!changed.has_changed().unwrap());
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":[]})).await["ok"],
+            true
+        );
+        // The removal is a change: checked again at once.
+        assert!(!still_holds(&f.host, &access, &mut changed, &mut checked).await);
+        // With the change seen, a fresh check is trusted, an old one is not.
+        let mut fresh = Instant::now();
+        assert!(still_holds(&f.host, &access, &mut changed, &mut fresh).await);
+        let mut old = Instant::now() - RECHECK;
+        assert!(!still_holds(&f.host, &access, &mut changed, &mut old).await);
+    }
+
+    /// A device that follows a burst live and asks for a full page of
+    /// history partway through it gets the page, its EOSE and every event of
+    /// the burst, on a connection that stays open, while other devices
+    /// publish more than the live channel holds.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_history_page_read_during_a_burst_still_gets_the_whole_burst() {
+        const PUBLISHERS: usize = 4;
+        const EACH: usize = 110;
+        const TOTAL: usize = PUBLISHERS * EACH;
+        // A full page: 128 stored events, from two devices at 64 each.
+        const SEEDERS: usize = 2;
+        const SEEDED: usize = 64;
+        // Live events the reader has before it asks for the page.
+        const BEFORE: usize = 32;
+        let f = fixture_holding(16_000_000).await;
+        let room = "04".repeat(32);
+        let inviter = Keys::generate();
+        let devices: Vec<Keys> = (0..SEEDERS + PUBLISHERS + 1)
+            .map(|_| Keys::generate())
+            .collect();
+        let rooms = json!([{"room":room,"inviter":inviter.public_key().to_hex(),"ends":null}]);
+        let grants: Vec<Value> = devices
+            .iter()
+            .map(|d| json!({"room":room,"device":d.public_key().to_hex(),"expires":now()+3600,"read":true,"write":true}))
+            .collect();
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        let event = |keys: &Keys, i: usize| {
+            signed(
+                keys,
+                1464,
+                &format!("event {i}"),
+                vec![vec!["expiration".into(), (now() + 600).to_string()]],
+            )
+        };
+        let authors = |keys: &[Keys]| -> Vec<String> {
+            keys.iter().map(|d| d.public_key().to_hex()).collect()
+        };
+        let mut seeded = HashSet::new();
+        for keys in &devices[..SEEDERS] {
+            let (mut client, allowed) = login(&f, &room, keys, "room").await;
+            assert!(allowed);
+            for i in 0..SEEDED {
+                let event = event(keys, i);
+                seeded.insert(event.id.to_hex());
+                client
+                    .send(ClientMessage::Text(
+                        json!(["EVENT", event]).to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(receive(&mut client).await[2], true);
+            }
+        }
+        // The burst's subscription: its authors, whom no history matches.
+        // The page's: the seeders, whom nothing live matches.
+        let burst = json!({"authors": authors(&devices[SEEDERS..SEEDERS + PUBLISHERS])});
+        let history = json!({"authors": authors(&devices[..SEEDERS])});
+        let mut publishers = Vec::new();
+        let mut sent = HashSet::new();
+        for keys in &devices[SEEDERS..=SEEDERS + PUBLISHERS] {
+            let (mut client, allowed) = login(&f, &room, keys, "room").await;
+            assert!(allowed);
+            client
+                .send(ClientMessage::Text(
+                    json!(["REQ", "live", burst]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(receive(&mut client).await[0], "EOSE");
+            publishers.push((client, Vec::new()));
+        }
+        let (reader, _) = publishers.pop().unwrap();
+        for ((_, events), keys) in publishers.iter_mut().zip(&devices[SEEDERS..]) {
+            *events = (0..EACH).map(|i| event(keys, i)).collect();
+            sent.extend(events.iter().map(|e| e.id.to_hex()));
+        }
+        // A fresh lease, so the node's 15 seconds cover only the burst.
+        assert_eq!(
+            command(&f, json!({"op":"sync","v":1,"rooms":rooms,"grants":grants})).await["ok"],
+            true
+        );
+        let tasks: Vec<_> = publishers
+            .into_iter()
+            .map(|(client, events)| {
+                tokio::spawn(async move {
+                    let (mut sink, mut stream) = client.split();
+                    let oks = events.len();
+                    let writer = tokio::spawn(async move {
+                        for event in &events {
+                            sink.send(ClientMessage::Text(
+                                json!(["EVENT", event]).to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                        }
+                        sink
+                    });
+                    let read = read_burst(&mut stream, TOTAL, oks).await;
+                    let _ = writer.await;
+                    read
+                })
+            })
+            .collect();
+        let (mut sink, mut stream) = reader.split();
+        let mut page = HashSet::new();
+        let mut live = HashSet::new();
+        let mut asked = false;
+        let mut ended = false;
+        let outcome = loop {
+            if ended && live.len() == TOTAL {
+                break Ok(());
+            }
+            if !asked && live.len() >= BEFORE {
+                sink.send(ClientMessage::Text(
+                    json!(["REQ", "page", history]).to_string().into(),
+                ))
+                .await
+                .unwrap();
+                asked = true;
+            }
+            let message = match tokio::time::timeout(Duration::from_secs(5), stream.next()).await {
+                Ok(Some(Ok(message))) => message,
+                other => {
+                    break Err(format!(
+                        "page {}, live {}: {other:?}",
+                        page.len(),
+                        live.len()
+                    ));
+                }
+            };
+            let value: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            let id = value[2]["id"].as_str().map(str::to_owned);
+            match (value[0].as_str(), value[1].as_str(), id) {
+                (Some("EVENT"), Some("live"), Some(id)) => {
+                    live.insert(id);
+                }
+                (Some("EVENT"), Some("page"), Some(id)) if asked && !ended => {
+                    page.insert(id);
+                }
+                (Some("EOSE"), Some("page"), _) if asked && !ended => ended = true,
+                _ => {
+                    break Err(format!("page {}, live {}: {value}", page.len(), live.len()));
+                }
+            }
+        };
+        let mut failures = Vec::new();
+        if let Err(error) = outcome {
+            failures.push(format!("history reader: {error}"));
+        }
+        for task in tasks {
+            if let Err(error) = task.await.unwrap() {
+                failures.push(format!("publisher: {error}"));
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
+        assert_eq!(live, sent);
+        assert_eq!(page, seeded);
     }
 }
