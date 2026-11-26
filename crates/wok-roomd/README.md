@@ -35,10 +35,13 @@ socket. On anything else the binary says so and exits.
   future: no later than the room's end if it has one, and otherwise at most
   30 days after the event was created. Ephemeral kinds are delivered to
   whoever is attached and never stored.
-- History and live delivery check the allowlist again for every event sent.
-  A device whose grant is withdrawn or has expired, a room that is closed,
-  or a supervisor that has stopped renewing: each ends the connection within
-  about a quarter of a second.
+- History and live delivery check the allowlist again for every event: a
+  history event just before it is sent, a live one when the connection
+  matches what has queued for it, up to 64 events at a time. While those
+  are written, any change to the allowlist, and a quarter of a second
+  passing, checks again. A device whose grant is withdrawn or has expired,
+  a room that is closed, or a supervisor that has stopped renewing: each
+  ends the connection within about a quarter of a second.
 - A room's database is named by a salted hash of its id, so the directory
   does not list room ids.
 - It writes no log while it runs, and sends nothing anywhere: no telemetry,
@@ -152,6 +155,7 @@ so a `sync` is seen whole or not at all.
 | Frames | 120 a minute on a connection, 257 KiB each |
 | Subscriptions | 16 on a connection, up to 8 filters each |
 | One history reply | 128 events or 2 MiB |
+| Live events queued for a connection | 128; one that falls further behind is told to reconnect and closed |
 | Device grants in a list | 1,024 |
 | Control requests in progress | 8 |
 

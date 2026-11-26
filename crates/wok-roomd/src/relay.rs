@@ -930,4 +930,32 @@ mod tests {
             Err(RoomError::Removed)
         ));
     }
+    /// A connection's live batch is matched under the lock with `delivers`
+    /// and written without a further access check, so `delivers` itself
+    /// must refuse a session whose access has ended.
+    #[test]
+    fn a_live_event_is_delivered_only_while_the_session_is_still_authorised() {
+        let temp = TempDir::new().unwrap();
+        let inviter = Keys::generate();
+        let device = Keys::generate();
+        let other = Keys::generate();
+        let room = "01".repeat(32);
+        let mut relay = RoomRelay::open(temp.path(), 1_000_000, 0, 4).unwrap();
+        let grants = vec![grant(&room, &device), grant(&room, &other)];
+        relay
+            .synchronise(vec![spec(&room, &inviter)], grants, NOW)
+            .unwrap();
+        let access = auth(&relay, &room, &device, "room").unwrap();
+        let writer = auth(&relay, &room, &other, "room").unwrap();
+        let (_, live) = relay
+            .publish(&writer, &message(&other, 1464, None), NOW)
+            .unwrap();
+        assert!(relay.delivers(&access, &live, json!({}), NOW));
+        assert!(!relay.delivers(&access, &live, json!({}), NOW + 3600));
+        relay
+            .synchronise(vec![spec(&room, &inviter)], vec![grant(&room, &other)], NOW)
+            .unwrap();
+        assert!(!relay.delivers(&access, &live, json!({}), NOW));
+        assert!(relay.delivers(&writer, &live, json!({}), NOW));
+    }
 }

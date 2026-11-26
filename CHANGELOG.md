@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- `wok-roomd`: a burst of live events no longer disconnects the devices
+  sending it. Each connection matched every live event in its own trip
+  under the node's one lock and checked access again in another before
+  each send, so a device that was publishing fell behind the 128-event live
+  queue and was told to reconnect. With four devices sending 110 events
+  each to twelve subscribed connections, all ten runs dropped publishers.
+  Now a connection sends what has queued live before it reads its next
+  frame, and takes up to 64 queued events (or 64 KiB of them) at a time,
+  matched in one trip under the lock, where `delivers` checks access for
+  each event. In 30 runs the deepest queue was 8 events; without the order
+  it was 24. With the lock held a millisecond longer on every trip, the
+  same burst reached every connection in about 8 seconds, and one event at
+  a time it ran past the node's 15-second lease. While a batch is written,
+  access is checked again whenever the allowlist changes and at least every
+  quarter of a second, where it was checked before every frame.
+
 ## 0.8.0 - 2026-11-25
 
 Performance, and a smaller container image. The store schema (version 5),
