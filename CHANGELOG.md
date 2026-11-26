@@ -1,6 +1,10 @@
 # Changelog
 
-## Unreleased
+## 0.8.1 - 2026-11-26
+
+A fix to `wok-roomd`'s live delivery. Nothing else changes: the store
+schema (version 5), the file format and the wire protocol are as in 0.8.0,
+and the container image, which holds `wokd` alone, behaves as 0.8.0's did.
 
 - `wok-roomd`: a burst of live events no longer disconnects the devices
   sending it. Each connection matched every live event in its own trip
