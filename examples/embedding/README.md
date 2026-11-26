@@ -8,8 +8,8 @@ dependencies to the same Wok tag, as Bothy does.
 
 ```toml
 [dependencies]
-wok-store = { git = "https://github.com/forgesworn/wok", tag = "v0.8.1" }
-wok-ws = { git = "https://github.com/forgesworn/wok", tag = "v0.8.1" }
+wok-store = { git = "https://github.com/forgesworn/wok", tag = "v0.8.2" }
+wok-ws = { git = "https://github.com/forgesworn/wok", tag = "v0.8.2" }
 ```
 
 ## Storage only

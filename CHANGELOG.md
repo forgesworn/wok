@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 0.8.2 - 2026-11-26
+
+Two fixes to `wok-roomd`'s delivery, of history and live events. Nothing
+else changes: the store schema (version 5), the file format and the wire
+protocol are as in 0.8.1, and the container image, which holds `wokd`
+alone, behaves as 0.8.1's did.
 
 - `wok-roomd`: a device that asks for history during a burst of live
   events is no longer disconnected once the page is sent. The page was
