@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+- `wok-roomd`: a device that asks for history during a burst of live
+  events is no longer disconnected once the page is sent. The page was
+  written with an access check under the node's one lock before every
+  event, while the connection read nothing live, so the burst filled the
+  128-event live queue and the device was told to reconnect. With a reader
+  following four devices that send 110 events each, and asking for a
+  128-event page partway through, 13 of 20 runs dropped it. Now the query
+  checks access under the lock and the page goes out as live frames do,
+  checked again whenever the allowlist changes and at least every quarter
+  of a second; in 40 runs none was dropped. A connection whose access ends
+  partway through a page is now told so and closed properly, where it was
+  closed with no notice.
+- `wok-roomd`: a `sync` while a connection is writing, a lease renewal
+  included, makes it check access once, where every frame it wrote after
+  the `sync` until the batch ended checked again under the lock.
+
 ## 0.8.1 - 2026-11-26
 
 A fix to `wok-roomd`'s live delivery. Nothing else changes: the store
